@@ -2644,12 +2644,14 @@ async def save_site_order(data: dict, source: str = "site") -> str:
 #  ПРОМО-АКЦИИ
 # ══════════════════════════════════════
 async def _get_active_promotion(conn):
-    """Текущая активная кампания (is_active=TRUE и сейчас между starts_at и ends_at)."""
+    """Текущая активная кампания (is_active=TRUE и сейчас между starts_at и ends_at)
+    ТЕКУЩЕЙ компании — раньше не фильтровало по company_id вообще, поэтому любая
+    компания видела активную акцию компании 1 (см. запрос пользователя 2026-08-08)."""
     return await conn.fetchrow("""
         SELECT * FROM promotions
-        WHERE is_active = TRUE AND NOW() BETWEEN starts_at AND ends_at
+        WHERE company_id = $1 AND is_active = TRUE AND NOW() BETWEEN starts_at AND ends_at
         ORDER BY id DESC LIMIT 1
-    """)
+    """, _cid())
 
 
 def _promo_public_fields(promo, mode: str, expires_at) -> dict:
