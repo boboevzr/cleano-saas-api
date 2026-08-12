@@ -7377,6 +7377,52 @@ async def _driver_take_delivery_core(order_id: int, staff: dict, source: str = "
     asyncio.create_task(_update_api_channel_stop(order_id))
     return {"ok": True}
 
+@app.post("/api/staff/my-route/stops/{order_id}/take-pickup")
+async def driver_route_take_pickup(order_id: int, req: PickupTakeRequest, staff=Depends(get_current_staff)):
+    """«Забрал» на маршруте типа «Забор» — new/confirmed → pickup, создаёт пустые
+    позиции (доизмерит мойщик), шлёт SMS клиенту. В отличие от /api/staff/pickup/{id}/take
+    (тот же ad-hoc флоу без маршрута) — здесь ещё синхронизируем route_orders,
+    иначе точка маршрута не отметится выполненной в списке. Портировано из прода."""
+    if not _can_drive(staff): raise HTTPException(403, "Нет доступа")
+    order = await db.get_order_by_id(order_id)
+    if not order: raise HTTPException(404, "Заказ не найден")
+    if order.get("status") not in ("new", "confirmed"):
+        raise HTTPException(400, f"Статус заказа: {order.get('status')}")
+    name = _driver_name(staff)
+
+    if req.mode == "by_service" and req.items:
+        items = await db.create_empty_items_by_service(order_id, req.items)
+    else:
+        items = await db.create_empty_items(order_id, max(1, req.count or 1))
+
+    await db.update_order_status(order_id, "pickup",
+        note=f"Забрал у клиента (маршрут): {name} ({len(items)} поз.)")
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE route_orders SET stop_status='done', driver_confirmed=TRUE WHERE order_id=$1", order_id)
+    asyncio.create_task(_send_sms_notification("pickup", order_id, order.get("client_phone"), order.get("order_num"),
+                                                len(items), req.sms_lang, staff["company_id"], staff["id"], name))
+    asyncio.create_task(_update_api_channel_stop(order_id))
+    return {"ok": True, "items": items, "count": len(items)}
+
+@app.post("/api/staff/my-route/stops/{order_id}/undo-pickup")
+async def driver_route_undo_pickup(order_id: int, staff=Depends(get_current_staff)):
+    """«Не забирал» после ошибочного «Забрал» на маршруте типа «Забор» — pickup → confirmed,
+    удаляет созданные пустые позиции, возвращает точку маршрута в pending. Портировано из прода."""
+    if not _can_drive(staff): raise HTTPException(403, "Нет доступа")
+    order = await db.get_order_by_id(order_id)
+    if not order: raise HTTPException(404, "Заказ не найден")
+    if order.get("status") != "pickup":
+        raise HTTPException(400, f"Статус заказа: {order.get('status')}")
+    name = _driver_name(staff)
+    async with db.pool.acquire() as conn:
+        await conn.execute("DELETE FROM order_items WHERE order_id=$1", order_id)
+        await conn.execute(
+            "UPDATE route_orders SET stop_status='pending', driver_confirmed=FALSE WHERE order_id=$1", order_id)
+    await db.update_order_status(order_id, "confirmed", note=f"Маршрут: не забирал — позиции удалены ({name})")
+    asyncio.create_task(_update_api_channel_stop(order_id))
+    return {"ok": True}
+
 @app.post("/api/staff/my-route/stops/{order_id}/take-delivery")
 async def driver_take_delivery(order_id: int, staff=Depends(get_current_staff)):
     return await _driver_take_delivery_core(order_id, staff)
