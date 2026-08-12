@@ -2550,6 +2550,17 @@ async def get_orders_by_phone(phone: str, company_id: int):
         """, phone, company_id)
 
 
+async def get_order_by_num_and_phone(order_num: str, phone: str, company_id: int) -> dict:
+    """Заказ по номеру, только если принадлежит этому телефону в рамках своей компании —
+    для проверки владения перед выдачей клиенту позиций/фото/видео заказа."""
+    if not pool: return {}
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM orders WHERE order_num=$1 AND client_phone=$2 AND company_id=$3",
+            order_num, phone, company_id)
+        return dict(row) if row else {}
+
+
 async def cancel_order_by_phone(order_num: str, phone: str, company_id: int):
     """Отменяет заказ со статусом 'new', принадлежащий этому номеру (в рамках своей компании).
     Возвращает dict с данными заказа или None если не найден/нельзя отменить."""
@@ -5579,6 +5590,16 @@ async def get_order_by_id(order_id: int) -> dict:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM orders WHERE id=$1 AND company_id=$2", order_id, cid)
         return dict(row) if row else {}
+
+async def get_order_client_phone(order_id: int, company_id: int) -> str | None:
+    """Телефон клиента заказа — для проверки владения в file-proxy эндпоинтах
+    (/api/media, /api/item-media), где company_id берётся напрямую из JWT,
+    а не из request-контекста _cid() (там ручной разбор токена, не middleware)."""
+    if not pool: return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT client_phone FROM orders WHERE id=$1 AND company_id=$2", order_id, company_id)
+        return row["client_phone"] if row else None
 
 async def update_order(order_id: int, **kwargs) -> dict:
     if not pool: return {}
