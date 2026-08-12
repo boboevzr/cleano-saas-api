@@ -1704,10 +1704,7 @@ def _route_pickup_kb(order_id: int, status: str, closed: bool = False) -> dict:
             [p, h, r],
         ]}
     elif status == "delivered":
-        return {"inline_keyboard": [
-            [{"text": "↩️ Отменить «Доставлен»", "callback_data": f"rp:{order_id}:undo_delivered"}],
-            [p, h, r],
-        ]}
+        return {"inline_keyboard": [[p, h, r]]}
     elif status == "skipped":
         return {"inline_keyboard": [
             [{"text": "↩️ Отменить пропуск", "callback_data": f"rp:{order_id}:unskip"}],
@@ -2618,14 +2615,13 @@ async def staff_create_order(req: StaffOrderRequest, staff=Depends(require_perm(
                     f"👷 {staff_name}\n"
                     f"━━━━━━━━━━"
                 )
-                keyboard = {"inline_keyboard": [[
-                    {"text": "✅ Принять", "callback_data": f"accept_{order_num}_0"},
-                    {"text": "❌ Отклонить", "callback_data": f"reject_{order_num}_0"},
-                ]]}
+                # Без кнопок Принять/Отклонить — заявка уже подтверждена тем сотрудником,
+                # который её создал в admin.html, группа тут только для просмотра
+                # (кнопки нужны только для неподтверждённых лидов с сайта).
                 async with aiohttp.ClientSession() as session:
                     await session.post(
                         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                        json={"chat_id": staff_chat_id, "text": text, "reply_markup": keyboard,
+                        json={"chat_id": staff_chat_id, "text": text,
                               "parse_mode": "HTML", "disable_web_page_preview": True},
                         timeout=aiohttp.ClientTimeout(total=8),
                     )
@@ -4221,15 +4217,12 @@ async def _notify_new_site_user(first_name: str, phone: str, method: str):
         f"👤 {first_name}, 📞 <code>{phone}</code>, 🔐 {method_icon}, 🌐\n"
         f"📅 {now}"
     )
+    # Только группа — раньше слало ещё персонально каждому сотруднику с тумблером
+    # "Уведомления о новых клиентах", включая владельца бота (утечка в личку).
     targets = []
     group_id = await _get_cfg("new_clients_group_id")
     if group_id:
         targets.append(group_id)
-    try:
-        staff_ids = await db.get_staff_notify_new_users()
-        targets.extend(str(tid) for tid in staff_ids)
-    except Exception:
-        pass
     async with aiohttp.ClientSession() as s:
         for chat_id in targets:
             try:
@@ -7388,23 +7381,6 @@ async def _driver_take_delivery_core(order_id: int, staff: dict, source: str = "
 async def driver_take_delivery(order_id: int, staff=Depends(get_current_staff)):
     return await _driver_take_delivery_core(order_id, staff)
 
-@app.post("/api/staff/my-route/stops/{order_id}/undo-delivered")
-async def driver_undo_delivered(order_id: int, staff=Depends(get_current_staff)):
-    if not _can_drive(staff): raise HTTPException(403, "Нет доступа")
-    name = _driver_name(staff)
-    async with db.pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT status FROM orders WHERE id=$1", order_id)
-        if not row: raise HTTPException(404)
-        if row["status"] != "delivered":
-            raise HTTPException(400, f"Статус заказа: {row['status']}")
-        await conn.execute("UPDATE orders SET status='delivery', updated_at=NOW() WHERE id=$1", order_id)
-        await conn.execute("UPDATE route_orders SET stop_status='pending', driver_confirmed=TRUE WHERE order_id=$1", order_id)
-        await conn.execute(
-            "INSERT INTO order_activity (order_id, staff_id, staff_name, action, details) VALUES ($1,$2,$3,$4,$5)",
-            order_id, staff["id"], name, "undo_delivered", "↩️ Отменён статус «Доставлен» (web)")
-    asyncio.create_task(_update_api_channel_stop(order_id))
-    return {"ok": True}
-
 @app.post("/api/staff/my-route/stops/{order_id}/undo-delivery")
 async def driver_undo_delivery(order_id: int, staff=Depends(get_current_staff)):
     if not _can_drive(staff): raise HTTPException(403, "Нет доступа")
@@ -7807,7 +7783,6 @@ async def approve_debt_approval_ep(
                     else:
                         new_text = _fmt_stop_text_api(ch_info, ch_info["stop_num"])
                         kb = {"inline_keyboard": [
-                            [{"text": "↩️ Отменить «Доставлен»", "callback_data": f"rp:{order_id}:undo_delivered"}],
                             [{"text": "📦 Позиции", "callback_data": f"rp:{order_id}:items"},
                              {"text": "📋 История", "callback_data": f"rp:{order_id}:history"},
                              {"text": "🔄 Обновить", "callback_data": f"rp:{order_id}:refresh"}],
