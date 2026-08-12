@@ -4509,8 +4509,6 @@ async def admin_change_order_status(order_id: int, staff=Depends(get_current_sta
                     detail=f"У {len(bad)} позиций замер провёл не мойщик — назначьте мойщика "
                            f"или откройте позицию, чтобы её мог взять мойщик")
 
-    _prev_order = await db.get_order_by_id(order_id)
-    _prev_status = _prev_order.get("status") if _prev_order else None
     order = await db.update_order_status(order_id, status,
                                           note=note or f"Статус изменён сотрудником {staff.get('login','')}")
     if status == 'packing' and packer_login:
@@ -4573,15 +4571,9 @@ async def admin_change_order_status(order_id: int, staff=Depends(get_current_sta
         except Exception as e:
             logging.warning(f"TG notify failed for order {order_id}: {e}")
 
-    # ── SMS клиенту при переходе в «Готов» (если включено в Тексты SMS) ──────
-    if status == "ready" and _prev_status != "ready":
-        try:
-            _ready_count = len(await db.get_order_items(order_id))
-            asyncio.create_task(_send_sms_notification(
-                "ready", order_id, order.get("client_phone", ""), order.get("order_num", ""),
-                _ready_count, "ru", staff["company_id"], staff.get("id"), staff.get("login", "")))
-        except Exception as e:
-            logging.warning(f"ready SMS trigger failed order={order_id}: {e}")
+    # SMS при переходе в «Готов» больше не шлём молча — фронт после успешной смены
+    # статуса сам спросит (модалка "Отправить SMS клиенту?" с выбором языка), тот же
+    # эндпоинт что и ручная отправка. Портировано из прода (запрос 2026-08-07).
 
     # ── Синхронизировать stop_status в маршруте ──────────────────────────────
     # ── Комиссия агента при доставке ─────────────────────────────────────────
@@ -7360,6 +7352,18 @@ async def admin_send_pickup_sms(order_id: int, req: ManualSmsRequest,
     sent, reason = await _send_sms_notification(kind, order_id, order.get("client_phone"), order.get("order_num"),
                                                  len(items), req.lang, staff["company_id"], staff["id"], name)
     return {"ok": True, "sent": sent, "reason": reason}
+
+
+@app.get("/api/staff/settings/sms-toggles")
+async def staff_sms_toggles(staff=Depends(require_perm("orders"))):
+    """Токены сотрудников (staff.html) не проходят _get_admin для не-admin ролей,
+    поэтому /admin/sms/settings им недоступен. Отдельный лёгкий staff-эндпоинт —
+    только два тоглера, нужных модалке подтверждения SMS при смене статуса.
+    Портировано из прода."""
+    return {
+        "sms_pickup_enabled": (await _get_cfg("sms_pickup_enabled")) == "true",
+        "sms_ready_enabled":  (await _get_cfg("sms_ready_enabled"))  == "true",
+    }
 
 
 async def _driver_take_delivery_core(order_id: int, staff: dict, source: str = "web") -> dict:
