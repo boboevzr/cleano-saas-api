@@ -390,6 +390,11 @@ async def create_tables():
         # сохранения, из-за чего позиции показывались вперемешку RU/UZ клиенту)
         "ALTER TABLE order_items ADD COLUMN IF NOT EXISTS service_ru TEXT DEFAULT NULL",
         "ALTER TABLE order_items ADD COLUMN IF NOT EXISTS service_uz TEXT DEFAULT NULL",
+        # Отсрочка доставки после статуса "Готов" — клиент просит подождать (ремонт,
+        # переезд, отпуск). Заказ остаётся в статусе ready, поля работают поверх него.
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS postponed_until DATE DEFAULT NULL",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS postpone_reason TEXT DEFAULT NULL",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS postponed_by INTEGER REFERENCES staff(id) ON DELETE SET NULL DEFAULT NULL",
         # Маршруты: хранить TG message_id отправленных сообщений водителям
         "ALTER TABLE routes ADD COLUMN IF NOT EXISTS tg_delivery_msg_ids JSONB DEFAULT NULL",
         # Маршруты логистики
@@ -5415,6 +5420,10 @@ async def update_order_status(order_id: int, status: str, note: str = "") -> dic
             sql = "UPDATE orders SET status=$2, washed_at=NOW() WHERE id=$1 AND company_id=$3 RETURNING *"
         elif status == 'packing':
             sql = "UPDATE orders SET status=$2, packed_at=NOW() WHERE id=$1 AND company_id=$3 RETURNING *"
+        elif status != 'ready':
+            # Уходим из "Готов" — отсрочка доставки (если была) больше не актуальна.
+            sql = """UPDATE orders SET status=$2, postponed_until=NULL,
+                     postpone_reason=NULL, postponed_by=NULL WHERE id=$1 AND company_id=$3 RETURNING *"""
         else:
             sql = "UPDATE orders SET status=$2 WHERE id=$1 AND company_id=$3 RETURNING *"
         row = await conn.fetchrow(sql, order_id, status, cid)
@@ -5424,6 +5433,41 @@ async def update_order_status(order_id: int, status: str, note: str = "") -> dic
                 VALUES ($1, $2, $3)
             """, dict(row).get("order_num", ""), status, note)
         return dict(row) if row else {}
+
+async def set_order_postpone(order_id: int, until_date, reason: str, staff_id: int) -> dict:
+    """Отложить доставку заказа в статусе "Готов" — клиент попросил подождать."""
+    if not pool: return {}
+    cid = _cid()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE orders SET postponed_until=$2, postpone_reason=$3, postponed_by=$4
+            WHERE id=$1 AND company_id=$5 AND status='ready' RETURNING *
+        """, order_id, until_date, reason, staff_id, cid)
+        return dict(row) if row else {}
+
+async def get_orders_for_postpone_reminder() -> list:
+    """Заказы всех компаний, у которых отсрочка доставки истекает завтра — для
+    ежедневного напоминания администраторам/менеджерам созвониться с клиентом."""
+    if not pool: return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT o.*, TRIM(COALESCE(s.last_name,'') || ' ' || COALESCE(s.first_name,'')) AS postponed_by_name
+            FROM orders o
+            LEFT JOIN staff s ON s.id = o.postponed_by
+            WHERE o.status='ready' AND o.postponed_until = (CURRENT_DATE + INTERVAL '1 day')::date
+        """)
+        return [dict(r) for r in rows]
+
+async def get_order_managers(company_id: int, branch: str | None) -> list:
+    """admin (видят все филиалы своей компании) + manager этого филиала, с TG."""
+    if not pool: return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, first_name, last_name, tg_id FROM staff
+            WHERE company_id=$1 AND active=TRUE AND tg_id IS NOT NULL
+              AND (role='admin' OR (role='manager' AND (branch=$2 OR branch IS NULL)))
+        """, company_id, branch)
+        return [dict(r) for r in rows]
 
 async def get_order_items(order_id: int) -> list:
     if not pool: return []

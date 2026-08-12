@@ -129,6 +129,7 @@ async def startup():
     asyncio.create_task(_chat_timeout_worker())
     asyncio.create_task(_measure_review_worker())
     asyncio.create_task(_debt_reminder_worker())
+    asyncio.create_task(_postpone_reminder_worker())
     asyncio.create_task(_route_rollover_worker())
     await db.ensure_sms_dispatch_table()
     await db.migrate_company1_positions()
@@ -388,6 +389,49 @@ async def _debt_reminder_worker():
             await _send_debt_reminders()
         except Exception as e:
             logging.warning(f"debt reminder error: {e}")
+
+
+async def _send_postpone_reminders():
+    """За день до истечения отсрочки доставки (см. /orders/{id}/postpone) —
+    напомнить admin/менеджерам филиала (своей компании) созвониться с клиентом."""
+    orders = await db.get_orders_for_postpone_reminder()
+    if not orders:
+        return
+    for o in orders:
+        managers = await db.get_order_managers(o.get("company_id") or 1, o.get("branch"))
+        if not managers:
+            continue
+        client = " ".join(p for p in [o.get("client_first_name"), o.get("client_last_name")] if p).strip() or "—"
+        until = o.get("postponed_until")
+        until_str = until.strftime("%d.%m.%Y") if hasattr(until, "strftime") else str(until or "")
+        msg = (
+            f"⏸ Завтра ({until_str}) истекает отсрочка доставки\n"
+            f"📋 Заказ {o.get('order_num')}\n"
+            f"👤 {client}\n"
+            f"📞 {o.get('client_phone') or '—'}\n"
+            f"📝 Причина: {o.get('postpone_reason') or '—'}\n"
+            f"👷 Отложил: {o.get('postponed_by_name') or '—'}\n\n"
+            f"Нужно созвониться с клиентом — согласовать доставку или отложить ещё."
+        )
+        for m in managers:
+            await send_tg(m["tg_id"], msg)
+
+
+async def _postpone_reminder_worker():
+    from datetime import timezone as _tz, timedelta as _td
+    _TZ5 = _tz(_td(hours=5))
+    while True:
+        from datetime import datetime as _dt
+        now = _dt.now(_TZ5)
+        target = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        if now >= target:
+            target = target + _td(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            await _send_postpone_reminders()
+        except Exception as e:
+            logging.warning(f"postpone reminder error: {e}")
+
 
 async def _salary_accrual_worker():
     """Запускает автоначисление зарплат 1-го числа каждого месяца в 00:05 Ташкент."""
@@ -4645,6 +4689,32 @@ async def admin_change_order_status(order_id: int, staff=Depends(get_current_sta
     except Exception as e:
         logging.warning(f"order_status_changed broadcast error: {e}")
 
+    return {"ok": True, "order": order}
+
+
+@app.post("/api/admin/orders/{order_id}/postpone")
+async def postpone_order_delivery(order_id: int,
+                                   until_date: str = Body(..., embed=True),
+                                   reason: str = Body("", embed=True),
+                                   staff=Depends(require_perm("orders"))):
+    """Отложить доставку заказа в статусе "Готов" — клиент попросил подождать
+    (ремонт, переезд, отпуск). Заказ остаётся в статусе ready, дата+причина
+    показываются бейджем вместо простого "Готов". За день до даты — напоминание
+    администраторам/менеджерам созвониться с клиентом (см. _send_postpone_reminders).
+    Портировано из прода."""
+    from datetime import date as _date
+    try:
+        until = _date.fromisoformat(until_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Неверный формат даты")
+    if until <= _date.today():
+        raise HTTPException(status_code=400, detail="Дата должна быть в будущем")
+    order = await db.set_order_postpone(order_id, until, reason, staff.get("id"))
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден или не в статусе «Готов»")
+    name = " ".join(p for p in [staff.get("first_name"), staff.get("last_name")] if p).strip() or staff.get("login", "")
+    await db.add_order_activity(order_id, staff.get("id"), name, "postponed",
+                                 f"⏸ Доставка отложена до {until.strftime('%d.%m.%Y')}" + (f": {reason}" if reason else ""))
     return {"ok": True, "order": order}
 
 
