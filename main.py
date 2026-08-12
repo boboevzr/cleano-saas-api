@@ -4831,6 +4831,8 @@ async def admin_get_order_items(order_id: int, _=Depends(get_current_staff)):
 
 class OrderItemRequest(BaseModel):
     service: str
+    service_ru: str | None = None
+    service_uz: str | None = None
     sqm: float | None = None
     width_cm: float | None = None
     length_cm: float | None = None
@@ -4876,6 +4878,11 @@ async def admin_update_order_item(order_id: int, item_id: int,
     if sqm: updates["sqm"] = sqm
     if req.width_cm: updates["width_cm"] = req.width_cm
     if req.length_cm: updates["length_cm"] = req.length_cm
+    # service_ru/service_uz — заполняются, только когда позиция выбрана из справочника
+    # (staff.html знает оба варианта сразу); для "своей услуги" остаются NULL —
+    # рендер везде фолбэкается на service.
+    if req.service_ru is not None: updates["service_ru"] = req.service_ru
+    if req.service_uz is not None: updates["service_uz"] = req.service_uz
     item = await db.update_order_item(item_id, **updates)
     if not item:
         raise HTTPException(status_code=404, detail="Позиция не найдена")
