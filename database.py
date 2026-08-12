@@ -7425,17 +7425,25 @@ async def get_orders_with_debt() -> list:
                    TRIM(COALESCE(sr.last_name,'') || ' ' || COALESCE(sr.first_name,'')) AS responsible_name,
                    sr.id AS responsible_id,
                    GREATEST(0,
-                     COALESCE(NULLIF((SELECT SUM(COALESCE(price_per_sqm,0)*COALESCE(sqm,0))
-                                       FROM order_items WHERE order_id=o.id), 0),
-                              COALESCE(o.total_price,0), 0)
-                     - COALESCE(o.discount_sum,0)
-                     - COALESCE(o.delivery_discount,0) - COALESCE(o.manual_discount,0)
+                     -- Сумма к оплате всегда округляется вниз до 1000 (остаток < 1000 не
+                     -- входит в долг) — та же формула, что в staff.html (_drvStopCard) и
+                     -- прод-версии. Портировано из прода 2026-08-07.
+                     (net.net_raw - MOD(net.net_raw, 1000))
                      - COALESCE((SELECT SUM(amount) FROM order_payments
                                   WHERE order_id=o.id
                                     AND NOT (confirmed=FALSE AND confirmed_at IS NOT NULL)),0)
                    ) AS debt_amount
               FROM orders o
               LEFT JOIN staff sr ON sr.id = o.debt_responsible_id
+              CROSS JOIN LATERAL (
+                SELECT GREATEST(0,
+                  COALESCE(NULLIF((SELECT SUM(COALESCE(price_per_sqm,0)*COALESCE(sqm,0))
+                                    FROM order_items WHERE order_id=o.id), 0),
+                           COALESCE(o.total_price,0), 0)
+                  - COALESCE(o.discount_sum,0)
+                  - COALESCE(o.delivery_discount,0) - COALESCE(o.manual_discount,0)
+                ) AS net_raw
+              ) net
              WHERE o.debt_responsible_id IS NOT NULL AND o.company_id=$1
              ORDER BY o.debt_due_date ASC NULLS LAST, o.id DESC
         """, cid)
