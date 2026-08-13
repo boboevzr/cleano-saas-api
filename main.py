@@ -5295,23 +5295,37 @@ async def _send_tg_cash(chat_id, text: str, photo_bytes: bytes = None, filename:
 
 
 @app.get("/api/tg/chat-info")
-async def tg_chat_info(chat_id: int, authorization: str = Header(None)):
+async def tg_chat_info(chat_id: int, company_id: int | None = None, authorization: str = Header(None)):
+    """Проверка ID группы/канала (кнопка 🔍 на формах Telegram-настроек, admin.html
+    и superadmin.html). Группы лидов/заказов/доставки принимают сообщения от
+    СОБСТВЕННОГО бота компании (order_bot_token, см. _notify_new_lead) — не от
+    глобального Cleano-бота (BOT_TOKEN, тот только для медиа-хранилища).
+    Проверять нужно тем же ботом, которым реально будут слаться сообщения,
+    иначе getChat падает с 'chat not found', даже если ID верный.
+
+    Вызывается и обычным admin (своя компания, из токена), и superadmin
+    (любая компания — редактирует чужие, company_id передаётся явно)."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Не авторизован")
-    token = authorization.removeprefix("Bearer ").strip()
+    token_str = authorization.removeprefix("Bearer ").strip()
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token_str, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except Exception:
         raise HTTPException(status_code=401, detail="Токен недействителен")
-    role = payload.get("role", "")
-    sub  = payload.get("sub", "")
-    if sub != "superadmin" and role != "admin":
+    if payload.get("type") == "superadmin":
+        if not company_id:
+            raise HTTPException(status_code=400, detail="company_id обязателен для суперадмина")
+        cid = company_id
+    elif payload.get("sub") == "admin" or payload.get("role") == "admin":
+        cid = int(payload.get("company_id") or 1)
+    else:
         raise HTTPException(status_code=403, detail="Нет доступа")
-    if not BOT_TOKEN:
-        raise HTTPException(400, detail="BOT_TOKEN не настроен")
+    token = await db.get_config_for_company("order_bot_token", cid)
+    if not token:
+        raise HTTPException(400, detail="Бот заказов ещё не подключён для этой компании")
     async with aiohttp.ClientSession() as s:
         async with s.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/getChat",
+            f"https://api.telegram.org/bot{token}/getChat",
             params={"chat_id": chat_id},
             timeout=aiohttp.ClientTimeout(total=10)
         ) as r:
