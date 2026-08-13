@@ -604,6 +604,7 @@ async def _notify_agent_status(lead_id: int, status: str, note: str):
 
 
 async def _notify_new_lead(lead: dict, staff: dict):
+    logging.info(f"_notify_new_lead: start lead_id={lead.get('id')} company_id={lead.get('company_id')} branch={lead.get('branch')!r} _cid={db._cid()}")
     # Web push к callcenter/manager/admin — всегда, независимо от TG настроек
     if db.pool and lead.get("id"):
         try:
@@ -628,6 +629,7 @@ async def _notify_new_lead(lead: dict, staff: dict):
     # Telegram группа — только если включено в настройках
     enabled = await _get_cfg("leads_group_enabled")
     if enabled not in ("1", "true"):
+        logging.info(f"_notify_new_lead: leads_group_enabled={enabled!r} — пропуск")
         return
 
     # Роутинг по филиалу: сначала своя группа из карточки филиала (tg_leads_group_id),
@@ -649,10 +651,13 @@ async def _notify_new_lead(lead: dict, staff: dict):
         else:
             group_id = await _get_cfg("leads_group_id")
 
+    logging.info(f"_notify_new_lead: branch_group_id={branch_group_id!r} branch={branch!r} group_id={group_id!r}")
     if not group_id:
+        logging.info("_notify_new_lead: group_id пустой — пропуск")
         return
 
     template = await _get_cfg("lead_notify_ru")
+    logging.info(f"_notify_new_lead: template len={len(template or '')}")
 
     role    = staff.get("role", "")
     if role == "agent":   source = "🤝 Агент"
@@ -706,6 +711,7 @@ async def _notify_new_lead(lead: dict, staff: dict):
 
     text = template
     if not text:
+        logging.info("_notify_new_lead: template пустой — пропуск")
         return
 
     try:
