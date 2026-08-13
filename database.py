@@ -9617,10 +9617,15 @@ async def get_branches(company_id: int):
         )
 
 async def get_branch_by_slug(company_id: int, slug: str):
+    """Регистронезависимое сравнение: slug у филиалов не нормализуется при
+    создании (может быть введён вручную кириллицей, с заглавной буквы —
+    см. баг 2026-08-13, ON CONFLICT-типа проблема с branch-роутингом лидов,
+    где 'Зарафшан1' и 'зарафшан1' не матчились точным сравнением)."""
     if not pool: return None
     async with pool.acquire() as conn:
         return await conn.fetchrow(
-            "SELECT * FROM branches WHERE company_id=$1 AND slug=$2", company_id, slug
+            "SELECT * FROM branches WHERE company_id=$1 AND LOWER(TRIM(slug))=LOWER(TRIM($2))",
+            company_id, slug
         )
 
 
