@@ -52,7 +52,7 @@ import re
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message, CallbackQuery,
+    Message, CallbackQuery, BufferedInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
 )
@@ -906,6 +906,18 @@ async def set_language(call: CallbackQuery, company_id: int, state: FSMContext) 
     except Exception as e:
         logging.warning(f"set_bot_client_lang error: {e}")
     await call.message.edit_text(t(lang, "lang_set"))
+    # Видео-инструкция — только первый раз для этого клиента (welcome_video_sent
+    # в БД, а не в памяти — переживает рестарт бота), на выбранном языке. Хранится
+    # через глобальный Cleano-бот (см. fetch_bot_welcome_video_bytes в main.py) —
+    # своему боту компании (message.bot) нужны сырые байты, а не чужой file_id.
+    try:
+        if await db.mark_welcome_video_sent(uid, company_id):
+            from main import fetch_bot_welcome_video_bytes
+            video_bytes = await fetch_bot_welcome_video_bytes(company_id, lang)
+            if video_bytes:
+                await call.message.answer_video(BufferedInputFile(video_bytes, filename=f"welcome-{lang}.mp4"))
+    except Exception as e:
+        logging.warning(f"welcome video error: {e}")
     await _show_menu(call.message, lang, company_id)
 
 

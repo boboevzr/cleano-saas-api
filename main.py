@@ -12333,6 +12333,81 @@ async def admin_site_video_status(_=Depends(get_admin)):
     return {"ok": True, "ru": bool(ru), "uz": bool(uz)}
 
 
+# ── Видео-инструкция при первом входе в Telegram-бот компании (отдельно от
+# видео-карточки сайта выше). Хранится тем же приёмом — через ГЛОБАЛЬНЫЙ
+# Cleano-бот (BOT_TOKEN) в media_ch, — но клиенту её шлёт КОНКРЕТНЫЙ бот
+# компании (order_bot_token), а file_id одного бота не работает у другого.
+# Поэтому раздача — не reuse file_id, а скачивание сырых байт глобальным ботом
+# и пересылка через message.bot самой компании — см. fetch_bot_welcome_video_bytes,
+# вызывается из order_bot_handlers.set_language.
+@app.post("/api/admin/bot-welcome-video/{lang}")
+async def admin_upload_bot_welcome_video(lang: str, file: UploadFile = File(...), _=Depends(get_admin)):
+    if lang not in ("ru", "uz"):
+        raise HTTPException(status_code=400, detail="lang должен быть ru или uz")
+    if not (file.content_type or "").startswith("video/"):
+        raise HTTPException(status_code=400, detail="Файл должен быть видео")
+    media_ch = await _get_media_channel()
+    if not BOT_TOKEN or not media_ch:
+        raise HTTPException(status_code=503, detail="Медиа-хранилище не настроено")
+    file_bytes = await file.read()
+    if len(file_bytes) > MAX_SITE_VIDEO_BYTES:
+        raise HTTPException(status_code=400, detail=f"Видео слишком большое (макс. {MAX_SITE_VIDEO_BYTES//1_000_000} МБ)")
+    form = aiohttp.FormData()
+    form.add_field("chat_id", str(media_ch))
+    form.add_field("video", file_bytes, filename=file.filename or f"bot-welcome-{lang}.mp4", content_type=file.content_type)
+    form.add_field("caption", f"Bot welcome video ({lang})")
+    async with aiohttp.ClientSession() as s:
+        async with s.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo", data=form,
+                           timeout=aiohttp.ClientTimeout(total=60)) as r:
+            result = await r.json()
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=f"Telegram: {result.get('description','upload failed')}")
+    file_id = result["result"]["video"]["file_id"]
+    await db.set_config(f"bot_welcome_video_file_id_{lang}", file_id)
+    return {"ok": True}
+
+
+@app.delete("/api/admin/bot-welcome-video/{lang}")
+async def admin_delete_bot_welcome_video(lang: str, _=Depends(get_admin)):
+    if lang not in ("ru", "uz"):
+        raise HTTPException(status_code=400, detail="lang должен быть ru или uz")
+    await db.set_config(f"bot_welcome_video_file_id_{lang}", "")
+    return {"ok": True}
+
+
+@app.get("/api/admin/bot-welcome-video-status")
+async def admin_bot_welcome_video_status(_=Depends(get_admin)):
+    ru = await db.get_config("bot_welcome_video_file_id_ru")
+    uz = await db.get_config("bot_welcome_video_file_id_uz")
+    return {"ok": True, "ru": bool(ru), "uz": bool(uz)}
+
+
+async def fetch_bot_welcome_video_bytes(company_id: int, lang: str) -> bytes | None:
+    """Скачивает сырые байты видео-инструкции компании через глобальный Cleano-бот
+    (тем же file_id, которым его туда когда-то загрузили). Вызывается из
+    order_bot_handlers.set_language — там видео пересылается через СВОЙ бот
+    компании (message.bot), т.к. file_id одного бота не работает у другого."""
+    if not BOT_TOKEN:
+        return None
+    file_id = await db.get_config_for_company(f"bot_welcome_video_file_id_{lang}", company_id)
+    if not file_id:
+        return None
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+                              params={"file_id": file_id}, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+            if not data.get("ok"):
+                return None
+            file_path = data["result"]["file_path"]
+            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+            async with s.get(file_url, timeout=aiohttp.ClientTimeout(total=60)) as fr:
+                return await fr.read()
+    except Exception as e:
+        logging.warning(f"fetch_bot_welcome_video_bytes error: {e}")
+        return None
+
+
 @app.get("/api/site-video/{lang}")
 async def public_site_video(lang: str, request: Request, company_slug: str = None):
     """Публичная раздача видео-карточки сайта компании — без авторизации."""

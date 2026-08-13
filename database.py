@@ -395,6 +395,9 @@ async def create_tables():
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS postponed_until DATE DEFAULT NULL",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS postpone_reason TEXT DEFAULT NULL",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS postponed_by INTEGER REFERENCES staff(id) ON DELETE SET NULL DEFAULT NULL",
+        # Видео-инструкция бота — отправляется один раз каждому новому клиенту
+        # после выбора языка, флаг переживает рестарт бота (не in-memory)
+        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS welcome_video_sent BOOLEAN DEFAULT FALSE",
         # Маршруты: хранить TG message_id отправленных сообщений водителям
         "ALTER TABLE routes ADD COLUMN IF NOT EXISTS tg_delivery_msg_ids JSONB DEFAULT NULL",
         # Маршруты логистики
@@ -7716,6 +7719,19 @@ async def set_bot_client_lang(tg_id: int, lang: str, company_id: int) -> None:
         await conn.execute(
             "UPDATE clients SET lang=$1, updated_at=NOW() WHERE tg_id=$2 AND company_id=$3",
             lang, tg_id, company_id)
+
+async def mark_welcome_video_sent(tg_id: int, company_id: int) -> bool:
+    """Атомарно помечает, что видео-инструкция отправлена этому клиенту этой
+    компании. Возвращает True только если флаг реально был снят (т.е. это
+    первый раз) — чтобы не слать видео повторно при каждом /start."""
+    if not pool: return False
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE clients SET welcome_video_sent=TRUE "
+            "WHERE tg_id=$1 AND company_id=$2 AND COALESCE(welcome_video_sent,FALSE)=FALSE RETURNING id",
+            tg_id, company_id
+        )
+        return row is not None
 
 async def get_services_for_company(company_id: int) -> list[dict]:
     """Список услуг компании (для клавиатуры выбора услуги в боте)."""
