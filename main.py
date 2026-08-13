@@ -12430,6 +12430,36 @@ async def fetch_bot_welcome_video_bytes(company_id: int, lang: str) -> bytes | N
         return None
 
 
+async def bot_register_client(phone: str, first_name: str, lang: str, company_id: int, tg_id: int) -> dict:
+    """Регистрация сайтового аккаунта, инициированная ИЗ бота (кнопка «Зарегистрироваться»
+    в главном меню — order_bot_handlers.RegisterForm). Отдельный путь от
+    /api/register-via-tg (тот вызывается САЙТОМ после подтверждения телефона через бота,
+    там пароль выбирает сам клиент). Здесь пароль генерируется сервером — клиент уже
+    подтвердил владение номером в реальном времени, поделившись контактом в боте,
+    поэтому дополнительный код подтверждения не нужен (тот же довод, что в проде)."""
+    existing = await db.get_user_by_phone(phone, company_id)
+    if existing and existing.get("is_verified"):
+        return {"ok": False, "already_registered": True}
+
+    import secrets, string
+    password = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(10))
+    password_hash = pwd_context.hash(password[:72])
+
+    await db.create_user(phone, password_hash, first_name, company_id)
+    await db.verify_user(phone, company_id)
+    await db.link_user_tg_id(phone, tg_id, company_id)
+
+    user = await db.get_user_by_phone(phone, company_id)
+    if not user:
+        return {"ok": False}
+    await db.set_user_must_change_password(user["id"], True)
+    asyncio.create_task(db.update_user_last_login(user["id"]))
+    asyncio.create_task(db.upsert_crm_client(phone=phone, first_name=first_name, source="bot_register"))
+    asyncio.create_task(_notify_new_site_user(first_name, phone, "tg"))
+
+    return {"ok": True, "password": password, "user": dict(user)}
+
+
 @app.get("/api/site-video/{lang}")
 async def public_site_video(lang: str, request: Request, company_slug: str = None):
     """Публичная раздача видео-карточки сайта компании — без авторизации."""

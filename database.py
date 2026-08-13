@@ -377,6 +377,9 @@ async def create_tables():
         "ALTER TABLE clients ADD COLUMN IF NOT EXISTS language  VARCHAR(5)  DEFAULT 'ru'",
         # Users: привязка Telegram ID
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_id BIGINT",
+        # Users: обязательная смена пароля (для аккаунтов с сервер-сгенерированным
+        # паролем — регистрация из бота, см. bot_register_client в main.py)
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE",
         # Staff: уникальный логин для ON CONFLICT
         "CREATE UNIQUE INDEX IF NOT EXISTS staff_login_unique ON staff(login)",
         # Orders: хранить текстовый адрес геолокации
@@ -2252,6 +2255,11 @@ async def link_user_tg_id(phone: str, tg_id: int, company_id: int):
             UPDATE users SET tg_id = $2, updated_at = NOW()
             WHERE phone = $1 AND company_id = $3
         """, phone, tg_id, company_id)
+
+async def set_user_must_change_password(user_id: int, value: bool):
+    if not pool: return
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE users SET must_change_password=$2 WHERE id=$1", user_id, value)
 
 async def save_tg_phone_link(phone: str, tg_id: int):
     """Сохраняет связку телефон→tg_id от бота (до регистрации на сайте)."""

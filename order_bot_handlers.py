@@ -106,6 +106,15 @@ class OperatorForm(StatesGroup):
     message = State()
 
 
+class RegisterForm(StatesGroup):
+    """Регистрация аккаунта на сайте компании прямо из бота (перенесено из
+    прод-бота, class RegisterForm ~L674). Пароль генерируется сервером
+    (main.register_via_tg) и присылается отдельным сообщением от лица
+    СВОЕГО бота компании — здесь нет HTTP-петли на себя же (один процесс)."""
+    waiting_name    = State()
+    waiting_contact = State()
+
+
 class AdminReplyForm(StatesGroup):
     """Сотрудник нажал «Ответить клиенту» в группе — следующее его сообщение
     (в ТОЙ ЖЕ группе, от того же tg_id — FSM-ключ включает chat_id+user_id,
@@ -202,6 +211,18 @@ T = {
         "btn_cancel":     "❌ Отмена",
         "btn_menu":       "🏠 Меню",
         "cancelled":      "❌ Отменено.",
+
+        # ── Регистрация на сайте через бота ──
+        "menu_register_hint": "<i>📝 Чтобы отслеживать статус заказов в боте или на сайте — зарегистрируйтесь, нажав кнопку «Зарегистрироваться» ниже</i>",
+        "btn_reg_start":  "📝 Зарегистрироваться",
+        "reg_ask_name":   "👤 Как к вам обращаться?",
+        "btn_reg_type_name": "✏️ Ввести другое имя",
+        "reg_name_empty": "⚠️ Введите имя",
+        "reg_ask_phone":  "📞 Теперь поделитесь номером телефона:",
+        "reg_already_registered": "ℹ️ <b>У вас уже есть аккаунт на сайте</b>\n\n📱 {phone}\n\nВойдите с этим номером.",
+        "reg_success":    "✅ <b>Готово!</b> Данные для входа отправлены отдельным сообщением.",
+        "reg_error":      "❌ Не удалось зарегистрировать. Попробуйте позже.",
+        "reg_own_phone_only": "❌ Поделитесь своим номером.",
 
         # ── Полный заказ (OrderForm) ──
         "btn_order_full": "📅 Заказать с выездом",
@@ -333,6 +354,18 @@ T = {
         "btn_menu":       "🏠 Menyu",
         "cancelled":      "❌ Bekor qilindi.",
 
+        # ── Bot orqali saytda ro'yxatdan o'tish ──
+        "menu_register_hint": "<i>📝 Botda yoki saytda buyurtmalar holatini kuzatish uchun — pastdagi «Ro'yxatdan o'tish» tugmasini bosib ro'yxatdan o'ting</i>",
+        "btn_reg_start":  "📝 Ro'yxatdan o'tish",
+        "reg_ask_name":   "👤 Sizga qanday murojaat qilish kerak?",
+        "btn_reg_type_name": "✏️ Boshqa ism kiritish",
+        "reg_name_empty": "⚠️ Ismingizni kiriting",
+        "reg_ask_phone":  "📞 Endi telefon raqamingizni ulashing:",
+        "reg_already_registered": "ℹ️ <b>Sizda akkaunt allaqachon bor</b>\n\n📱 {phone}\n\nShu raqam bilan kiring.",
+        "reg_success":    "✅ <b>Tayyor!</b> Kirish uchun ma'lumotlar alohida xabarda yuborildi.",
+        "reg_error":      "❌ Ro'yxatdan o'tkazib bo'lmadi. Keyinroq urinib ko'ring.",
+        "reg_own_phone_only": "❌ O'z raqamingizni ulashing.",
+
         # ── To'liq buyurtma (OrderForm) ──
         "btn_order_full": "📅 Chiqib olib ketish bilan buyurtma",
         "ask_branch":     "🏢 Filialni tanlang:",
@@ -453,12 +486,13 @@ def lang_kb() -> InlineKeyboardMarkup:
     ]])
 
 
-def menu_kb(lang: str, site_url: str) -> InlineKeyboardMarkup:
+def menu_kb(lang: str, site_url: str, show_register: bool = False) -> InlineKeyboardMarkup:
     """Главное меню — структура рядов как в прод-боте (menu_kb ~L719-729):
     ссылка на сайт → «Оставить заявку» (ведёт в подменю быстрая/полная,
-    см. menu_order ниже) → статус+цены → калькулятор+профиль → оператор.
+    см. menu_order ниже) → статус+цены → калькулятор+профиль → оператор →
+    (если нет сайтового аккаунта) «Зарегистрироваться».
     "Стать Агентом" — кнопка внутри «Мой профиль» (см. menu_profile), не здесь."""
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text=t(lang, "btn_webapp"), url=site_url)],
         [InlineKeyboardButton(text=t(lang, "btn_order"), callback_data="menu_order")],
         [InlineKeyboardButton(text=t(lang, "btn_status"), callback_data="menu_status"),
@@ -466,7 +500,10 @@ def menu_kb(lang: str, site_url: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=t(lang, "btn_calc"), callback_data="menu_calc"),
          InlineKeyboardButton(text=t(lang, "btn_profile"), callback_data="menu_profile")],
         [InlineKeyboardButton(text=t(lang, "btn_operator"), callback_data="menu_operator")],
-    ])
+    ]
+    if show_register:
+        rows.append([InlineKeyboardButton(text=t(lang, "btn_reg_start"), callback_data="reg_start")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def status_menu_kb(lang: str, counts: dict) -> InlineKeyboardMarkup:
@@ -722,10 +759,11 @@ def _branch_phone_list(branch: dict) -> list[str]:
     return out
 
 
-async def _build_menu_text(lang: str, company_id: int) -> str:
+async def _build_menu_text(lang: str, company_id: int, registered: bool = True) -> str:
     """Динамический текст главного меню (аналог статичного текста прод-бота,
     см. задание): название компании + тэглайн, филиалы, короткий номер (если
-    задан), основной номер (всегда 2 строки), телефоны по филиалам."""
+    задан), основной номер (всегда 2 строки), телефоны по филиалам.
+    registered=False — добавляет подсказку про регистрацию (см. _show_menu)."""
     try:
         company = await db.get_company(company_id)
     except Exception as e:
@@ -795,15 +833,28 @@ async def _build_menu_text(lang: str, company_id: int) -> str:
             lines.append(_h(bname))
             lines.extend(f"📱 {_h(p)}" for p in phones)
 
+    if not registered:
+        lines.append("")
+        lines.append(t(lang, "menu_register_hint"))
+
     return "\n".join(lines)
 
 
-async def _show_menu(target, lang: str, company_id: int) -> None:
+async def _show_menu(target, lang: str, company_id: int, uid: int | None = None) -> None:
     """target — Message/CallbackQuery.message. Показывает динамическое главное меню
-    (текст + клавиатура с корректной ссылкой на витрину компании)."""
-    header = await _build_menu_text(lang, company_id)
+    (текст + клавиатура с корректной ссылкой на витрину компании). Если передан
+    uid — проверяет, есть ли у него сайтовый аккаунт этой компании, и добавляет
+    подсказку + кнопку «Зарегистрироваться» (аналог _menu_text_and_kb в прод-боте)."""
+    registered = True
+    if uid is not None:
+        try:
+            registered = bool(await db.get_user_by_tg_id(uid, company_id))
+        except Exception as e:
+            logging.warning(f"get_user_by_tg_id error: {e}")
+            registered = True  # при сбое лучше не показывать лишнюю кнопку
+    header = await _build_menu_text(lang, company_id, registered)
     site_url = await _site_url(company_id)
-    await target.answer(header, reply_markup=menu_kb(lang, site_url))
+    await target.answer(header, reply_markup=menu_kb(lang, site_url, show_register=not registered))
 
 
 async def _build_prices_text(lang: str, company_id: int) -> str:
@@ -890,7 +941,7 @@ async def start(message: Message, company_id: int, state: FSMContext) -> None:
 
     if lang:
         await state.update_data(lang=lang)
-        await _show_menu(message, lang, company_id)
+        await _show_menu(message, lang, company_id, uid)
     else:
         await message.answer(t("ru", "hello"), reply_markup=lang_kb())
 
@@ -918,7 +969,7 @@ async def set_language(call: CallbackQuery, company_id: int, state: FSMContext) 
                 await call.message.answer_video(BufferedInputFile(video_bytes, filename=f"welcome-{lang}.mp4"))
     except Exception as e:
         logging.warning(f"welcome video error: {e}")
-    await _show_menu(call.message, lang, company_id)
+    await _show_menu(call.message, lang, company_id, uid)
 
 
 @router.callback_query(F.data == "go_menu")
@@ -931,7 +982,7 @@ async def go_menu(call: CallbackQuery, company_id: int, state: FSMContext) -> No
         await call.message.answer(t("ru", "hello"), reply_markup=lang_kb())
         return
     await state.update_data(lang=lang)
-    await _show_menu(call.message, lang, company_id)
+    await _show_menu(call.message, lang, company_id, uid)
 
 
 @router.callback_query(F.data == "cancel_order")
@@ -943,6 +994,133 @@ async def cancel_order(call: CallbackQuery, company_id: int, state: FSMContext) 
     await state.update_data(lang=lang)
     site_url = await _site_url(company_id)
     await call.message.answer(t(lang, "cancelled"), reply_markup=menu_kb(lang, site_url))
+
+
+# ══════════════════════════════════════
+#  РЕГИСТРАЦИЯ НА САЙТЕ ЧЕРЕЗ БОТА (перенесено из прод-бота, ~L1466-1568).
+#  Кнопка «Зарегистрироваться» появляется в главном меню только когда у
+#  этого tg_id ещё нет сайтового аккаунта ЭТОЙ компании (см. _show_menu).
+# ══════════════════════════════════════
+@router.callback_query(F.data == "reg_start")
+async def register_start(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    fname = (call.from_user.first_name or "").strip()
+    if call.from_user.last_name:
+        fname = (fname + " " + call.from_user.last_name).strip()
+    rows = []
+    if fname:
+        rows.append([InlineKeyboardButton(text=f"✅ {fname}", callback_data="reg_use_tgname")])
+    rows.append([InlineKeyboardButton(text=t(lang, "btn_reg_type_name"), callback_data="reg_type_name")])
+    rows.append([InlineKeyboardButton(text=t(lang, "btn_menu"), callback_data="go_menu")])
+    await state.set_state(RegisterForm.waiting_name)
+    await call.message.answer(t(lang, "reg_ask_name"), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(RegisterForm.waiting_name, F.data == "reg_use_tgname")
+async def register_name_from_tg(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    name = (call.from_user.first_name or "").strip()
+    if call.from_user.last_name:
+        name = (name + " " + call.from_user.last_name).strip()
+    await state.update_data(name=name)
+    await state.set_state(RegisterForm.waiting_contact)
+    await call.message.answer(t(lang, "reg_ask_phone"), reply_markup=ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text=t(lang, "btn_share_phone"), request_contact=True)],
+    ], resize_keyboard=True, one_time_keyboard=True))
+
+
+@router.callback_query(RegisterForm.waiting_name, F.data == "reg_type_name")
+async def register_name_prompt_typed(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    await call.message.answer(t(lang, "reg_ask_name"))
+
+
+@router.message(RegisterForm.waiting_name)
+async def register_name_typed(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer(t(lang, "reg_name_empty"))
+        return
+    await state.update_data(name=name)
+    await state.set_state(RegisterForm.waiting_contact)
+    await message.answer(t(lang, "reg_ask_phone"), reply_markup=ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text=t(lang, "btn_share_phone"), request_contact=True)],
+    ], resize_keyboard=True, one_time_keyboard=True))
+
+
+@router.message(RegisterForm.waiting_contact, F.contact)
+async def register_contact_received(message: Message, company_id: int, state: FSMContext) -> None:
+    uid = message.from_user.id
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    if message.contact.user_id and int(message.contact.user_id) != uid:
+        await message.answer(t(lang, "reg_own_phone_only"), reply_markup=ReplyKeyboardRemove())
+        return
+
+    phone = normalize_phone_bot(message.contact.phone_number or "")
+    if not phone:
+        await message.answer(t(lang, "phone_invalid"), reply_markup=ReplyKeyboardRemove())
+        return
+
+    name = (data.get("name") or message.from_user.first_name or "").strip()
+    await state.clear()
+    await state.update_data(lang=lang)
+
+    await message.answer("⏳", reply_markup=ReplyKeyboardRemove())
+
+    try:
+        await db.upsert_bot_client(
+            tg_id=uid, company_id=company_id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
+            phone=phone, lang=lang,
+            tg_phone=phone,
+        )
+    except Exception as e:
+        logging.warning(f"upsert_bot_client (register) error: {e}")
+
+    kb_back = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t(lang, "btn_menu"), callback_data="go_menu")]])
+
+    try:
+        from main import bot_register_client
+        result = await bot_register_client(phone, name, lang, company_id, uid)
+    except Exception as e:
+        logging.warning(f"bot_register_client error: {e}")
+        result = {"ok": False}
+
+    if result.get("already_registered"):
+        await message.answer(t(lang, "reg_already_registered").format(phone=phone), reply_markup=kb_back)
+        return
+
+    if not result.get("ok"):
+        await message.answer(t(lang, "reg_error"), reply_markup=kb_back)
+        return
+
+    # Без кнопки меню — кредсы придут отдельным сообщением, там уже своя кнопка «Меню».
+    await message.answer(t(lang, "reg_success"))
+    creds_text = (
+        f"🎉 Регистрация завершена!\n\n"
+        f"📱 Номер / Логин: <code>{phone}</code>\n"
+        f"🔑 Пароль: <code>{result['password']}</code>\n\n"
+        f"⚠️ Пароль можно сменить в личном кабинете на сайте."
+        if lang != "uz" else
+        f"🎉 Ro'yxatdan o'tish yakunlandi!\n\n"
+        f"📱 Raqam / Login: <code>{phone}</code>\n"
+        f"🔑 Parol: <code>{result['password']}</code>\n\n"
+        f"⚠️ Parolni saytdagi shaxsiy kabinetda almashtirish mumkin."
+    )
+    await message.answer(creds_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t(lang, "btn_menu"), callback_data="go_menu")]
+    ]))
 
 
 # ══════════════════════════════════════
@@ -2324,4 +2502,4 @@ async def echo_fallback(message: Message, company_id: int, state: FSMContext) ->
     lang = data.get("lang") or await _resolve_lang(message.from_user.id, company_id, state) or "ru"
     await state.clear()
     await state.update_data(lang=lang)
-    await _show_menu(message, lang, company_id)
+    await _show_menu(message, lang, company_id, message.from_user.id)
