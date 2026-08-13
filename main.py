@@ -632,12 +632,16 @@ async def _notify_new_lead(lead: dict, staff: dict):
 
     # Роутинг по филиалу: сначала своя группа из карточки филиала (tg_leads_group_id),
     # затем legacy ARTEZ-ключи (для обратной совместимости), затем общий fallback.
+    # branch вычисляется ДО ветвления и используется дальше в vars_["branch"] —
+    # раньше был объявлен только внутри else и падал с UnboundLocalError, когда
+    # филиал резолвился через branch_group_id (сообщение просто не уходило, тихо,
+    # т.к. вся функция — fire-and-forget asyncio.create_task).
     branch_slug = (lead.get("branch", "") or "").strip()
+    branch = branch_slug.lower().replace("📍", "").strip()
     branch_group_id = await db.get_branch_tg_group_id(branch_slug, "tg_leads_group_id") if branch_slug else None
     if branch_group_id:
         group_id = str(branch_group_id)
     else:
-        branch = branch_slug.lower().replace("📍", "").strip()
         if branch in ("zarafshan", "зарафшан", "zarafshon"):
             group_id = await _get_cfg("leads_group_zarafshan") or await _get_cfg("leads_group_id")
         elif branch in ("navoi", "навои", "navoiy"):
