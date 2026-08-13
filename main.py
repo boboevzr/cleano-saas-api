@@ -725,6 +725,7 @@ async def _notify_new_lead(lead: dict, staff: dict):
         lead_company_id = lead.get("company_id")
         token = await db.get_config_for_company("order_bot_token", lead_company_id) if lead_company_id else None
         if not token:
+            logging.warning(f"_notify_new_lead: order_bot_token не настроен для company_id={lead_company_id} — пропуск")
             return  # у компании ещё не подключён бот заказов — некому слать уведомление
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {
@@ -736,7 +737,10 @@ async def _notify_new_lead(lead: dict, staff: dict):
         if keyboard:
             payload["reply_markup"] = keyboard
         async with aiohttp.ClientSession() as s:
-            await s.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8))
+            async with s.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                result = await r.json()
+                if not result.get("ok"):
+                    logging.warning(f"_notify_new_lead: Telegram sendMessage failed chat_id={group_id}: {result.get('description')}")
     except Exception as e:
         logging.warning(f"_notify_new_lead error: {e}")
 
