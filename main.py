@@ -330,6 +330,27 @@ async def send_tg(chat_id, text: str):
         logging.warning(f"send_tg error: {e}")
 
 
+async def _send_company_tg(company_id: int, tg_id: int, text: str) -> bool:
+    """Отправляет сообщение клиенту через СОБСТВЕННЫЙ бот его компании
+    (order_bot_token), а не глобальный BOT_TOKEN/send_tg — тот принадлежит
+    другому боту, tg_id клиента с ним может ни разу не пересекаться
+    (см. мульти-бот архитектуру, fetch_bot_welcome_video_bytes/bot_register_client).
+    Возвращает True, если Telegram подтвердил доставку (ok=true)."""
+    token = await db.get_config_for_company("order_bot_token", company_id)
+    if not token or not tg_id:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, json={"chat_id": str(tg_id), "text": text, "parse_mode": "HTML"},
+                               timeout=aiohttp.ClientTimeout(total=5)) as r:
+                result = await r.json()
+                return bool(result.get("ok"))
+    except Exception as e:
+        logging.warning(f"_send_company_tg error: {e}")
+        return False
+
+
 async def _send_debt_reminders():
     from datetime import date as _date
     today = _date.today()
@@ -3362,6 +3383,87 @@ async def login(req: LoginRequest):
     if not user["is_verified"]:
         raise HTTPException(status_code=403, detail=bi("Номер не подтверждён. Запросите код заново","Raqam tasdiqlanmagan. Kodni qayta so'rang"))
 
+    asyncio.create_task(db.update_user_last_login(user["id"]))
+    token = create_token(user["id"], user["phone"], cid)
+    return {
+        "ok": True,
+        "token": token,
+        "user": {
+            "id": user["id"],
+            "phone": user["phone"],
+            "first_name": user["first_name"],
+            "address": user["address"],
+        }
+    }
+
+
+@app.post("/api/forgot-password/request")
+async def forgot_password_request(body: dict):
+    """Отправляет код сброса пароля — в Telegram (через СВОЙ бот компании), если
+    номер к нему привязан, иначе по SMS (тот же принцип, что и register-via-tg)."""
+    phone = normalize_phone((body.get("phone") or "").strip())
+    uz = (body.get("lang") or "ru") == "uz"
+    cid = await _resolve_client_company_id(body.get("company_slug"))
+    if not phone:
+        raise HTTPException(400, "Telefon raqami kerak" if uz else "Укажите номер телефона")
+
+    user = await db.get_user_by_phone(phone, cid)
+    if not user or not user.get("is_verified"):
+        # Не палим существование аккаунта — единый ответ для любого номера.
+        return {"ok": True}
+
+    ok, err = await db.check_sms_rate_limit(phone, "reset")
+    if not ok:
+        raise HTTPException(status_code=429, detail=err)
+
+    code = generate_code()
+    expires_at = datetime.utcnow() + timedelta(minutes=SMS_CODE_TTL_MIN)
+    await db.save_sms_code(phone, code, "reset", expires_at)
+
+    tg_id = user.get("tg_id")
+    if tg_id:
+        from zoneinfo import ZoneInfo
+        expires_str = (datetime.now(ZoneInfo("Asia/Tashkent")) + timedelta(minutes=SMS_CODE_TTL_MIN)).strftime("%d.%m.%Y %H:%M")
+        text = (
+            f"🔐 <b>Код для сброса пароля:</b>\n\n<code>{code}</code>\n\n⏱ Действителен {SMS_CODE_TTL_MIN} минут (до {expires_str})."
+            if not uz else
+            f"🔐 <b>Parolni tiklash kodi:</b>\n\n<code>{code}</code>\n\n⏱ {SMS_CODE_TTL_MIN} daqiqa amal qiladi ({expires_str} gacha)."
+        )
+        if await _send_company_tg(cid, tg_id, text):
+            return {"ok": True}
+
+    await send_sms(phone, await sms_text(code, "reset"))
+    return {"ok": True}
+
+
+@app.post("/api/forgot-password/confirm")
+async def forgot_password_confirm(body: dict):
+    phone = normalize_phone((body.get("phone") or "").strip())
+    code = (body.get("code") or "").strip()
+    new_password = (body.get("password") or "").strip()
+    uz = (body.get("lang") or "ru") == "uz"
+    cid = await _resolve_client_company_id(body.get("company_slug"))
+
+    if not phone or not code or not new_password:
+        raise HTTPException(400, "Yetishmayotgan maydonlar" if uz else "Заполните все поля")
+    if len(new_password) < 6:
+        raise HTTPException(400, "Parol kamida 6 ta belgi" if uz else "Пароль минимум 6 символов")
+
+    # Ограничиваем число попыток подбора кода (не только частоту его запроса).
+    ok, err = await db.check_sms_rate_limit(phone, "reset_attempt")
+    if not ok:
+        raise HTTPException(status_code=429, detail=err)
+    await db.save_sms_code(phone, "attempt", "reset_attempt", datetime.utcnow() + timedelta(minutes=1))
+
+    if not await db.check_sms_code(phone, code, "reset"):
+        raise HTTPException(400, "Kod noto'g'ri yoki eskirgan" if uz else "Неверный или просроченный код")
+
+    user = await db.get_user_by_phone(phone, cid)
+    if not user:
+        raise HTTPException(400, "Foydalanuvchi topilmadi" if uz else "Пользователь не найден")
+
+    password_hash = pwd_context.hash(new_password[:72])
+    await db.update_user_password(user["id"], password_hash)
     asyncio.create_task(db.update_user_last_login(user["id"]))
     token = create_token(user["id"], user["phone"], cid)
     return {
