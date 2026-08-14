@@ -1067,7 +1067,7 @@ async def _render_sms_notification(kind: str, lang: str, order_num: str, count: 
     order_bot_username = await _get_cfg("order_bot_username")
     bot_link = f"t.me/{order_bot_username}" if order_bot_username else ""
     slug = await db.get_company_slug(company_id)
-    site_link = f"https://cleano.uz/?c={slug}" if slug else "https://cleano.uz"
+    site_link = f"https://{slug}.cleano.uz/" if slug else "https://cleano.uz"
     # Текст шаблона отправляется КАК ЕСТЬ (без авто-схлопывания переносов строк/пробелов) —
     # пользователь сам контролирует форматирование под то, что одобрено в Eskiz.
     return (tpl.replace("{order_num}", _order_num_short(order_num))
@@ -8302,6 +8302,7 @@ SITE_SETTINGS_DEFAULTS = {
     "tg_group_zarafshan":  "",
     "tg_group_navoi":      "",
     "tg_group_sms_id":     "",
+    "order_bot_username":  "",
     # Яндекс Карты — fallback из env (общий ключ платформы)
     "yandex_maps_key":     os.getenv("YANDEX_MAPS_KEY", ""),
     # Eskiz SMS (каждая компания подключает свой аккаунт)
@@ -8470,6 +8471,7 @@ class SiteSettings(BaseModel):
     sms_ready_enabled:       str | None = None
     sms_ready_template_ru:   str | None = None
     sms_ready_template_uz:   str | None = None
+    sms_registration_enabled: str | None = None
     sheets_url:          str | None = None
     leads_group_id:          str | None = None
     leads_group_zarafshan:   str | None = None
