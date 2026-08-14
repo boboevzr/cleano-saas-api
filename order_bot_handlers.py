@@ -480,10 +480,10 @@ def t(lang: str, key: str) -> str:
 #  КЛАВИАТУРЫ
 # ══════════════════════════════════════
 def lang_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🇷🇺 Русский язык", callback_data="lang_ru"),
-        InlineKeyboardButton(text="🇺🇿 O'zbek tili",  callback_data="lang_uz"),
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇷🇺 Русский язык", callback_data="lang_ru")],
+        [InlineKeyboardButton(text="🇺🇿 O'zbek tili",  callback_data="lang_uz")],
+    ])
 
 
 def menu_kb(lang: str, site_url: str, show_register: bool = False) -> InlineKeyboardMarkup:
