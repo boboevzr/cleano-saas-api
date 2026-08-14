@@ -961,6 +961,52 @@ async def _eskiz_get_token() -> str:
     return _eskiz_token
 
 
+ESKIZ_BALANCE_CACHE_TTL_SEC = 900  # 15 минут
+
+async def get_eskiz_balance_cached() -> int | None:
+    """Баланс Eskiz текущей компании (через _cid(), как _eskiz_get_token) с кэшем
+    ~15 минут — используется для sms_registration_available в публичном
+    /api/settings/site, нельзя дёргать live Eskiz API на каждой загрузке сайта.
+    None — Eskiz не настроен для этой компании или запрос не удался."""
+    cached_at  = await db.get_config("eskiz_balance_cached_at")
+    cached_val = await db.get_config("eskiz_balance_cached_value")
+    if cached_at and cached_val is not None:
+        try:
+            age = (datetime.utcnow() - datetime.fromisoformat(cached_at)).total_seconds()
+            if age < ESKIZ_BALANCE_CACHE_TTL_SEC:
+                return int(cached_val)
+        except Exception:
+            pass
+
+    email    = await _get_cfg("eskiz_email")
+    password = await _get_cfg("eskiz_password")
+    if not email or not password:
+        return None
+
+    token = await _eskiz_get_token()
+    if not token:
+        return None
+    try:
+        async with aiohttp.ClientSession() as s:
+            r = await s.get(
+                "https://notify.eskiz.uz/api/user/get-limit",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=aiohttp.ClientTimeout(total=8),
+            )
+            data = await r.json()
+        balance = data.get("data", {}).get("balance")
+        if balance is None:
+            return None
+        balance = int(balance)
+    except Exception as e:
+        logging.warning(f"get_eskiz_balance_cached error: {e}")
+        return None
+
+    await db.set_config("eskiz_balance_cached_at", datetime.utcnow().isoformat())
+    await db.set_config("eskiz_balance_cached_value", str(balance))
+    return balance
+
+
 async def send_sms(phone: str, message: str) -> bool:
     """Отправляет SMS через Eskiz.uz. Если ключи не заданы — пишет в лог. Возвращает True/False (доставлен ли запрос в Eskiz)."""
     logging.info(f"📲 [SMS->{phone}] {message}")
@@ -3283,6 +3329,10 @@ async def tg_phone_link(body: dict):
 async def register(req: RegisterRequest):
     uz = req.lang == "uz"
     cid = await _resolve_client_company_id(req.company_slug)
+    if not req.via_tg and await db.get_config_for_company("sms_registration_enabled", cid) == "false":
+        raise HTTPException(status_code=403, detail=(
+            "Ro'yxatdan o'tish faqat Telegram orqali mavjud" if uz
+            else "Регистрация доступна только через Telegram"))
     existing = await db.get_user_by_phone(req.phone, cid)
     if existing and existing["is_verified"]:
         raise HTTPException(status_code=400, detail=(
@@ -8352,6 +8402,18 @@ async def get_site_settings(company_slug: str = None):
     result = {}
     for key in PUBLIC_KEYS:
         result[key] = await _get_cfg(key)
+
+    # Доступность SMS-регистрации на сайте: ручной тогл + реально настроен Eskiz
+    # + на балансе хватает хотя бы на 1 SMS (~1000 сум). Сам баланс/логин/пароль
+    # Eskiz наружу не отдаём — только готовый булев флаг.
+    sms_reg_enabled = (await _get_cfg("sms_registration_enabled")) != "false"
+    eskiz_configured = bool(await _get_cfg("eskiz_email")) and bool(await _get_cfg("eskiz_password"))
+    sms_registration_available = False
+    if sms_reg_enabled and eskiz_configured:
+        balance = await get_eskiz_balance_cached()
+        sms_registration_available = balance is not None and balance >= 1000
+    result["sms_registration_available"] = sms_registration_available
+
     return {"ok": True, "settings": result}
 
 
