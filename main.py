@@ -62,7 +62,10 @@ SHEETS_URL = os.getenv("SHEETS_URL", "https://script.google.com/macros/s/AKfycby
 ESKIZ_EMAIL    = os.getenv("ESKIZ_EMAIL", "")
 ESKIZ_PASSWORD = os.getenv("ESKIZ_PASSWORD", "")
 ESKIZ_FROM     = os.getenv("ESKIZ_FROM", "4546")   # имя отправителя — 4546 для тестов
-_eskiz_token   = ""  # кэш токена в памяти
+_eskiz_tokens: dict[int, str] = {}  # кэш токена в памяти, per-company (company_id -> token)
+                                     # раньше была одна общая строка на процесс — у двух компаний
+                                     # с разными Eskiz-аккаунтами токены могли перезаписывать друг
+                                     # друга при почти одновременных запросах (см. фикс 2026-08-14)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -920,30 +923,34 @@ class StaffOrderRequest(BaseModel):
 #  SMS — Eskiz.uz
 # ══════════════════════════════════════
 async def _eskiz_get_token() -> str:
-    """Получает/обновляет токен Eskiz. Читает email/пароль из БД (приоритет) или env."""
-    global _eskiz_token
+    """Получает/обновляет токен Eskiz текущей компании (через _cid(), как email/
+    password ниже). Читает email/пароль из БД (приоритет) или env. Кэш токена —
+    per-company (_eskiz_tokens), не общая переменная процесса."""
+    cid      = db._cid()
     email    = await _get_cfg("eskiz_email")
     password = await _get_cfg("eskiz_password")
     if not email or not password:
         # Fallback: прямой токен сохранённый в config
         return await db.get_config("eskiz_token") or ""
 
-    if not _eskiz_token:
-        _eskiz_token = await db.get_config("eskiz_token") or ""
+    token = _eskiz_tokens.get(cid)
+    if not token:
+        token = await db.get_config("eskiz_token") or ""
 
     async with aiohttp.ClientSession() as session:
-        if _eskiz_token:
+        if token:
             resp = await session.patch(
                 "https://notify.eskiz.uz/api/auth/refresh",
-                headers={"Authorization": f"Bearer {_eskiz_token}"},
+                headers={"Authorization": f"Bearer {token}"},
             )
             if resp.status == 200:
                 data = await resp.json()
-                new_token = data.get("data", {}).get("token", _eskiz_token)
-                if new_token != _eskiz_token:
-                    _eskiz_token = new_token
-                    await db.set_config("eskiz_token", _eskiz_token)
-                return _eskiz_token
+                new_token = data.get("data", {}).get("token", token)
+                if new_token != token:
+                    token = new_token
+                    await db.set_config("eskiz_token", token)
+                _eskiz_tokens[cid] = token
+                return token
 
         resp = await session.post(
             "https://notify.eskiz.uz/api/auth/login",
@@ -951,14 +958,15 @@ async def _eskiz_get_token() -> str:
         )
         if resp.status == 200:
             data = await resp.json()
-            _eskiz_token = data.get("data", {}).get("token", "")
-            if _eskiz_token:
-                await db.set_config("eskiz_token", _eskiz_token)
+            token = data.get("data", {}).get("token", "")
+            if token:
+                await db.set_config("eskiz_token", token)
+                _eskiz_tokens[cid] = token
             logging.info("✅ Eskiz: токен получен")
         else:
             body = await resp.text()
             logging.error(f"❌ Eskiz login failed: {resp.status} {body}")
-    return _eskiz_token
+    return token
 
 
 ESKIZ_BALANCE_CACHE_TTL_SEC = 900  # 15 минут
@@ -10151,13 +10159,12 @@ async def sms_settings_get(_=Depends(_get_admin)):
     return {"token": token, "from": frm}
 
 @app.post("/api/admin/sms/settings")
-async def sms_settings_save(body: dict = Body(...), _=Depends(_get_admin)):
-    global _eskiz_token
+async def sms_settings_save(body: dict = Body(...), cid: int = Depends(_get_admin_cid)):
     token = (body.get("token") or "").strip()
     frm   = (body.get("from") or "4546").strip()
     if token:
         await db.set_config("eskiz_token", token)
-        _eskiz_token = token
+        _eskiz_tokens[cid] = token
     if frm:
         await db.set_config("eskiz_from", frm)
     return {"ok": True}
