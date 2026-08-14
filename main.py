@@ -661,11 +661,21 @@ async def _notify_new_lead(lead: dict, staff: dict):
     else:                 source = "👤 Сотрудник"
     creator = " ".join(filter(None, [staff.get("last_name"), staff.get("first_name")])) or staff.get("login", "—")
 
-    # source_full: для агентов/сотрудников добавляем имя, для сайта/бота — только иконка
+    # source_full: для агентов/сотрудников добавляем имя, для сайта — домен компании
+    # (одна и та же группа может быть общей на несколько компаний — см. вопрос
+    # пользователя "может одну группу использовать 2 компании" — без домена в
+    # сообщении невозможно понять, с какого именно сайта пришла заявка).
     if role == "agent":
         source_full = f"🤝 {creator}" if creator and creator != "—" else "🤝 Агент"
     elif role == "site":
-        source_full = "🌐 Сайт"
+        site_domain = None
+        try:
+            lead_company = await db.get_company(lead.get("company_id"))
+            slug = (lead_company["slug"] if lead_company else "") or ""
+            site_domain = "artez.uz" if slug == "artez" else (f"{slug}.cleano.uz" if slug else None)
+        except Exception as e:
+            logging.warning(f"_notify_new_lead site_domain error: {e}")
+        source_full = f"🌐 {site_domain}" if site_domain else "🌐 Сайт"
     elif role == "bot":
         source_full = "✈️ Telegram"
     else:
