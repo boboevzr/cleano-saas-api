@@ -5125,12 +5125,18 @@ class OrderItemRequest(BaseModel):
     width_cm: float | None = None
     length_cm: float | None = None
     price_per_sqm: float = 0
+    min_order: float | None = None  # мин. площадь позиции из прайса (см. запрос пользователя 2026-08-14) —
+                                     # фронт присылает это значение, когда услуга выбрана из справочника;
+                                     # если реально измеренная площадь меньше — оплачиваемая площадь (sqm,
+                                     # от которой считается total_sum) не может быть меньше этого порога.
 
 @app.post("/api/admin/orders/{order_id}/items")
 async def admin_create_order_item(order_id: int, req: OrderItemRequest, _=Depends(get_current_staff)):
     sqm = req.sqm
     if not sqm and req.width_cm and req.length_cm:
         sqm = round(req.width_cm * req.length_cm / 10000, 3)
+    if req.min_order and sqm and sqm < req.min_order:
+        sqm = req.min_order
     item = await db.create_order_item(
         order_id=order_id, service=req.service, sqm=sqm or 0,
         price_per_sqm=req.price_per_sqm,
@@ -5151,6 +5157,8 @@ async def admin_update_order_item(order_id: int, item_id: int,
     sqm = req.sqm
     if not sqm and req.width_cm and req.length_cm:
         sqm = round(req.width_cm * req.length_cm / 10000, 3)
+    if req.min_order and sqm and sqm < req.min_order:
+        sqm = req.min_order
     # Fetch old values + position number for diff logging
     old = {}
     item_pos = None
