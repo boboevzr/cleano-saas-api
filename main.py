@@ -3467,8 +3467,10 @@ async def forgot_password_request(body: dict):
 
     user = await db.get_user_by_phone(phone, cid)
     if not user or not user.get("is_verified"):
-        # Не палим существование аккаунта — единый ответ для любого номера.
-        return {"ok": True}
+        # По явному запросу пользователя (2026-08-18) сообщаем, что номер не
+        # найден — раньше отвечали {"ok":true} на любой номер (anti-enumeration),
+        # но UX-приоритет перевесил: пользователь предпочёл явную ошибку.
+        raise HTTPException(400, "Bunday raqam bilan ro'yxatdan o'tgan foydalanuvchi topilmadi" if uz else "Пользователь с таким номером не найден")
 
     ok, err = await db.check_sms_rate_limit(phone, "reset")
     if not ok:
