@@ -2653,34 +2653,31 @@ _STAGE_STATUSES = {
 }
 
 @app.get("/api/staff/orders")
-async def staff_orders(status: str = None, branch: str = None,
+async def staff_orders(status: str = None, branch: str = None, limit: int = 50, offset: int = 0,
                        staff=Depends(require_perm("orders"))):
-    rows = await db.get_admin_orders(status=status, limit=200)
-    result = [dict(r) for r in rows]
     # Фильтр по этапам: если order_stages заданы — показывать только нужные статусы
     stages_raw = staff.get("order_stages") or ""
     stages = [s.strip() for s in stages_raw.split(",") if s.strip()]
-    if stages:
-        visible = set()
-        for stage in stages:
-            visible |= _STAGE_STATUSES.get(stage, set())
-        result = [o for o in result if o.get("status") in visible]
-    if branch:
-        result = [o for o in result if o.get("branch") == branch]
+    visible = set()
+    for stage in stages:
+        visible |= _STAGE_STATUSES.get(stage, set())
+    result, total = await db.get_admin_orders(
+        status=status, statuses=list(visible) if stages else None,
+        branch=branch, limit=limit, offset=offset)
     if staff.get("hide_client_phone"):
         for o in result:
             o["client_phone"] = ""
-    return {"ok": True, "orders": result}
+    return {"ok": True, "orders": result, "total": total, "limit": limit, "offset": offset}
 
 @app.get("/api/staff/orders/own")
-async def staff_own_orders(staff=Depends(get_current_staff)):
-    rows = await db.get_admin_orders(limit=200)
-    result = [dict(r) for r in rows
-              if dict(r).get("branch") == staff.get("branch")]
+async def staff_own_orders(status: str = None, limit: int = 50, offset: int = 0,
+                            staff=Depends(get_current_staff)):
+    result, total = await db.get_admin_orders(
+        status=status, branch=staff.get("branch"), limit=limit, offset=offset)
     if staff.get("hide_client_phone"):
         for o in result:
             o["client_phone"] = ""
-    return {"ok": True, "orders": result}
+    return {"ok": True, "orders": result, "total": total, "limit": limit, "offset": offset}
 
 @app.post("/api/staff/orders/create")
 async def staff_create_order(req: StaffOrderRequest, staff=Depends(require_perm("orders"))):
@@ -4598,9 +4595,9 @@ async def admin_delete_unit(key: str, _=Depends(get_admin)):
     return {"ok": True}
 
 @app.get("/api/admin/orders")
-async def admin_get_orders(_=Depends(get_admin), status: str = None, limit: int = 50):
-    prices = await db.get_admin_orders(status=status, limit=limit)
-    return {"ok": True, "orders": [dict(o) for o in prices]}
+async def admin_get_orders(_=Depends(get_admin), status: str = None, limit: int = 50, offset: int = 0):
+    orders, total = await db.get_admin_orders(status=status, limit=limit, offset=offset)
+    return {"ok": True, "orders": orders, "total": total, "limit": limit, "offset": offset}
 
 @app.get("/api/admin/orders/debts")
 async def get_debt_orders(_=Depends(_get_admin)):

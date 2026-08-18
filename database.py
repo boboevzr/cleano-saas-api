@@ -3158,12 +3158,30 @@ async def get_orders_items_totals(order_ids: list[int]) -> dict[int, float]:
     return totals
 
 
-async def get_admin_orders(status: str = None, limit: int = 50):
+async def get_admin_orders(status: str = None, statuses: list = None, branch: str = None,
+                            limit: int = 50, offset: int = 0):
+    """Список заказов с постраничностью, всегда scoped на company_id. statuses (набор,
+    из order_stages сотрудника) и status (выбранная вкладка) пересекаются, если заданы
+    оба. Возвращает (orders, total_count)."""
     if not pool:
-        return []
+        return [], 0
     cid = _cid()
     async with pool.acquire() as conn:
-        q = """
+        conditions = ["o.company_id = $1"]
+        params = [cid]
+        if statuses:
+            allowed = set(statuses) & {status} if status else set(statuses)
+            conditions.append(f"o.status = ANY(${len(params)+1}::text[])")
+            params.append(list(allowed) if allowed else ["__none__"])
+        elif status:
+            conditions.append(f"o.status = ${len(params)+1}")
+            params.append(status)
+        if branch:
+            conditions.append(f"o.branch = ${len(params)+1}")
+            params.append(branch)
+        where = "WHERE " + " AND ".join(conditions)
+        limit_idx, offset_idx = len(params) + 1, len(params) + 2
+        q = f"""
             SELECT o.*,
                    COALESCE(i.cnt, 0)::int AS item_count,
                    COALESCE(i.corr, 0)::int AS corrected_count,
@@ -3171,7 +3189,8 @@ async def get_admin_orders(status: str = None, limit: int = 50):
                               FROM order_items WHERE order_id=o.id), 0) AS items_total,
                    COALESCE((SELECT SUM(amount) FROM order_payments
                               WHERE order_id=o.id
-                                AND NOT (confirmed=FALSE AND confirmed_at IS NOT NULL)), 0) AS paid_amount
+                                AND NOT (confirmed=FALSE AND confirmed_at IS NOT NULL)), 0) AS paid_amount,
+                   COUNT(*) OVER() AS total_count
             FROM orders o
             LEFT JOIN (
                 SELECT order_id, COUNT(*) AS cnt,
@@ -3179,19 +3198,19 @@ async def get_admin_orders(status: str = None, limit: int = 50):
                 FROM order_items GROUP BY order_id
             ) i ON i.order_id = o.id
             {where}
-            ORDER BY o.created_at DESC LIMIT $1
+            ORDER BY o.created_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}
         """
-        if status:
-            rows = await conn.fetch(
-                q.format(where="WHERE o.status=$2 AND o.company_id=$3"), limit, status, cid)
-        else:
-            rows = await conn.fetch(q.format(where="WHERE o.company_id=$2"), limit, cid)
+        params += [limit, offset]
+        rows = await conn.fetch(q, *params)
         result = [dict(r) for r in rows]
+        total = result[0]["total_count"] if result else 0
+        for r in result:
+            r.pop("total_count", None)
         totals = await get_orders_items_totals([r["id"] for r in result])
         for r in result:
             if r["id"] in totals:
                 r["items_total"] = totals[r["id"]]
-        return result
+        return result, total
 
 
 async def get_company_id_by_slug(slug: str) -> int | None:
