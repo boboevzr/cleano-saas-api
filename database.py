@@ -180,9 +180,9 @@ async def create_tables():
         CREATE TABLE IF NOT EXISTS sms_codes (
             id              SERIAL PRIMARY KEY,
             phone           VARCHAR(20) NOT NULL,
-            code            VARCHAR(6) NOT NULL,
+            code            VARCHAR(20) NOT NULL,
             purpose         VARCHAR(20) DEFAULT 'register'
-                            CHECK (purpose IN ('register','login','reset')),
+                            CHECK (purpose IN ('register','login','reset','cleano_register','reset_attempt')),
             expires_at      TIMESTAMP NOT NULL,
             used            BOOLEAN DEFAULT FALSE,
             created_at      TIMESTAMP DEFAULT NOW()
@@ -682,6 +682,14 @@ async def create_tables():
             company_id  INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
             expires_at  TIMESTAMPTZ NOT NULL
         )""",
+        # forgot-password: попытки подтверждения кода пишут маркер purpose='reset_attempt'
+        # с кодом-словом "attempt" (7 символов) — старая схема (code VARCHAR(6),
+        # purpose CHECK без 'reset_attempt') валила это StringDataRightTruncationError
+        # при каждой попытке ввести код сброса пароля (тот же баг, что и в проде).
+        "ALTER TABLE sms_codes ALTER COLUMN code TYPE VARCHAR(20)",
+        "ALTER TABLE sms_codes DROP CONSTRAINT IF EXISTS sms_codes_purpose_check",
+        "ALTER TABLE sms_codes ADD CONSTRAINT sms_codes_purpose_check "
+        "CHECK (purpose IN ('register','login','reset','cleano_register','reset_attempt'))",
     ]
     async with pool.acquire() as c:
         for sql in other_migrations:
