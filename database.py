@@ -695,8 +695,8 @@ async def create_tables():
         for sql in other_migrations:
             try:
                 await c.execute(sql)
-            except Exception:
-                pass
+            except Exception as e:
+                logging.warning(f"migration skipped ({sql[:80]!r}): {e}")
         # IVR 7000 — основной, всегда должен быть в списке
         await c.execute(
             "INSERT INTO autodial_ivrs (exten,label,ivr_group) "
