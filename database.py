@@ -209,6 +209,7 @@ async def create_tables():
             unit            VARCHAR(20) DEFAULT 'sum/m2',
             unit_key        VARCHAR(20) DEFAULT 'm2',
             min_order       NUMERIC(10,2) DEFAULT NULL,
+            min_order_total NUMERIC(10,2) DEFAULT NULL,
             updated_at      TIMESTAMP DEFAULT NOW(),
             UNIQUE(service_key, type_key)
         );
@@ -276,6 +277,7 @@ async def create_tables():
         "ALTER TABLE orders ADD CONSTRAINT orders_source_check CHECK (source IN ('bot','site','staff'))",
         "ALTER TABLE prices  ADD COLUMN IF NOT EXISTS unit_key  VARCHAR(20)   DEFAULT 'm2'",
         "ALTER TABLE prices  ADD COLUMN IF NOT EXISTS min_order NUMERIC(10,2) DEFAULT NULL",
+        "ALTER TABLE prices  ADD COLUMN IF NOT EXISTS min_order_total NUMERIC(10,2) DEFAULT NULL",
         "ALTER TABLE users   ADD COLUMN IF NOT EXISTS address    VARCHAR(200)  DEFAULT NULL",
         "ALTER TABLE users   ADD COLUMN IF NOT EXISTS car_plate  VARCHAR(20)   DEFAULT NULL",
         "ALTER TABLE users   ADD COLUMN IF NOT EXISTS osago_expiry DATE        DEFAULT NULL",
@@ -2875,13 +2877,13 @@ async def update_promotion(promo_id: int, **kwargs) -> dict | None:
 #  ЦЕНЫ (общая таблица с ботом)
 # ══════════════════════════════════════
 async def get_all_prices() -> dict:
-    """Возвращает все цены из таблицы prices: {service_key: {type_key: {price, unit_key, min_order}}}"""
+    """Возвращает все цены из таблицы prices: {service_key: {type_key: {price, unit_key, min_order, min_order_total}}}"""
     if not pool:
         return {}
     cid = _cid()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT service_key, type_key, price, unit_key, min_order FROM prices WHERE company_id=$1 ORDER BY service_key, type_key",
+            "SELECT service_key, type_key, price, unit_key, min_order, min_order_total FROM prices WHERE company_id=$1 ORDER BY service_key, type_key",
             cid
         )
     result = {}
@@ -2890,25 +2892,27 @@ async def get_all_prices() -> dict:
             "price": r["price"],
             "unit_key": r["unit_key"],
             "min_order": float(r["min_order"]) if r["min_order"] is not None else None,
+            "min_order_total": float(r["min_order_total"]) if r["min_order_total"] is not None else None,
         }
     return result
 
 
 async def set_price(service_key: str, type_key: str, price: int,
-                     unit_key: str = None, min_order=None, company_id: int = None) -> bool:
+                     unit_key: str = None, min_order=None, min_order_total=None, company_id: int = None) -> bool:
     if not pool:
         return False
     cid = company_id if company_id is not None else _cid()
     async with pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO prices (company_id, service_key, type_key, price, unit_key, min_order, updated_at)
-            VALUES ($1, $2, $3, $4, COALESCE($5, 'm2'), $6, NOW())
+            INSERT INTO prices (company_id, service_key, type_key, price, unit_key, min_order, min_order_total, updated_at)
+            VALUES ($1, $2, $3, $4, COALESCE($5, 'm2'), $6, $7, NOW())
             ON CONFLICT (company_id, service_key, type_key) DO UPDATE SET
-                price      = EXCLUDED.price,
-                unit_key   = COALESCE($5, prices.unit_key),
-                min_order  = $6,
-                updated_at = NOW()
-        """, cid, service_key, type_key, price, unit_key, min_order)
+                price           = EXCLUDED.price,
+                unit_key        = COALESCE($5, prices.unit_key),
+                min_order       = $6,
+                min_order_total = $7,
+                updated_at      = NOW()
+        """, cid, service_key, type_key, price, unit_key, min_order, min_order_total)
     return True
 
 
@@ -2918,7 +2922,7 @@ async def get_catalog_prices() -> dict:
         return {}
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT service_key, type_key, price, unit_key, min_order FROM prices WHERE company_id=0 ORDER BY service_key, type_key"
+            "SELECT service_key, type_key, price, unit_key, min_order, min_order_total FROM prices WHERE company_id=0 ORDER BY service_key, type_key"
         )
     result = {}
     for r in rows:
@@ -2926,6 +2930,7 @@ async def get_catalog_prices() -> dict:
             "price": r["price"],
             "unit_key": r["unit_key"],
             "min_order": float(r["min_order"]) if r["min_order"] is not None else None,
+            "min_order_total": float(r["min_order_total"]) if r["min_order_total"] is not None else None,
         }
     return result
 
@@ -2942,26 +2947,26 @@ async def seed_company_prices(company_id: int, force: bool = False):
         if force:
             await conn.execute("DELETE FROM prices WHERE company_id=$1", company_id)
         template = await conn.fetch(
-            "SELECT service_key, type_key, price, unit_key, min_order FROM prices WHERE company_id=0"
+            "SELECT service_key, type_key, price, unit_key, min_order, min_order_total FROM prices WHERE company_id=0"
         )
     if template:
         for r in template:
-            await set_price(r["service_key"], r["type_key"], r["price"], r["unit_key"], r["min_order"], company_id=company_id)
+            await set_price(r["service_key"], r["type_key"], r["price"], r["unit_key"], r["min_order"], r["min_order_total"], company_id=company_id)
     else:
         defaults = [
-            ("carpet",      "standard",  5000, "m2",    None),
-            ("carpet",      "express",   8000, "m2",    None),
-            ("carpet_home", "standard",  6000, "m2",    None),
-            ("carpet_home", "express",  10000, "m2",    None),
-            ("sofa",        "standard", 150000, "piece", None),
-            ("sofa",        "express",  200000, "piece", None),
-            ("mattress",    "standard", 100000, "piece", None),
-            ("mattress",    "express",  150000, "piece", None),
-            ("curtains",    "standard", 10000, "m2",    None),
-            ("curtains",    "express",  15000, "m2",    None),
+            ("carpet",      "standard",  5000, "m2",    None, None),
+            ("carpet",      "express",   8000, "m2",    None, None),
+            ("carpet_home", "standard",  6000, "m2",    None, None),
+            ("carpet_home", "express",  10000, "m2",    None, None),
+            ("sofa",        "standard", 150000, "piece", None, None),
+            ("sofa",        "express",  200000, "piece", None, None),
+            ("mattress",    "standard", 100000, "piece", None, None),
+            ("mattress",    "express",  150000, "piece", None, None),
+            ("curtains",    "standard", 10000, "m2",    None, None),
+            ("curtains",    "express",  15000, "m2",    None, None),
         ]
-        for skey, tkey, price, ukey, mord in defaults:
-            await set_price(skey, tkey, price, ukey, mord, company_id=company_id)
+        for skey, tkey, price, ukey, mord, mtot in defaults:
+            await set_price(skey, tkey, price, ukey, mord, mtot, company_id=company_id)
 
 
 # ══════════════════════════════════════
@@ -3075,6 +3080,76 @@ async def delete_unit(key: str) -> bool:
     return result != "DELETE 0"
 
 
+_TYPE_NAMES_RU = {"standard": "Стандарт", "express": "Экспресс"}
+_TYPE_NAMES_UZ = {"standard": "Standart", "express": "Ekspress"}
+
+async def _price_match_maps() -> tuple[dict, dict]:
+    """{service_ru_label: (svcKey, typeKey)} и то же для UZ — реконструирует те же
+    подписи, что staff.html пишет в order_items.service_ru/service_uz при выборе
+    услуги из справочника (см. sifFindPriceMatch в staff.html)."""
+    prices   = await get_all_prices()
+    services = await get_services()
+    ru_map, uz_map = {}, {}
+    for s in services:
+        svc_key = s["key"]
+        if svc_key not in prices:
+            continue
+        for type_key in prices[svc_key]:
+            emoji = (s.get("emoji") or "").strip()
+            ru_label = f"{emoji} {s['name_ru']}".strip() + f" — {_TYPE_NAMES_RU.get(type_key, type_key)}"
+            uz_label = f"{emoji} {s['name_uz']}".strip() + f" — {_TYPE_NAMES_UZ.get(type_key, type_key)}"
+            ru_map[ru_label] = (svc_key, type_key)
+            uz_map[uz_label] = (svc_key, type_key)
+    return ru_map, uz_map
+
+async def get_orders_items_totals(order_ids: list[int]) -> dict[int, float]:
+    """Order-level 'Итого' с учётом мин.по.позиции/мин.по.заказу — та же логика,
+    что staffRenderItems() в staff.html (группировка по услуге, floor по каталогу).
+    Используется, чтобы список заказов не расходился с карточкой заказа."""
+    if not order_ids or not pool:
+        return {}
+    async with pool.acquire() as conn:
+        items = await conn.fetch(
+            "SELECT order_id, service, service_ru, service_uz, sqm, price_per_sqm, total_sum "
+            "FROM order_items WHERE order_id = ANY($1::int[])", order_ids)
+    prices = await get_all_prices()
+    ru_map, uz_map = await _price_match_maps()
+
+    def find_match(it):
+        return (ru_map.get(it["service_ru"]) or uz_map.get(it["service_uz"])
+                or ru_map.get(it["service"]) or uz_map.get(it["service"]))
+
+    groups: dict[tuple, dict] = {}
+    no_service_totals: dict[int, float] = {}
+    for it in items:
+        oid = it["order_id"]
+        if not it["service"]:
+            no_service_totals[oid] = no_service_totals.get(oid, 0.0) + float(it["total_sum"] or 0)
+            continue
+        m = find_match(it)
+        gkey = it["service_ru"] or (f"{m[0]}::{m[1]}" if m else it["service"])
+        g = groups.setdefault((oid, gkey), {"sqm": 0.0, "count": 0, "clamped": 0.0, "match": m})
+        sqm   = float(it["sqm"] or 0)
+        price = float(it["price_per_sqm"] or 0)
+        total = float(it["total_sum"] or 0)
+        g["sqm"]   += sqm
+        g["count"] += 1
+        catalog  = prices.get(m[0], {}).get(m[1]) if m else None
+        pos_min  = catalog.get("min_order") if catalog else None
+        g["clamped"] += (pos_min * price) if (pos_min and sqm and sqm < pos_min and price) else total
+
+    totals: dict[int, float] = dict(no_service_totals)
+    for (oid, _gkey), g in groups.items():
+        m = g["match"]
+        catalog   = prices.get(m[0], {}).get(m[1]) if m else None
+        group_min = catalog.get("min_order_total") if catalog else None
+        price     = catalog.get("price") if catalog else None
+        qty       = g["sqm"] if g["sqm"] > 0 else g["count"]
+        contribution = (group_min * price) if (group_min and qty < group_min and price) else g["clamped"]
+        totals[oid] = totals.get(oid, 0.0) + contribution
+    return totals
+
+
 async def get_admin_orders(status: str = None, limit: int = 50):
     if not pool:
         return []
@@ -3103,7 +3178,12 @@ async def get_admin_orders(status: str = None, limit: int = 50):
                 q.format(where="WHERE o.status=$2 AND o.company_id=$3"), limit, status, cid)
         else:
             rows = await conn.fetch(q.format(where="WHERE o.company_id=$2"), limit, cid)
-        return rows
+        result = [dict(r) for r in rows]
+        totals = await get_orders_items_totals([r["id"] for r in result])
+        for r in result:
+            if r["id"] in totals:
+                r["items_total"] = totals[r["id"]]
+        return result
 
 
 async def get_company_id_by_slug(slug: str) -> int | None:
@@ -5657,6 +5737,17 @@ async def save_measure_dims(item_id: int, width_cm: float, length_cm: float) -> 
         """, item_id, width_cm, length_cm, sqm)
         return dict(row) if row else {}
 
+async def save_measure_qty(item_id: int, quantity: float) -> dict:
+    if not pool: return {}
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE order_items
+            SET width_cm=NULL, length_cm=NULL, sqm=$2
+            WHERE id=$1 AND measure_status != 'approved'
+            RETURNING *
+        """, item_id, round(quantity, 3))
+        return dict(row) if row else {}
+
 async def update_item_washer(item_id: int, washer_login: str) -> dict:
     if not pool: return {}
     async with pool.acquire() as conn:
@@ -6380,7 +6471,7 @@ async def submit_item_measure(item_id: int) -> dict:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE order_items SET measure_status='submitted', reject_note=NULL
-            WHERE id=$1 AND width_cm IS NOT NULL AND length_cm IS NOT NULL
+            WHERE id=$1 AND sqm IS NOT NULL
             RETURNING *
         """, item_id)
         return dict(row) if row else {}
@@ -6404,6 +6495,17 @@ async def direct_approve_measure(item_id: int, width_cm: float, length_cm: float
                    measure_status='approved', reject_note=NULL
              WHERE id=$1 RETURNING *
         """, item_id, width_cm, length_cm, sqm)
+        return dict(row) if row else {}
+
+async def direct_approve_measure_qty(item_id: int, quantity: float) -> dict:
+    if not pool: return {}
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE order_items
+               SET width_cm=NULL, length_cm=NULL, sqm=$2,
+                   measure_status='approved', reject_note=NULL
+             WHERE id=$1 RETURNING *
+        """, item_id, round(quantity, 3))
         return dict(row) if row else {}
 
 async def reject_item_measure(item_id: int, note: str) -> dict:

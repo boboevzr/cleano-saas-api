@@ -3981,6 +3981,7 @@ class SetPriceRequest(BaseModel):
     price: int
     unit_key: str = None
     min_order: float = None
+    min_order_total: float = None  # мин. по заказу — порог по услуге суммарно по всем позициям
 
 class ServiceRequest(BaseModel):
     key: str
@@ -4530,7 +4531,10 @@ async def admin_set_price(req: SetPriceRequest, _=Depends(get_admin)):
         raise HTTPException(status_code=400, detail="Цена должна быть > 0")
     if req.min_order is not None and req.min_order <= 0:
         raise HTTPException(status_code=400, detail="Минимальный заказ должен быть > 0")
-    await db.set_price(req.service_key, req.type_key, req.price, unit_key=req.unit_key, min_order=req.min_order)
+    if req.min_order_total is not None and req.min_order_total <= 0:
+        raise HTTPException(status_code=400, detail="Минимальный заказ по услуге должен быть > 0")
+    await db.set_price(req.service_key, req.type_key, req.price, unit_key=req.unit_key,
+                        min_order=req.min_order, min_order_total=req.min_order_total)
     return {"ok": True}
 
 @app.get("/api/services")
@@ -5125,18 +5129,12 @@ class OrderItemRequest(BaseModel):
     width_cm: float | None = None
     length_cm: float | None = None
     price_per_sqm: float = 0
-    min_order: float | None = None  # мин. площадь позиции из прайса (см. запрос пользователя 2026-08-14) —
-                                     # фронт присылает это значение, когда услуга выбрана из справочника;
-                                     # если реально измеренная площадь меньше — оплачиваемая площадь (sqm,
-                                     # от которой считается total_sum) не может быть меньше этого порога.
 
 @app.post("/api/admin/orders/{order_id}/items")
 async def admin_create_order_item(order_id: int, req: OrderItemRequest, _=Depends(get_current_staff)):
     sqm = req.sqm
     if not sqm and req.width_cm and req.length_cm:
         sqm = round(req.width_cm * req.length_cm / 10000, 3)
-    if req.min_order and sqm and sqm < req.min_order:
-        sqm = req.min_order
     item = await db.create_order_item(
         order_id=order_id, service=req.service, sqm=sqm or 0,
         price_per_sqm=req.price_per_sqm,
@@ -5157,8 +5155,6 @@ async def admin_update_order_item(order_id: int, item_id: int,
     sqm = req.sqm
     if not sqm and req.width_cm and req.length_cm:
         sqm = round(req.width_cm * req.length_cm / 10000, 3)
-    if req.min_order and sqm and sqm < req.min_order:
-        sqm = req.min_order
     # Fetch old values + position number for diff logging
     old = {}
     item_pos = None
@@ -6964,6 +6960,7 @@ async def admin_measure_item(order_id: int, item_id: int, staff=Depends(get_curr
                               action: str = Body(..., embed=True),
                               actual_width_cm: float = Body(None, embed=True),
                               actual_length_cm: float = Body(None, embed=True),
+                              quantity: float = Body(None, embed=True),
                               note: str = Body("", embed=True)):
     is_admin = staff.get("role") == "admin"
     if action == "submit" and not (staff.get("can_measure") or is_admin):
@@ -6973,9 +6970,12 @@ async def admin_measure_item(order_id: int, item_id: int, staff=Depends(get_curr
     if action == "direct_approve" and not (staff.get("can_override_measure") or is_admin):
         raise HTTPException(status_code=403, detail="Нет прав для переопределения замера")
     if action == "submit":
-        if not actual_width_cm or not actual_length_cm:
-            raise HTTPException(status_code=400, detail="Укажите ширину и длину")
-        await db.save_measure_dims(item_id, actual_width_cm, actual_length_cm)
+        if quantity:
+            await db.save_measure_qty(item_id, quantity)
+        elif actual_width_cm and actual_length_cm:
+            await db.save_measure_dims(item_id, actual_width_cm, actual_length_cm)
+        else:
+            raise HTTPException(status_code=400, detail="Укажите ширину и длину или количество")
         media = await db.get_item_media(item_id)
         if not media:
             raise HTTPException(status_code=400, detail="Добавьте фото или видео замера")
@@ -7023,9 +7023,12 @@ async def admin_measure_item(order_id: int, item_id: int, staff=Depends(get_curr
         except Exception as _pe:
             logging.warning(f"measure approved push error: {_pe}")
     elif action == "direct_approve":
-        if not actual_width_cm or not actual_length_cm:
-            raise HTTPException(status_code=400, detail="Укажите ширину и длину")
-        item = await db.direct_approve_measure(item_id, actual_width_cm, actual_length_cm)
+        if quantity:
+            item = await db.direct_approve_measure_qty(item_id, quantity)
+        elif actual_width_cm and actual_length_cm:
+            item = await db.direct_approve_measure(item_id, actual_width_cm, actual_length_cm)
+        else:
+            raise HTTPException(status_code=400, detail="Укажите ширину и длину или количество")
     elif action == "reject":
         if not note:
             raise HTTPException(status_code=400, detail="Укажите причину отклонения")
@@ -11977,7 +11980,8 @@ async def sa_catalog_set_price(req: SetPriceRequest, _=Depends(get_superadmin)):
     if req.price <= 0:
         raise HTTPException(status_code=400, detail="Цена должна быть > 0")
     await db.set_price(req.service_key, req.type_key, req.price,
-                       unit_key=req.unit_key, min_order=req.min_order, company_id=0)
+                       unit_key=req.unit_key, min_order=req.min_order,
+                       min_order_total=req.min_order_total, company_id=0)
     return {"ok": True}
 
 @app.get("/api/saas/catalog/units")
