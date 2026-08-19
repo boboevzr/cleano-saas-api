@@ -8388,6 +8388,10 @@ SITE_SETTINGS_DEFAULTS = {
     # Видео-карточка на главной странице сайта (своё видео компании)
     "site_video_enabled":      "false",
     "site_video_placement":    "hero",  # hero | how_it_works | reviews | floating
+    # Правила приёма и выдачи заказов — JSON-массив [{emoji,title_ru,text_ru,title_uz,text_uz}].
+    # Пусто по умолчанию: реальный дефолт живёт в config company_id=0 и копируется
+    # в новую компанию при регистрации (см. seed_company_order_rules).
+    "order_rules": "",
 }
 
 async def _get_cfg(key: str) -> str:
@@ -8417,6 +8421,7 @@ async def get_site_settings(company_slug: str = None):
         "agent_cta_text_ru", "agent_cta_text_uz",
         "agent_learnmore_text_ru", "agent_learnmore_text_uz",
         "site_video_enabled", "site_video_placement",
+        "order_rules",
     ]
     result = {}
     for key in PUBLIC_KEYS:
@@ -8513,6 +8518,7 @@ class SiteSettings(BaseModel):
     agent_learnmore_text_uz: str | None = None
     site_video_enabled:      str | None = None
     site_video_placement:    str | None = None
+    order_rules:             str | None = None
 
 @app.get("/api/admin/settings/site")
 async def get_admin_site_settings(_=Depends(get_admin)):
@@ -10889,6 +10895,7 @@ async def _provision_company(name: str, slug: str, plan: str, max_branches: int,
     await db.seed_company_site_faq(company["id"])
     await db.seed_company_defaults(company["id"], name)
     await db.seed_company_sms_templates(company["id"])
+    await db.seed_company_order_rules(company["id"])
 
     # Мастер-пароль для подтверждения опасных действий — свой уникальный на компанию,
     # а не общий ADMIN_PASS по умолчанию для всех.
@@ -13108,6 +13115,17 @@ async def saas_reseed_sms_templates(_=Depends(get_superadmin)):
     companies = await db.get_all_companies()
     for c in companies:
         await db.seed_company_sms_templates(c["id"])
+    return {"ok": True, "companies": len(companies)}
+
+
+@app.post("/api/saas/catalog/order-rules/seed-to-companies")
+async def saas_reseed_order_rules(_=Depends(get_superadmin)):
+    """Засеять order_rules во ВСЕХ компаниях, у которых он ещё пуст (компании,
+    созданные до появления этой фичи — ON CONFLICT DO NOTHING не тронет тех,
+    кто уже сам отредактировал свои правила)."""
+    companies = await db.get_all_companies()
+    for c in companies:
+        await db.seed_company_order_rules(c["id"])
     return {"ok": True, "companies": len(companies)}
 
 
