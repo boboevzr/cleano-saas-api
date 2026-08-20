@@ -3399,6 +3399,7 @@ async def verify(req: VerifyRequest):
             "phone": user["phone"],
             "first_name": user["first_name"],
             "address": user["address"],
+            "must_change_password": user.get("must_change_password", False),
         }
     }
 
@@ -3448,6 +3449,7 @@ async def login(req: LoginRequest):
             "phone": user["phone"],
             "first_name": user["first_name"],
             "address": user["address"],
+            "must_change_password": user.get("must_change_password", False),
         }
     }
 
@@ -3531,6 +3533,7 @@ async def forgot_password_confirm(body: dict):
             "phone": user["phone"],
             "first_name": user["first_name"],
             "address": user["address"],
+            "must_change_password": user.get("must_change_password", False),
         }
     }
 
@@ -3544,6 +3547,7 @@ async def me(user = Depends(get_current_user)):
         "is_verified": user["is_verified"],
         "address": user["address"],
         "tg_id": user.get("tg_id"),
+        "must_change_password": user.get("must_change_password", False),
     }
 
 
@@ -3694,7 +3698,7 @@ class UpdateProfileRequest(BaseModel):
 
 
 class UpdatePasswordRequest(BaseModel):
-    old_password: str
+    old_password: str | None = None
     new_password: str
 
     @field_validator("new_password")
@@ -3713,8 +3717,12 @@ async def update_profile(req: UpdateProfileRequest, user = Depends(get_current_u
 
 @app.patch("/api/me/password")
 async def update_password(req: UpdatePasswordRequest, user = Depends(get_current_user)):
-    if not pwd_context.verify(req.old_password[:72], user["password_hash"]):
-        raise HTTPException(status_code=400, detail="Неверный текущий пароль")
+    # must_change_password (пароль выдан автоматически ботом) — пропускаем проверку
+    # старого пароля, клиент его никогда не вводил сам. В остальных случаях (обычная
+    # смена пароля в настройках) старый пароль обязателен как раньше.
+    if not user.get("must_change_password"):
+        if not req.old_password or not pwd_context.verify(req.old_password[:72], user["password_hash"]):
+            raise HTTPException(status_code=400, detail="Неверный текущий пароль")
     new_hash = pwd_context.hash(req.new_password[:72])
     await db.update_user_password(user["id"], new_hash)
     return {"ok": True}
@@ -4461,6 +4469,7 @@ async def register_via_tg(body: dict):
             "phone": user["phone"],
             "first_name": user["first_name"],
             "address": user.get("address"),
+            "must_change_password": user.get("must_change_password", False),
         }
     }
 

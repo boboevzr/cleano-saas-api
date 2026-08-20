@@ -2354,7 +2354,7 @@ async def update_user_password(user_id: int, password_hash: str):
     if not pool: return
     async with pool.acquire() as conn:
         await conn.execute("""
-            UPDATE users SET password_hash=$2, updated_at=NOW() WHERE id=$1
+            UPDATE users SET password_hash=$2, must_change_password=FALSE, updated_at=NOW() WHERE id=$1
         """, user_id, password_hash)
 
 async def get_all_site_users(search: str = "", limit: int = 500):
