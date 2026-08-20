@@ -13118,6 +13118,31 @@ async def saas_reseed_sms_templates(_=Depends(get_superadmin)):
     return {"ok": True, "companies": len(companies)}
 
 
+@app.get("/api/saas/catalog/order-rules")
+async def saas_get_order_rules_template(_=Depends(get_superadmin)):
+    """Шаблон правил приёма/выдачи (company_id=0) — копируется в новые компании при создании."""
+    val = await db.get_config_for_company("order_rules", 0)
+    return {"ok": True, "order_rules": val or db._DEFAULT_ORDER_RULES_JSON}
+
+
+class OrderRulesTemplateRequest(BaseModel):
+    order_rules: str
+
+@app.put("/api/saas/catalog/order-rules")
+async def saas_save_order_rules_template(body: OrderRulesTemplateRequest, _=Depends(get_superadmin)):
+    await db.set_config_for_company("order_rules", body.order_rules, 0)
+    return {"ok": True}
+
+
+@app.post("/api/saas/catalog/order-rules/seed-from-company")
+async def sa_seed_order_rules_from_company(_=Depends(get_superadmin)):
+    """Копирует текущие правила приёма компании #1 в шаблон (company_id=0)."""
+    val = await db.get_config_for_company("order_rules", 1)
+    if val:
+        await db.set_config_for_company("order_rules", val, 0)
+    return {"ok": True}
+
+
 @app.post("/api/saas/catalog/order-rules/seed-to-companies")
 async def saas_reseed_order_rules(_=Depends(get_superadmin)):
     """Засеять order_rules во ВСЕХ компаниях, у которых он ещё пуст (компании,
