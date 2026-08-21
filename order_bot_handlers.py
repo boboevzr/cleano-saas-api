@@ -55,6 +55,7 @@ from aiogram.types import (
     Message, CallbackQuery, BufferedInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    InputMediaPhoto, InputMediaVideo,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -269,6 +270,20 @@ T = {
         "status_lead_line":   "📋 Заявка {num}\n🧺 {service}\n📌 Статус: 🆕 Новая заявка, ожидайте звонка",
         "status_lead_lost_line": "📋 Заявка {num}\n📌 Статус: ❌ Отменена",
         "btn_back_to_status": "◀️ К категориям",
+        "btn_order_detail":   "📋 №{num}: подробнее",
+        "btn_positions":      "📄 Позиции",
+        "btn_measure_media":  "📐 Фото/видео замера",
+        "btn_photos":         "📸 Фото: до/после/повреждения",
+        "btn_back_to_order":  "◀️ К заказу",
+        "order_positions_title": "📄 Позиции заказа №{num}",
+        "no_positions":       "Позиций пока нет.",
+        "no_measure_media":   "Фото/видео замера пока нет.",
+        "no_photos":          "Фото пока нет.",
+        "order_measure_caption": "📐 Замер · Позиция {idx}: {service}\n🧾 Заказ №{num}",
+        "photo_type_before":  "До",
+        "photo_type_after":   "После",
+        "photo_type_damage":  "⚠️ Повреждение",
+        "order_not_found":    "⚠️ Заказ не найден.",
 
         # ── Мой профиль ──
         "profile_text":   "👤 Ваш профиль\n\n📛 Имя: {name}\n📞 Телефон: {phone}\n🆔 ID: {uid}\n\n📊 Заявок всего: {total}\n✅ Выполнено: {done}{last}",
@@ -411,6 +426,20 @@ T = {
         "status_lead_line":   "📋 Ariza {num}\n🧺 {service}\n📌 Holat: 🆕 Yangi ariza, qo'ng'iroqni kuting",
         "status_lead_lost_line": "📋 Ariza {num}\n📌 Holat: ❌ Bekor qilindi",
         "btn_back_to_status": "◀️ Kategoriyalarga",
+        "btn_order_detail":   "📋 №{num}: batafsil",
+        "btn_positions":      "📄 Pozitsiyalar",
+        "btn_measure_media":  "📐 O'lchash foto/video",
+        "btn_photos":         "📸 Foto: oldin/keyin/shikastlanish",
+        "btn_back_to_order":  "◀️ Buyurtmaga",
+        "order_positions_title": "📄 №{num} buyurtma pozitsiyalari",
+        "no_positions":       "Pozitsiyalar hali yo'q.",
+        "no_measure_media":   "O'lchash foto/videosi hali yo'q.",
+        "no_photos":          "Foto hali yo'q.",
+        "order_measure_caption": "📐 O'lchash · Pozitsiya {idx}: {service}\n🧾 Buyurtma №{num}",
+        "photo_type_before":  "Oldin",
+        "photo_type_after":   "Keyin",
+        "photo_type_damage":  "⚠️ Shikastlanish",
+        "order_not_found":    "⚠️ Buyurtma topilmadi.",
 
         # ── Mening profilim ──
         "profile_text":   "👤 Sizning profilingiz\n\n📛 Ism: {name}\n📞 Telefon: {phone}\n🆔 ID: {uid}\n\n📊 Jami buyurtmalar: {total}\n✅ Bajarildi: {done}{last}",
@@ -1762,6 +1791,7 @@ async def show_status_group(call: CallbackQuery, company_id: int, state: FSMCont
     leads, orders = await _gather_status_data(uid, company_id)
 
     lines = []
+    order_nums: list[str] = []  # заказы этой группы — под каждым кнопка "подробнее" (не для лидов, у них нет детального просмотра)
     if group == "new":
         for l in leads:
             if l.get("status") in ("converted", "lost"):
@@ -1778,6 +1808,8 @@ async def show_status_group(call: CallbackQuery, company_id: int, state: FSMCont
                 num=_h(o.get("order_num", "")), service=_h(o.get("service") or ""),
                 date=_h(o.get("pickup_date") or ""), status=_order_status_name(lang, o["status"]),
             ))
+            if o.get("order_num"):
+                order_nums.append(o["order_num"])
     elif group == "done":
         for o in orders:
             if o.get("status") != "delivered":
@@ -1786,6 +1818,8 @@ async def show_status_group(call: CallbackQuery, company_id: int, state: FSMCont
                 num=_h(o.get("order_num", "")), service=_h(o.get("service") or ""),
                 date=_h(o.get("pickup_date") or ""), status=_order_status_name(lang, o["status"]),
             ))
+            if o.get("order_num"):
+                order_nums.append(o["order_num"])
     elif group == "cancelled":
         for l in leads:
             if l.get("status") != "lost":
@@ -1799,6 +1833,8 @@ async def show_status_group(call: CallbackQuery, company_id: int, state: FSMCont
                 num=_h(o.get("order_num", "")), service=_h(o.get("service") or ""),
                 date=_h(o.get("pickup_date") or ""), status=_order_status_name(lang, o["status"]),
             ))
+            if o.get("order_num"):
+                order_nums.append(o["order_num"])
 
     group_title_keys = {
         "new": "status_btn_new", "progress": "status_btn_progress",
@@ -1811,7 +1847,224 @@ async def show_status_group(call: CallbackQuery, company_id: int, state: FSMCont
     else:
         text = "\n\n".join([f"{title}\n"] + lines)
 
-    await call.message.answer(text, reply_markup=back_to_status_kb(lang))
+    if order_nums:
+        kb_rows = [[InlineKeyboardButton(text=t(lang, "btn_order_detail").format(num=_h(num)),
+                                          callback_data=f"ordet_{num}")] for num in order_nums]
+        kb_rows += back_to_status_kb(lang).inline_keyboard
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    else:
+        kb = back_to_status_kb(lang)
+
+    await call.message.answer(text, reply_markup=kb)
+
+
+# ══════════════════════════════════════
+#  ДЕТАЛЬНЫЙ ПРОСМОТР ЗАКАЗА — позиции / фото-видео замера / фото до-после-
+#  повреждение прямо в боте (перенесено из прод-бота artez_bot/bot.py).
+#  Плоская маршрутизация по префиксу callback_data (без FSM), как в проде:
+#  ordet_{num} → карточка заказа, opos_/omed_/ophoto_{num} → вкладки. Только
+#  для заказов (не лидов — у лида ещё нет позиций/фото).
+# ══════════════════════════════════════
+def _svc_label(lang: str, item: dict) -> str:
+    if lang == "uz" and item.get("service_uz"):
+        return item["service_uz"]
+    return item.get("service_ru") or item.get("service") or ""
+
+
+def _item_meta_str(lang: str, item: dict) -> str:
+    unit_m2 = "m²" if lang == "uz" else "м²"
+    unit_sum = "so'm" if lang == "uz" else "сум"
+    parts = []
+    w, l = item.get("width_cm"), item.get("length_cm")
+    if w and l:
+        parts.append(f"{w}×{l} {'sm' if lang == 'uz' else 'см'}")
+    if item.get("sqm"):
+        parts.append(f"{item['sqm']} {unit_m2}")
+    if item.get("price_per_sqm"):
+        parts.append(f"{item['price_per_sqm']} {unit_sum}/{unit_m2}")
+    if item.get("total_sum"):
+        parts.append(f"= {item['total_sum']} {unit_sum}")
+    return " · ".join(str(p) for p in parts)
+
+
+def _order_detail_kb(lang: str, order_num: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t(lang, "btn_positions"),     callback_data=f"opos_{order_num}")],
+        [InlineKeyboardButton(text=t(lang, "btn_measure_media"), callback_data=f"omed_{order_num}")],
+        [InlineKeyboardButton(text=t(lang, "btn_photos"),        callback_data=f"ophoto_{order_num}")],
+        [InlineKeyboardButton(text=t(lang, "btn_back_to_status"), callback_data="menu_status")],
+        [InlineKeyboardButton(text=t(lang, "btn_menu"), callback_data="go_menu")],
+    ])
+
+
+def _back_to_order_kb(lang: str, order_num: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t(lang, "btn_back_to_order"), callback_data=f"ordet_{order_num}")],
+        [InlineKeyboardButton(text=t(lang, "btn_menu"), callback_data="go_menu")],
+    ])
+
+
+async def _client_owned_order(order_num: str, uid: int, company_id: int) -> dict | None:
+    """Заказ по номеру, только если принадлежит этому tg_id (через верифицированный
+    tg_phone, тот же путь владения, что в _gather_status_data)."""
+    try:
+        client = await db.get_bot_client_by_tg_id(uid, company_id)
+        phone = (client or {}).get("tg_phone")
+    except Exception as e:
+        logging.warning(f"get_bot_client_by_tg_id error: {e}")
+        phone = None
+    if not phone:
+        return None
+    try:
+        order = await db.get_order_by_num_and_phone(order_num, phone, company_id)
+    except Exception as e:
+        logging.warning(f"get_order_by_num_and_phone error: {e}")
+        return None
+    return order or None
+
+
+@router.callback_query(F.data.startswith("ordet_"))
+async def show_order_detail(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    order_num = call.data[len("ordet_"):]
+    uid = call.from_user.id
+
+    order = await _client_owned_order(order_num, uid, company_id)
+    if not order:
+        await call.message.answer(t(lang, "order_not_found"), reply_markup=back_to_status_kb(lang))
+        return
+
+    text = t(lang, "status_order_line").format(
+        num=_h(order.get("order_num", "")), service=_h(order.get("service") or ""),
+        date=_h(order.get("pickup_date") or ""), status=_order_status_name(lang, order["status"]),
+    )
+    await call.message.answer(text, reply_markup=_order_detail_kb(lang, order_num))
+
+
+@router.callback_query(F.data.startswith("opos_"))
+async def show_order_positions(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    order_num = call.data[len("opos_"):]
+    uid = call.from_user.id
+
+    order = await _client_owned_order(order_num, uid, company_id)
+    if not order:
+        await call.message.answer(t(lang, "order_not_found"), reply_markup=back_to_status_kb(lang))
+        return
+
+    try:
+        items = await db.get_order_items(order["id"])
+    except Exception as e:
+        logging.warning(f"get_order_items error: {e}")
+        items = []
+
+    if not items:
+        await call.message.answer(t(lang, "no_positions"), reply_markup=_back_to_order_kb(lang, order_num))
+        return
+
+    lines = [t(lang, "order_positions_title").format(num=_h(order_num))]
+    for i, it in enumerate(items, 1):
+        line = f"{i}. {_h(_svc_label(lang, it))}"
+        meta = _item_meta_str(lang, it)
+        if meta:
+            line += f"\n{meta}"
+        lines.append(line)
+    await call.message.answer("\n\n".join(lines), reply_markup=_back_to_order_kb(lang, order_num))
+
+
+@router.callback_query(F.data.startswith("omed_"))
+async def show_order_measure_media(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    order_num = call.data[len("omed_"):]
+    uid = call.from_user.id
+
+    order = await _client_owned_order(order_num, uid, company_id)
+    if not order:
+        await call.message.answer(t(lang, "order_not_found"), reply_markup=back_to_status_kb(lang))
+        return
+
+    try:
+        items = await db.get_order_items(order["id"])
+    except Exception as e:
+        logging.warning(f"get_order_items error: {e}")
+        items = []
+
+    sent_any = False
+    for i, it in enumerate(items, 1):
+        try:
+            media = await db.get_item_media(it["id"])
+        except Exception as e:
+            logging.warning(f"get_item_media error: {e}")
+            media = []
+        if not media:
+            continue
+        sent_any = True
+        caption = t(lang, "order_measure_caption").format(idx=i, service=_h(_svc_label(lang, it)), num=_h(order_num))
+        meta = _item_meta_str(lang, it)
+        if meta:
+            caption += f"\n{meta}"
+        try:
+            if len(media) == 1:
+                m = media[0]
+                if m.get("tg_file_type") == "video":
+                    await call.bot.send_video(uid, m["tg_file_id"], caption=caption, protect_content=True)
+                else:
+                    await call.bot.send_photo(uid, m["tg_file_id"], caption=caption, protect_content=True)
+            else:
+                # Лимит Telegram-альбома — 10 файлов; caption можно задать только первому элементу.
+                group = [
+                    (InputMediaVideo if m.get("tg_file_type") == "video" else InputMediaPhoto)(
+                        media=m["tg_file_id"], caption=caption if idx == 0 else None,
+                    )
+                    for idx, m in enumerate(media[:10])
+                ]
+                await call.bot.send_media_group(uid, group, protect_content=True)
+        except Exception as e:
+            logging.warning(f"send measure media error: {e}")
+
+    if not sent_any:
+        await call.message.answer(t(lang, "no_measure_media"), reply_markup=_back_to_order_kb(lang, order_num))
+
+
+@router.callback_query(F.data.startswith("ophoto_"))
+async def show_order_photos(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    order_num = call.data[len("ophoto_"):]
+    uid = call.from_user.id
+
+    order = await _client_owned_order(order_num, uid, company_id)
+    if not order:
+        await call.message.answer(t(lang, "order_not_found"), reply_markup=back_to_status_kb(lang))
+        return
+
+    try:
+        photos = await db.get_order_photos(order["id"])
+    except Exception as e:
+        logging.warning(f"get_order_photos error: {e}")
+        photos = []
+
+    if not photos:
+        await call.message.answer(t(lang, "no_photos"), reply_markup=_back_to_order_kb(lang, order_num))
+        return
+
+    type_keys = {"before": "photo_type_before", "after": "photo_type_after", "damage": "photo_type_damage"}
+    for p in photos:
+        caption = t(lang, type_keys.get(p.get("photo_type"), "photo_type_damage"))
+        try:
+            if p.get("tg_file_type") == "video":
+                await call.bot.send_video(uid, p["tg_file_id"], caption=caption, protect_content=True)
+            else:
+                await call.bot.send_photo(uid, p["tg_file_id"], caption=caption, protect_content=True)
+        except Exception as e:
+            logging.warning(f"send order photo error: {e}")
 
 
 # ══════════════════════════════════════
