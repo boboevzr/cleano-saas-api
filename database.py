@@ -2647,12 +2647,12 @@ async def save_site_order(data: dict, source: str = "site") -> str:
                 order_num, source,
                 client_tg_id, client_first_name, client_last_name, client_phone,
                 branch, city, address, short_address, location, service, service_type, pickup_type, delivery_type, pickup_date, pickup_time, note,
-                total_price, status
+                total_price, status, company_id
             ) VALUES (
                 $1, $2,
                 NULL, $3, $4, $5,
                 $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                $18, 'new'
+                $18, 'new', $19
             )
             ON CONFLICT (order_num) DO NOTHING
         """,
@@ -2674,6 +2674,7 @@ async def save_site_order(data: dict, source: str = "site") -> str:
             data.get("pickup_time"),
             data.get("note"),
             data.get("total_price"),
+            _cid(),
         )
         await conn.execute("""
             INSERT INTO order_status_history (order_num, new_status, note)
