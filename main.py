@@ -44,11 +44,6 @@ GROUP_ID              = os.getenv("GROUP_ID", "")
 GROUP_ID_ZARAFSHAN    = os.getenv("GROUP_ID_ZARAFSHAN", "")
 LEADS_GROUP_ID        = os.getenv("LEADS_GROUP_ID", "-1004486597965")
 GROUP_NEW_CLIENTS_ID  = os.getenv("GROUP_NEW_CLIENTS_ID", "-1003768571929")
-GROUP_DELIVERY_ID            = os.getenv("GROUP_DELIVERY_ID", "-5434866533")
-GROUP_DELIVERY_ZARAFSHAN_ID      = os.getenv("GROUP_DELIVERY_ZARAFSHAN_ID", "-1004327266702")
-GROUP_DELIVERY_NAVOI_ID          = os.getenv("GROUP_DELIVERY_NAVOI_ID", "-1004327266702")
-GROUP_DELIVERY_ZARAFSHAN_CHANNEL = os.getenv("GROUP_DELIVERY_ZARAFSHAN_CHANNEL", "-1004483444044")
-GROUP_DELIVERY_NAVOI_CHANNEL     = os.getenv("GROUP_DELIVERY_NAVOI_CHANNEL", "-1004483444044")
 GROUP_ID_NAVOI     = os.getenv("GROUP_ID_NAVOI", "")
 MEDIA_CHANNEL_ID   = os.getenv("MEDIA_CHANNEL_ID", "-1004453880659")
 APP_URL            = os.getenv("APP_URL", "https://web-production-eef2a.up.railway.app")
@@ -1928,23 +1923,17 @@ async def send_route_to_delivery_group(route_id: int, me=Depends(get_current_sta
         raise HTTPException(404, "Маршрут не найден")
 
     branch = route.get("branch", "")
-    branch_group_id   = await db.get_branch_tg_group_id(branch, "tg_delivery_group_id")   if branch else None
     branch_channel_id = await db.get_branch_tg_group_id(branch, "tg_delivery_channel_id") if branch else None
-    if branch_group_id or branch_channel_id:
-        group_id   = int(branch_group_id)   if branch_group_id   else 0
-        channel_id = int(branch_channel_id) if branch_channel_id else 0
+    if branch_channel_id:
+        channel_id = int(branch_channel_id)
     elif branch == "navoi":
-        group_id_str   = await _get_cfg("delivery_group_navoi_id")   or await _get_cfg("delivery_group_id")
         channel_id_str = await _get_cfg("delivery_channel_navoi_id")
-        group_id   = int(group_id_str)   if group_id_str   else 0
         channel_id = int(channel_id_str) if channel_id_str else 0
     else:
-        group_id_str   = await _get_cfg("delivery_group_zarafshan_id") or await _get_cfg("delivery_group_id")
         channel_id_str = await _get_cfg("delivery_channel_zarafshan_id")
-        group_id   = int(group_id_str)   if group_id_str   else 0
         channel_id = int(channel_id_str) if channel_id_str else 0
-    if not channel_id and not group_id:
-        raise HTTPException(400, "Канал/группа водителей не настроены (Настройки → Telegram → Водители)")
+    if not channel_id:
+        raise HTTPException(400, "Канал водителей не настроен (Настройки → Telegram → Водители)")
 
     stops = route.get("stops", [])
     if not stops:
@@ -1955,13 +1944,14 @@ async def send_route_to_delivery_group(route_id: int, me=Depends(get_current_sta
     import json as _jmod
     now_uz     = datetime.now(ZoneInfo("Asia/Tashkent"))
     time_str   = now_uz.strftime("%H:%M:%S")
-    date_short = now_uz.strftime("%d.%m")
     type_label = {"pickup": "Забор", "delivery": "Доставка", "mixed": "Смешанный"}.get(route.get("type", ""), "")
     type_emoji = {"pickup": "📥", "delivery": "📤", "mixed": "🔄"}.get(route.get("type", ""), "🚗")
     route_date = str(route.get("date", ""))
     route_name = route.get("name", "")
 
-    # Удаляем предыдущие сообщения (канал и группа)
+    # Удаляем предыдущие сообщения из канала (старые записи "__group__" от
+    # удалённой фичи группы-уведомления просто не найдутся в канале и молча
+    # проигнорируются — see except ниже, это ожидаемая деградация)
     _raw = route.get("tg_delivery_msg_ids")
     if isinstance(_raw, str):
         try: _raw = _jmod.loads(_raw)
@@ -1970,20 +1960,16 @@ async def send_route_to_delivery_group(route_id: int, me=Depends(get_current_sta
     if old_msg_ids:
         async with aiohttp.ClientSession() as sess:
             for key, msg_id_str in old_msg_ids.items():
-                # __group__ → удалять из группы, остальное → из канала
-                target = group_id if key == "__group__" else (channel_id or group_id)
-                if not target:
-                    continue
                 try:
                     await sess.post(
                         f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage",
-                        json={"chat_id": str(target), "message_id": int(msg_id_str)},
+                        json={"chat_id": str(channel_id), "message_id": int(msg_id_str)},
                         timeout=aiohttp.ClientTimeout(total=4))
                 except Exception:
                     pass
 
     # ── Канал: заголовок + остановки + подвал ──
-    dest = channel_id or group_id
+    dest = channel_id
     new_msg_ids: dict = {}
     tg_error = None
 
@@ -2027,24 +2013,6 @@ async def send_route_to_delivery_group(route_id: int, me=Depends(get_current_sta
     if sent == 0 and tg_error:
         logging.error(f"send-to-delivery-group failed: {tg_error}")
         raise HTTPException(400, f"Telegram: {tg_error}")
-
-    # ── Группа: короткое уведомление (только если есть и канал, и группа) ──
-    if group_id and channel_id:
-        tpl = await _get_cfg("delivery_group_template") or "🚗 {route_name}-{count} — {route_type} · {date} {time}"
-        try:
-            notify = tpl.format(
-                route_name=route_name, count=len(stops),
-                route_type=f"{type_emoji} {type_label}",
-                date=date_short, time=time_str,
-            )
-        except Exception:
-            notify = f"🚗 {route_name}-{len(stops)} — {type_emoji} {type_label} · {date_short} {time_str}"
-        ch_link_key = "delivery_channel_navoi_link" if branch == "navoi" else "delivery_channel_zarafshan_link"
-        ch_link = await _get_cfg(ch_link_key)
-        notify_kb = {"inline_keyboard": [[{"text": "↗️ Открыть канал", "url": ch_link}]]} if ch_link else {"inline_keyboard": []}
-        grp_msg_id = await _send_tg_with_kb(group_id, notify, notify_kb, parse_mode=None)
-        if grp_msg_id:
-            new_msg_ids["__group__"] = grp_msg_id
 
     if new_msg_ids and db.pool:
         async with db.pool.acquire() as conn:
@@ -8341,15 +8309,11 @@ SITE_SETTINGS_DEFAULTS = {
     "sheets_url":          "",
     # Группа уведомлений
     "new_clients_group_id":    "",
-    # Группа водителей/доставщиков (маршруты)
-    "delivery_group_id":              "",
-    "delivery_group_zarafshan_id":      "",
-    "delivery_group_navoi_id":          "",
+    # Канал водителей/доставщиков (маршруты)
     "delivery_channel_zarafshan_id":    "",
     "delivery_channel_navoi_id":        "",
     "delivery_channel_zarafshan_link":  "",
     "delivery_channel_navoi_link":      "",
-    "delivery_group_template": "🚗 {route_name}-{count} — {route_type} · {date} {time}",
     # Лиды
     "leads_group_id":          "",
     "leads_group_zarafshan":   "",
@@ -8470,14 +8434,10 @@ class SiteSettings(BaseModel):
     contact_navoi_whatsapp:     str | None = None
     contact_navoi_instagram:    str | None = None
     branch_navoi_location:      str | None = None
-    delivery_group_id:              str | None = None
-    delivery_group_zarafshan_id:      str | None = None
-    delivery_group_navoi_id:          str | None = None
     delivery_channel_zarafshan_id:    str | None = None
     delivery_channel_navoi_id:        str | None = None
     delivery_channel_zarafshan_link:  str | None = None
     delivery_channel_navoi_link:      str | None = None
-    delivery_group_template:          str | None = None
     tg_group_id:         str | None = None
     tg_group_zarafshan:  str | None = None
     tg_group_navoi:      str | None = None
@@ -10775,7 +10735,6 @@ class BranchCreateRequest(BaseModel):
     workshop_lat:              float | None = None
     workshop_lon:              float | None = None
     phones:                    list = []
-    tg_delivery_group_id:      int | None = None
     tg_orders_channel_id:      int | None = None
     tg_leads_group_id:         int | None = None
     tg_delivery_channel_id:    int | None = None
@@ -10786,7 +10745,6 @@ class BranchCreateRequest(BaseModel):
     instagram:                 str | None = None
     tg_leads_group_link:       str | None = None
     tg_orders_channel_link:    str | None = None
-    tg_delivery_group_link:    str | None = None
     telegram_group_id:         int | None = None
     admin_tg_id:               int | None = None
 
@@ -10798,7 +10756,6 @@ class BranchUpdateRequest(BaseModel):
     workshop_lat:              float | None = None
     workshop_lon:              float | None = None
     phones:                    list | None = None
-    tg_delivery_group_id:      int | None = None
     tg_orders_channel_id:      int | None = None
     tg_leads_group_id:         int | None = None
     tg_delivery_channel_id:    int | None = None
@@ -10810,7 +10767,6 @@ class BranchUpdateRequest(BaseModel):
     active:                    bool | None = None
     tg_leads_group_link:       str | None = None
     tg_orders_channel_link:    str | None = None
-    tg_delivery_group_link:    str | None = None
     telegram_group_id:         int | None = None
     admin_tg_id:               int | None = None
 
@@ -12816,7 +12772,6 @@ async def branches_create(req: BranchCreateRequest, staff=Depends(get_current_st
         name_ru=req.name_ru, name_uz=req.name_uz,
         lat=req.lat, lon=req.lon, phones=req.phones,
         workshop_lat=req.workshop_lat, workshop_lon=req.workshop_lon,
-        tg_delivery_group_id=req.tg_delivery_group_id,
         tg_orders_channel_id=req.tg_orders_channel_id,
         tg_leads_group_id=req.tg_leads_group_id,
         tg_delivery_channel_id=req.tg_delivery_channel_id,
@@ -12827,7 +12782,6 @@ async def branches_create(req: BranchCreateRequest, staff=Depends(get_current_st
         instagram=req.instagram,
         tg_leads_group_link=req.tg_leads_group_link,
         tg_orders_channel_link=req.tg_orders_channel_link,
-        tg_delivery_group_link=req.tg_delivery_group_link,
         telegram_group_id=req.telegram_group_id,
         admin_tg_id=req.admin_tg_id,
     )

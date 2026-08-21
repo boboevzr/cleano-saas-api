@@ -8125,13 +8125,10 @@ async def get_order_channel_info(order_id: int) -> dict | None:
         else:
             branch = d.get("branch", "")
             key_ch = "delivery_channel_navoi_id" if branch == "navoi" else "delivery_channel_zarafshan_id"
-            key_gr = "delivery_group_navoi_id"   if branch == "navoi" else "delivery_group_zarafshan_id"
             d["channel_id"] = 0
-            for key in (key_ch, key_gr, "delivery_group_id"):
-                cfg = await conn.fetchrow("SELECT value FROM config WHERE key=$1", key)
-                if cfg and cfg["value"]:
-                    d["channel_id"] = int(cfg["value"])
-                    break
+            cfg = await conn.fetchrow("SELECT value FROM config WHERE key=$1", key_ch)
+            if cfg and cfg["value"]:
+                d["channel_id"] = int(cfg["value"])
         num_row = await conn.fetchrow(
             "SELECT COUNT(*)+1 AS num FROM route_orders WHERE route_id=$1 AND sort_order < $2",
             d["route_id"], d["sort_order"])
@@ -9834,7 +9831,7 @@ async def get_branch_by_slug(company_id: int, slug: str):
         )
 
 
-_BRANCH_TG_COLUMNS = {"tg_leads_group_id", "tg_orders_channel_id", "tg_delivery_group_id", "tg_delivery_channel_id"}
+_BRANCH_TG_COLUMNS = {"tg_leads_group_id", "tg_orders_channel_id", "tg_delivery_channel_id"}
 
 async def get_branch_tg_group_id(branch_slug: str, column: str):
     """Читает Telegram group/channel id из карточки филиала (по slug, текущая компания через _cid()).
@@ -9847,12 +9844,12 @@ async def get_branch_tg_group_id(branch_slug: str, column: str):
 async def create_branch(company_id: int, slug: str, name_ru: str, name_uz: str = "",
                          lat=None, lon=None, phones: list = None,
                          workshop_lat=None, workshop_lon=None,
-                         tg_delivery_group_id=None, tg_orders_channel_id=None,
+                         tg_orders_channel_id=None,
                          tg_leads_group_id=None, tg_delivery_channel_id=None,
                          tg_delivery_channel_link=None, telegram_link=None,
                          admin_tg_link=None, whatsapp=None, instagram=None,
                          tg_leads_group_link=None, tg_orders_channel_link=None,
-                         tg_delivery_group_link=None, telegram_group_id=None,
+                         telegram_group_id=None,
                          admin_tg_id=None):
     if not pool: return None
     import json
@@ -9863,21 +9860,21 @@ async def create_branch(company_id: int, slug: str, name_ru: str, name_uz: str =
                 INSERT INTO branches
                     (company_id, slug, name_ru, name_uz, lat, lon, phones,
                      workshop_lat, workshop_lon,
-                     tg_delivery_group_id, tg_orders_channel_id,
+                     tg_orders_channel_id,
                      tg_leads_group_id, tg_delivery_channel_id, tg_delivery_channel_link,
                      telegram_link, admin_tg_link, whatsapp, instagram,
                      tg_leads_group_link, tg_orders_channel_link,
-                     tg_delivery_group_link, telegram_group_id, admin_tg_id, active)
-                VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-                        $19,$20,$21,$22,$23,TRUE)
+                     telegram_group_id, admin_tg_id, active)
+                VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+                        $18,$19,$20,$21,TRUE)
                 RETURNING *
             """, company_id, slug, name_ru, name_uz, lat, lon, phones_json,
                  workshop_lat, workshop_lon,
-                 tg_delivery_group_id, tg_orders_channel_id,
+                 tg_orders_channel_id,
                  tg_leads_group_id, tg_delivery_channel_id, tg_delivery_channel_link,
                  telegram_link, admin_tg_link, whatsapp, instagram,
                  tg_leads_group_link, tg_orders_channel_link,
-                 tg_delivery_group_link, telegram_group_id, admin_tg_id)
+                 telegram_group_id, admin_tg_id)
         except Exception:
             return None  # slug уже занят
 
@@ -9886,11 +9883,11 @@ async def update_branch(branch_id: int, company_id: int, updates: dict) -> bool:
     import json
     allowed = {"name_ru", "name_uz", "lat", "lon", "phones",
                "workshop_lat", "workshop_lon",
-               "tg_delivery_group_id", "tg_orders_channel_id",
+               "tg_orders_channel_id",
                "tg_leads_group_id", "tg_delivery_channel_id", "tg_delivery_channel_link",
                "telegram_link", "admin_tg_link", "whatsapp", "instagram", "active",
                "tg_leads_group_link", "tg_orders_channel_link",
-               "tg_delivery_group_link", "telegram_group_id", "admin_tg_id"}
+               "telegram_group_id", "admin_tg_id"}
     fields = {k: v for k, v in updates.items() if k in allowed}
     if not fields: return False
     # phones сериализуем в JSON
