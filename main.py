@@ -2651,6 +2651,9 @@ async def staff_own_orders(status: str = None, limit: int = 50, offset: int = 0,
 async def staff_create_order(req: StaffOrderRequest, staff=Depends(require_perm("orders"))):
     if not staff.get("can_create_order", True):
         raise HTTPException(status_code=403, detail="Нет права создавать заказы")
+    req.phone = normalize_phone(req.phone)
+    if not PHONE_RE.match(req.phone):
+        raise HTTPException(status_code=400, detail="Неверный формат номера. Используйте +998XXXXXXXXX")
     try:
         order_num = await db.get_next_order_num()
         first_name = staff.get("first_name") or ""
@@ -4617,6 +4620,11 @@ async def update_order_data(order_id: int, body: dict = Body(...), staff=Depends
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         raise HTTPException(status_code=400, detail="Нет данных для обновления")
+    if "client_phone" in updates and updates["client_phone"]:
+        normalized_phone = normalize_phone(str(updates["client_phone"]))
+        if not PHONE_RE.match(normalized_phone):
+            raise HTTPException(status_code=400, detail="Неверный формат номера. Используйте +998XXXXXXXXX")
+        updates["client_phone"] = normalized_phone
     # asyncpg требует объект date, а не строку
     if "deadline" in updates and isinstance(updates["deadline"], str):
         from datetime import date
