@@ -2615,8 +2615,24 @@ async def get_orders_by_tg_id(tg_id: int):
 # ══════════════════════════════════════
 #  СОЗДАНИЕ ЗАЯВКИ С САЙТА
 # ══════════════════════════════════════
-async def get_next_order_num(prefix: str = "ARTEZ") -> str:
-    """Возвращает следующий номер заказа на основе данных в БД (общий с ботом счётчик)"""
+async def get_next_order_num(prefix: str | None = None) -> str:
+    """Возвращает следующий номер заказа на основе данных в БД (общий с ботом счётчик).
+    Без явного prefix — берётся свой префикс для текущей компании (_cid()), чтобы
+    номера заказов разных SaaS-компаний не смешивались под одним "ARTEZ-..." (баг
+    найден 2026-08-21: раньше префикс был захардкожен одинаковым для всех тенантов).
+    company_id=1 — это реальная компания ARTEZ (общая физ. БД с прод-сайтом
+    artez.uz) — для неё префикс намеренно не трогаем, чтобы не рвать её живую
+    последовательность номеров заказов независимо от значения slug."""
+    if prefix is None:
+        cid = _cid()
+        if cid == 1:
+            prefix = "ARTEZ"
+        else:
+            slug = None
+            if pool:
+                async with pool.acquire() as conn:
+                    slug = await conn.fetchval("SELECT slug FROM companies WHERE id=$1", cid)
+            prefix = re.sub(r'[^A-Z0-9]', '', (slug or '').upper())[:12] or f"C{cid}"
     if not pool:
         return f"{prefix}-1001"
     async with pool.acquire() as conn:
