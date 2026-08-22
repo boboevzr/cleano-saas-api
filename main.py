@@ -4747,6 +4747,10 @@ async def admin_change_order_status(order_id: int, staff=Depends(get_current_sta
             order = await db.get_order_by_id(order_id)
             if not order or order.get("status") != "new":
                 raise HTTPException(status_code=403, detail="Можно подтвердить только новый заказ")
+        elif status == "pickup" and staff.get("can_send_pickup") is True:
+            order = await db.get_order_by_id(order_id)
+            if not order or order.get("status") != "confirmed":
+                raise HTTPException(status_code=403, detail="Можно передать на вывоз только подтверждённый заказ")
         else:
             raise HTTPException(status_code=403, detail="Нет прав для смены статуса")
     if status not in ALL_ORDER_STATUSES:
