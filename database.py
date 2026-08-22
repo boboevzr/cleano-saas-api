@@ -792,12 +792,23 @@ async def create_tables():
         CREATE TABLE IF NOT EXISTS push_subscriptions (
             id         SERIAL PRIMARY KEY,
             staff_id   INTEGER NOT NULL,
-            endpoint   TEXT    NOT NULL UNIQUE,
+            endpoint   TEXT    NOT NULL,
             p256dh     TEXT    NOT NULL,
             auth       TEXT    NOT NULL,
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_push_staff_id ON push_subscriptions(staff_id);
+        -- UNIQUE был раньше только на endpoint (сама подписка браузера) — из-за
+        -- этого один физический браузер мог "принадлежать" только ОДНОМУ staff_id
+        -- одновременно: ON CONFLICT(endpoint) в upsert_push_subscription молча
+        -- переписывал staff_id на того, кто подписался последним с этого устройства.
+        -- Найдено 2026-08-21: push-уведомление для сотрудника компании id=3 пришло
+        -- сотруднику компании id=1 — тот же браузер использовался для входа в оба
+        -- staff-аккаунта, и второй "украл" подписку у первого. Теперь UNIQUE на
+        -- пару (staff_id, endpoint) — один браузер может держать подписки сразу
+        -- нескольких staff_id одновременно, без взаимной перезаписи.
+        ALTER TABLE push_subscriptions DROP CONSTRAINT IF EXISTS push_subscriptions_endpoint_key;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_push_staff_endpoint ON push_subscriptions(staff_id, endpoint);
         """)
 
     # ── Шаг 3б: таблица contacts (справочник) ───────────────────────────
@@ -6084,12 +6095,16 @@ async def get_tg_clients(search: str = "", limit: int = 200) -> list[dict]:
         return [dict(r) for r in rows]
 
 async def upsert_push_subscription(staff_id: int, endpoint: str, p256dh: str, auth: str):
+    # NB: конфликт по (staff_id, endpoint), а не по endpoint одному — иначе один
+    # физический браузер, использованный для входа под разными staff_id (включая
+    # разные компании в SaaS), "крал" бы подписку друг у друга при переподписке
+    # (см. комментарий у CREATE UNIQUE INDEX idx_push_staff_endpoint).
     if not pool: return
     async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO push_subscriptions (staff_id, endpoint, p256dh, auth)
             VALUES ($1, $2, $3, $4)
-            ON CONFLICT (endpoint) DO UPDATE SET staff_id=$1, p256dh=$3, auth=$4
+            ON CONFLICT (staff_id, endpoint) DO UPDATE SET p256dh=$3, auth=$4
         """, staff_id, endpoint, p256dh, auth)
 
 async def get_push_subscriptions(staff_id: int):
@@ -6098,10 +6113,24 @@ async def get_push_subscriptions(staff_id: int):
         return await conn.fetch(
             "SELECT * FROM push_subscriptions WHERE staff_id=$1", staff_id)
 
-async def delete_push_subscription(endpoint: str):
+async def delete_push_subscription(endpoint: str, staff_id: int | None = None):
+    """endpoint (один физический браузер) теперь может принадлежать НЕСКОЛЬКИМ
+    staff_id одновременно (см. UNIQUE INDEX idx_push_staff_endpoint) — без явного
+    staff_id удалит подписки ВСЕХ сотрудников с этого браузера, что почти всегда
+    не то, что нужно. Передавайте staff_id при self-service отписке; endpoint-only
+    оставлен только для обратной совместимости, для точечной чистки одной мёртвой
+    подписки используйте delete_push_subscription_by_id(sub["id"])."""
     if not pool: return
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM push_subscriptions WHERE endpoint=$1", endpoint)
+        if staff_id is not None:
+            await conn.execute("DELETE FROM push_subscriptions WHERE endpoint=$1 AND staff_id=$2", endpoint, staff_id)
+        else:
+            await conn.execute("DELETE FROM push_subscriptions WHERE endpoint=$1", endpoint)
+
+async def delete_push_subscription_by_id(sub_id: int):
+    if not pool: return
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM push_subscriptions WHERE id=$1", sub_id)
 
 # ── order_photos ──────────────────────────────────────────────────────────────
 

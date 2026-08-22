@@ -162,7 +162,7 @@ async def send_web_push(staff_id: int, title: str, body: str, lead_id: int = Non
             except Exception as ex:
                 resp = getattr(ex, 'response', None)
                 if resp and resp.status_code in (404, 410):
-                    await db.delete_push_subscription(sub["endpoint"])
+                    await db.delete_push_subscription_by_id(sub["id"])
                 else:
                     logging.warning(f"web_push error for sub {sub['id']}: {ex}")
     except ImportError:
@@ -2530,7 +2530,7 @@ async def save_push_subscription(body: dict, staff=Depends(get_current_staff)):
 async def remove_push_subscription(body: dict, staff=Depends(get_current_staff)):
     endpoint = body.get("endpoint")
     if endpoint:
-        await db.delete_push_subscription(endpoint)
+        await db.delete_push_subscription(endpoint, staff["id"])
     return {"ok": True}
 
 @app.delete("/api/staff/leads/{lead_id}")
