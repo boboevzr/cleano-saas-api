@@ -5640,22 +5640,24 @@ async def create_order_item(order_id: int, service: str, sqm: float,
                              price_per_sqm: float, width_cm: float = None,
                              length_cm: float = None) -> dict:
     if not pool: return {}
+    cid = _cid()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO order_items (order_id, service, width_cm, length_cm, sqm, price_per_sqm)
-            VALUES ($1, $2, $3, $4, $5, $6) RETURNING *
-        """, order_id, service, width_cm, length_cm, sqm, price_per_sqm)
+            INSERT INTO order_items (order_id, service, width_cm, length_cm, sqm, price_per_sqm, company_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *
+        """, order_id, service, width_cm, length_cm, sqm, price_per_sqm, cid)
         return dict(row) if row else {}
 
 async def create_empty_items(order_id: int, count: int) -> list:
     if not pool: return []
+    cid = _cid()
     result = []
     async with pool.acquire() as conn:
         for _ in range(count):
             row = await conn.fetchrow("""
-                INSERT INTO order_items (order_id, service, sqm, price_per_sqm)
-                VALUES ($1, '', 0, 0) RETURNING *
-            """, order_id)
+                INSERT INTO order_items (order_id, service, sqm, price_per_sqm, company_id)
+                VALUES ($1, '', 0, 0, $2) RETURNING *
+            """, order_id, cid)
             if row:
                 result.append(dict(row))
     return result
@@ -5663,14 +5665,15 @@ async def create_empty_items(order_id: int, count: int) -> list:
 async def create_empty_items_by_service(order_id: int, service_counts: dict) -> list:
     """Как create_empty_items, но с разбивкой по услугам (по N позиций на каждую)."""
     if not pool: return []
+    cid = _cid()
     result = []
     async with pool.acquire() as conn:
         for service, count in service_counts.items():
             for _ in range(int(count or 0)):
                 row = await conn.fetchrow("""
-                    INSERT INTO order_items (order_id, service, sqm, price_per_sqm)
-                    VALUES ($1, $2, 0, 0) RETURNING *
-                """, order_id, service)
+                    INSERT INTO order_items (order_id, service, sqm, price_per_sqm, company_id)
+                    VALUES ($1, $2, 0, 0, $3) RETURNING *
+                """, order_id, service, cid)
                 if row:
                     result.append(dict(row))
     return result
@@ -6144,11 +6147,12 @@ async def get_order_photos(order_id: int) -> list:
 async def save_order_photo(order_id: int, tg_file_id: str, tg_file_type: str,
                            photo_type: str, note: str, uploaded_by: str) -> dict:
     if not pool: return {}
+    cid = _cid()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO order_photos (order_id, tg_file_id, tg_file_type, photo_type, note, uploaded_by)
-            VALUES ($1,$2,$3,$4,$5,$6) RETURNING *
-        """, order_id, tg_file_id, tg_file_type, photo_type, note, uploaded_by)
+            INSERT INTO order_photos (order_id, tg_file_id, tg_file_type, photo_type, note, uploaded_by, company_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
+        """, order_id, tg_file_id, tg_file_type, photo_type, note, uploaded_by, cid)
         return dict(row) if row else {}
 
 async def delete_order_photo(photo_id: int, company_id: int) -> bool:
@@ -6440,9 +6444,9 @@ async def add_order_payment(order_id: int, amount: float, method: str, purpose: 
             FROM orders o WHERE o.id=$1
         """, order_id)
         row = await conn.fetchrow("""
-            INSERT INTO order_payments (order_id, amount, method, purpose, note, created_by, handed_to_staff_id, created_by_staff_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *
-        """, order_id, amount, method, purpose, note, created_by, handed_to_staff_id, created_by_staff_id)
+            INSERT INTO order_payments (order_id, amount, method, purpose, note, created_by, handed_to_staff_id, created_by_staff_id, company_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *
+        """, order_id, amount, method, purpose, note, created_by, handed_to_staff_id, created_by_staff_id, _cid())
         # Пересчитать payment_status на orders (не считаем отклонённые)
         total_row = await conn.fetchrow(
             "SELECT COALESCE(SUM(amount),0) AS paid FROM order_payments WHERE order_id=$1 AND NOT (confirmed=FALSE AND confirmed_at IS NOT NULL)", order_id)
@@ -6528,9 +6532,9 @@ async def add_item_media(item_id: int, order_id: int, tg_file_id: str, tg_file_t
     if not pool: return {}
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO order_item_media (item_id, order_id, tg_file_id, tg_file_type, created_by)
-            VALUES ($1,$2,$3,$4,$5) RETURNING *
-        """, item_id, order_id, tg_file_id, tg_file_type, created_by)
+            INSERT INTO order_item_media (item_id, order_id, tg_file_id, tg_file_type, created_by, company_id)
+            VALUES ($1,$2,$3,$4,$5,$6) RETURNING *
+        """, item_id, order_id, tg_file_id, tg_file_type, created_by, _cid())
         return dict(row) if row else {}
 
 async def delete_item_media(media_id: int, company_id: int) -> bool:
@@ -6569,7 +6573,7 @@ async def get_pending_measure_reviews() -> list:
             FROM order_items oi
             JOIN orders o ON o.id = oi.order_id
             LEFT JOIN staff s ON s.id = oi.review_claimed_by
-            WHERE oi.measure_status = 'submitted' AND oi.company_id = $1
+            WHERE oi.measure_status = 'submitted' AND o.company_id = $1
             ORDER BY oi.id ASC
         """, cid)
         return [dict(r) for r in rows]
