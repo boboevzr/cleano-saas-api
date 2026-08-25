@@ -4965,7 +4965,7 @@ async def _render_order_receipt(order_id: int) -> tuple[bytes, dict]:
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден")
     items = await db.get_order_items(order_id)
-    grand_total = sum(float(it.get("total_sum") or 0) for it in items)
+    grand_total = (await db.get_orders_items_totals([order_id])).get(order_id, 0.0)
 
     branch = order.get("branch")
     branch_1_key = "contact_navoi_1" if branch == "navoi" else "contact_zarafshan_1"
@@ -4982,7 +4982,7 @@ async def _render_order_receipt(order_id: int) -> tuple[bytes, dict]:
 
     jpeg_bytes = receipt.generate_receipt_jpeg(order, items, branch_contacts,
                                                 header_text, slogan, footer_note,
-                                                bot_link)
+                                                bot_link, grand_total=grand_total)
     return jpeg_bytes, order
 
 

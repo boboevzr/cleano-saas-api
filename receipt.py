@@ -100,7 +100,8 @@ def generate_receipt_jpeg(order: dict, items: list[dict], branch_contacts: list[
                            slogan: str = "Химчистка ковров, мебели, матрасов и штор",
                            footer_note: str = "",
                            bot_link: str = "",
-                           site_link: str = "artez.uz") -> bytes:
+                           site_link: str = "artez.uz",
+                           grand_total: float = None) -> bytes:
     """
     Рисует JPEG-чек заказа и возвращает его байты.
 
@@ -183,7 +184,7 @@ def generate_receipt_jpeg(order: dict, items: list[dict], branch_contacts: list[
         _dashed_line(draw, y)
         y += 16
 
-    grand = sum(float(it.get("total_sum") or 0) for it in items)
+    grand = grand_total if grand_total is not None else sum(float(it.get("total_sum") or 0) for it in items)
     y += 8
     y += _right_text(draw, y, f"ИТОГО: {fmt_n(grand)} сум", f["total"]) + 16
     _dashed_line(draw, y); y += 20
