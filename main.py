@@ -4775,8 +4775,10 @@ async def admin_change_order_status(order_id: int, staff=Depends(get_current_sta
                     detail=f"У {len(bad)} позиций замер провёл не мойщик — назначьте мойщика "
                            f"или откройте позицию, чтобы её мог взять мойщик")
 
+    staff_name = " ".join(filter(None,[staff.get("last_name"),staff.get("first_name")])) or staff.get("login","")
     order = await db.update_order_status(order_id, status,
-                                          note=note or f"Статус изменён сотрудником {staff.get('login','')}")
+                                          note=note or bi(f"Статус изменён сотрудником {staff_name}",
+                                                           f"{staff_name} xodim tomonidan holat oʻzgartirildi"))
     if status == 'packing' and packer_login:
         async with db.pool.acquire() as _pc:
             await _pc.execute("UPDATE orders SET packer_login=$1 WHERE id=$2", packer_login, order_id)
