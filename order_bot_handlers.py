@@ -302,7 +302,10 @@ T = {
         # ── Цены ──
         "prices_title":   "💰 Цены",
         "prices_empty":   "⚠️ Цены ещё не настроены. Обратитесь в компанию.",
-        "prices_min_order_line": "📦 Мин. заказ: {min_order} {unit}",
+        "prices_min_order_title": "📦 Мин. заказ: ",
+        "prices_min_order_line": "{min_order} {unit} ({services})",
+        "prices_footer_types": "Стандарт / Экспресс",
+        "prices_footer_delivery": "🚚 Вывоз и доставка — бесплатно",
 
         # ── Стать Агентом ──
         "btn_agent":      "🤝 Стать Агентом",
@@ -458,7 +461,10 @@ T = {
         # ── Narxlar ──
         "prices_title":   "💰 Narxlar",
         "prices_empty":   "⚠️ Narxlar hali sozlanmagan. Kompaniyaga murojaat qiling.",
-        "prices_min_order_line": "📦 Minimal buyurtma: {min_order} {unit}",
+        "prices_min_order_title": "📦 Min buyurtma: ",
+        "prices_min_order_line": "{min_order} {unit} ({services})",
+        "prices_footer_types": "Standart / Ekspress",
+        "prices_footer_delivery": "🚚 Olib ketish va yetkazish — bepul",
 
         # ── Agent bo'lish ──
         "btn_agent":      "🤝 Agent bo'lish",
@@ -904,6 +910,7 @@ async def _build_prices_text(lang: str, company_id: int) -> str:
     currency = "so'm" if lang == "uz" else "сум"
     lines = [t(lang, "prices_title"), ""]
     any_price = False
+    min_groups: dict = {}  # {(min_val, unit_sym): [svc_name,...]} — как в прод-боте
 
     ordered = sorted(services, key=lambda s: s.get("order_idx", 0)) if services else []
     for s in ordered:
@@ -927,10 +934,19 @@ async def _build_prices_text(lang: str, company_id: int) -> str:
         if std and std.get("min_order"):
             mo = std["min_order"]
             mo_str = int(mo) if mo == int(mo) else mo
-            lines.append(t(lang, "prices_min_order_line").format(min_order=mo_str, unit=unit_sym))
+            min_groups.setdefault((mo_str, unit_sym), []).append(_h(name))
 
     if not any_price:
         lines.append(t(lang, "prices_empty"))
+        return "\n".join(lines)
+
+    lines.append("")
+    if min_groups:
+        lines.append(t(lang, "prices_min_order_title"))
+        for (mo_str, unit_sym), svc_names in min_groups.items():
+            lines.append(t(lang, "prices_min_order_line").format(min_order=mo_str, unit=unit_sym, services=", ".join(svc_names)))
+    lines.append(t(lang, "prices_footer_types"))
+    lines.append(t(lang, "prices_footer_delivery"))
 
     return "\n".join(lines)
 
@@ -2077,6 +2093,16 @@ async def menu_prices(call: CallbackQuery, company_id: int, state: FSMContext) -
     lang = data.get("lang", "ru")
     text = await _build_prices_text(lang, company_id)
     await call.message.answer(text, reply_markup=back_kb(lang))
+
+
+@router.message(Command("prices"))
+async def cmd_prices(message: Message, company_id: int, state: FSMContext) -> None:
+    """Слэш-команда /prices — раньше был только доступ через кнопку меню,
+    /prices как текст не совпадал ни с одним обработчиком и падал в общий
+    фоллбэк (главное меню)."""
+    lang = await _resolve_lang(message.from_user.id, company_id, state) or "ru"
+    text = await _build_prices_text(lang, company_id)
+    await message.answer(text, reply_markup=back_kb(lang))
 
 
 # ══════════════════════════════════════
