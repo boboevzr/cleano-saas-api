@@ -6998,13 +6998,15 @@ async def admin_measure_item(order_id: int, item_id: int, staff=Depends(get_curr
         except Exception as _pe:
             logging.warning(f"measure push error: {_pe}")
     elif action == "approve":
-        # Проверяющий мог поправить замер прямо в модалке перед утверждением
-        # (доступно тем, у кого can_override_measure/admin) — если ширину/длину
-        # или количество прислали, сохраняем их вместе с утверждением, а не
-        # просто утверждаем то, что было отправлено на проверку изначально.
-        if quantity:
+        # Проверяющий мог поправить замер прямо в модалке перед утверждением —
+        # но редактировать размеры вправе только тот же круг, что и для
+        # direct_approve (can_override_measure/admin), иначе любой с одним
+        # только can_approve_measure смог бы прислать произвольные размеры
+        # через approve, в обход проверки прав на direct_approve.
+        can_override = bool(staff.get("can_override_measure")) or is_admin
+        if can_override and quantity:
             item = await db.direct_approve_measure_qty(item_id, quantity)
-        elif actual_width_cm and actual_length_cm:
+        elif can_override and actual_width_cm and actual_length_cm:
             item = await db.direct_approve_measure(item_id, actual_width_cm, actual_length_cm)
         else:
             item = await db.approve_item_measure(item_id)
