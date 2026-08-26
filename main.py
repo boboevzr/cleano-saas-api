@@ -6998,7 +6998,16 @@ async def admin_measure_item(order_id: int, item_id: int, staff=Depends(get_curr
         except Exception as _pe:
             logging.warning(f"measure push error: {_pe}")
     elif action == "approve":
-        item = await db.approve_item_measure(item_id)
+        # Проверяющий мог поправить замер прямо в модалке перед утверждением
+        # (доступно тем, у кого can_override_measure/admin) — если ширину/длину
+        # или количество прислали, сохраняем их вместе с утверждением, а не
+        # просто утверждаем то, что было отправлено на проверку изначально.
+        if quantity:
+            item = await db.direct_approve_measure_qty(item_id, quantity)
+        elif actual_width_cm and actual_length_cm:
+            item = await db.direct_approve_measure(item_id, actual_width_cm, actual_length_cm)
+        else:
+            item = await db.approve_item_measure(item_id)
         try:
             washer_login = item.get("washer_login")
             if washer_login:

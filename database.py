@@ -4766,14 +4766,17 @@ async def cancel_pending_lead_reminders(lead_id: int):
     закрытии как потерянный, чтобы не слать и не показывать в списке
     Уведомлений «Пора перезвонить» по уже закрытому лиду."""
     if not pool: return
+    cid = _cid()
     async with pool.acquire() as conn:
         await conn.execute(
-            "DELETE FROM lead_reminders WHERE lead_id=$1 AND sent_tg=FALSE AND sent_browser=FALSE",
-            lead_id
+            "DELETE FROM lead_reminders WHERE lead_id=$1 AND sent_tg=FALSE AND sent_browser=FALSE "
+            "AND lead_id IN (SELECT id FROM leads WHERE company_id=$2)",
+            lead_id, cid
         )
         await conn.execute(
-            "DELETE FROM agent_notifications WHERE lead_id=$1 AND action='callback'",
-            lead_id
+            "DELETE FROM agent_notifications WHERE lead_id=$1 AND action='callback' "
+            "AND lead_id IN (SELECT id FROM leads WHERE company_id=$2)",
+            lead_id, cid
         )
 
 async def get_lead_calls(lead_id: int):
