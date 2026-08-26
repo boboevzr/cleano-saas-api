@@ -266,9 +266,19 @@ T = {
         "status_btn_done":      "✅ Выполнено",
         "status_btn_cancelled": "❌ Отменены",
         "status_group_empty": "В этой категории заявок нет.",
-        "status_order_line":  "📋 №{num}\n🧺 {service}\n📅 {date}\n📌 Статус: {status}",
         "status_lead_line":   "📋 Заявка {num}\n🧺 {service}\n📌 Статус: 🆕 Новая заявка, ожидайте звонка",
         "status_lead_lost_line": "📋 Заявка {num}\n📌 Статус: ❌ Отменена",
+        "lbl_created":        "Заказ создан",
+        "lbl_pickup":         "Забор",
+        "lbl_delivered":      "Доставлен",
+        "lbl_status":         "Статус",
+        "lbl_items":          "Позиций",
+        "lbl_items_total":    "Сумма позиций",
+        "lbl_due":            "К оплате",
+        "lbl_paid":           "Оплачено",
+        "lbl_remaining":      "Осталось оплатить",
+        "lbl_fully_paid":     "✅ Оплачено полностью",
+        "lbl_currency":       "сум",
         "btn_back_to_status": "◀️ К категориям",
         "btn_order_detail":   "📋 №{num}: подробнее",
         "btn_positions":      "📄 Позиции",
@@ -425,9 +435,19 @@ T = {
         "status_btn_done":      "✅ Bajarildi",
         "status_btn_cancelled": "❌ Bekor qilindi",
         "status_group_empty": "Bu kategoriyada buyurtmalar yo'q.",
-        "status_order_line":  "📋 №{num}\n🧺 {service}\n📅 {date}\n📌 Holat: {status}",
         "status_lead_line":   "📋 Ariza {num}\n🧺 {service}\n📌 Holat: 🆕 Yangi ariza, qo'ng'iroqni kuting",
         "status_lead_lost_line": "📋 Ariza {num}\n📌 Holat: ❌ Bekor qilindi",
+        "lbl_created":        "Buyurtma yaratildi",
+        "lbl_pickup":         "Olib ketish",
+        "lbl_delivered":      "Yetkazildi",
+        "lbl_status":         "Holat",
+        "lbl_items":          "Pozitsiyalar",
+        "lbl_items_total":    "Pozitsiyalar summasi",
+        "lbl_due":            "To'lov uchun",
+        "lbl_paid":           "To'landi",
+        "lbl_remaining":      "Qolgan to'lov",
+        "lbl_fully_paid":     "✅ To'liq to'landi",
+        "lbl_currency":       "so'm",
         "btn_back_to_status": "◀️ Kategoriyalarga",
         "btn_order_detail":   "📋 №{num}: batafsil",
         "btn_positions":      "📄 Pozitsiyalar",
@@ -1820,20 +1840,14 @@ async def show_status_group(call: CallbackQuery, company_id: int, state: FSMCont
         for o in orders:
             if o.get("status") in ("delivered", "cancelled"):
                 continue
-            lines.append(t(lang, "status_order_line").format(
-                num=_h(o.get("order_num", "")), service=_h(o.get("service") or ""),
-                date=_h(o.get("pickup_date") or ""), status=_order_status_name(lang, o["status"]),
-            ))
+            lines.append(_format_order_summary(lang, o))
             if o.get("order_num"):
                 order_nums.append(o["order_num"])
     elif group == "done":
         for o in orders:
             if o.get("status") != "delivered":
                 continue
-            lines.append(t(lang, "status_order_line").format(
-                num=_h(o.get("order_num", "")), service=_h(o.get("service") or ""),
-                date=_h(o.get("pickup_date") or ""), status=_order_status_name(lang, o["status"]),
-            ))
+            lines.append(_format_order_summary(lang, o))
             if o.get("order_num"):
                 order_nums.append(o["order_num"])
     elif group == "cancelled":
@@ -1845,10 +1859,7 @@ async def show_status_group(call: CallbackQuery, company_id: int, state: FSMCont
         for o in orders:
             if o.get("status") != "cancelled":
                 continue
-            lines.append(t(lang, "status_order_line").format(
-                num=_h(o.get("order_num", "")), service=_h(o.get("service") or ""),
-                date=_h(o.get("pickup_date") or ""), status=_order_status_name(lang, o["status"]),
-            ))
+            lines.append(_format_order_summary(lang, o))
             if o.get("order_num"):
                 order_nums.append(o["order_num"])
 
@@ -1872,6 +1883,41 @@ async def show_status_group(call: CallbackQuery, company_id: int, state: FSMCont
         kb = back_to_status_kb(lang)
 
     await call.message.answer(text, reply_markup=kb)
+
+
+def _fmt_dt(v) -> str:
+    return v.strftime("%d.%m.%Y %H:%M") if hasattr(v, "strftime") else (str(v) if v else "")
+
+
+def _format_order_summary(lang: str, o: dict) -> str:
+    """Сводка заказа: даты (создан/забор/доставлен), статус, кол-во позиций,
+    оплата — 1-в-1 формат прод-бота (_format_order_summary в artez_bot/bot.py).
+    Услуга (order.service) намеренно не показывается — заказ может содержать
+    разные услуги по позициям, точный список смотрите в кнопке «Позиции»."""
+    lines = [f"📋 №{_h(o.get('order_num', ''))}"]
+    created = o.get("created_at")
+    if created:
+        lines.append(f"📅 {t(lang,'lbl_created')}: {_fmt_dt(created)}")
+    if o.get("pickup_date"):
+        pu = str(o["pickup_date"]) + (f" {o['pickup_time']}" if o.get("pickup_time") else "")
+        lines.append(f"🚚 {t(lang,'lbl_pickup')}: {_h(pu)}")
+    if o.get("delivered_at"):
+        lines.append(f"✅ {t(lang,'lbl_delivered')}: {_fmt_dt(o['delivered_at'])}")
+    lines.append(f"📍 {t(lang,'lbl_status')}: {_order_status_name(lang, o['status'])}")
+    lines.append(f"📦 {t(lang,'lbl_items')}: {o.get('item_count') or 0}")
+
+    pay = db.order_payment_summary(o)
+    cur = t(lang, 'lbl_currency')
+    if pay['items_total'] > 0:
+        lines.append(f"🧾 {t(lang,'lbl_items_total')}: {_fmt_sum(pay['items_total'])} {cur}")
+    lines.append(f"💰 {t(lang,'lbl_due')}: {_fmt_sum(pay['net'])} {cur}")
+    if pay['paid'] > 0:
+        lines.append(f"✅ {t(lang,'lbl_paid')}: {_fmt_sum(pay['paid'])} {cur}")
+    if pay['debt'] >= 1000:
+        lines.append(f"❗ {t(lang,'lbl_remaining')}: {_fmt_sum(pay['debt'])} {cur}")
+    elif pay['net'] > 0:
+        lines.append(t(lang,'lbl_fully_paid'))
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════
@@ -1952,10 +1998,7 @@ async def show_order_detail(call: CallbackQuery, company_id: int, state: FSMCont
         await call.message.answer(t(lang, "order_not_found"), reply_markup=back_to_status_kb(lang))
         return
 
-    text = t(lang, "status_order_line").format(
-        num=_h(order.get("order_num", "")), service=_h(order.get("service") or ""),
-        date=_h(order.get("pickup_date") or ""), status=_order_status_name(lang, order["status"]),
-    )
+    text = _format_order_summary(lang, order)
     await call.message.answer(text, reply_markup=_order_detail_kb(lang, order_num))
 
 

@@ -2605,7 +2605,7 @@ async def get_order_by_num_and_phone(order_num: str, phone: str, company_id: int
     if not pool: return {}
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM orders WHERE order_num=$1 AND client_phone=$2 AND company_id=$3",
+            f"SELECT *{_ORDER_EXTRA_COLS} FROM orders WHERE order_num=$1 AND client_phone=$2 AND company_id=$3",
             order_num, phone, company_id)
         return dict(row) if row else {}
 
@@ -8054,6 +8054,32 @@ async def get_client_leads_by_tg(tg_id: int, company_id: int) -> list[dict]:
             tg_id, company_id)
         return [dict(r) for r in rows]
 
+# item_count — число позиций; items_total_calc — сумма по позициям (фолбэк, если total_price
+# не заполнен); paid_amount — сколько уже оплачено (подтверждённые платежи) — тот же паттерн,
+# что и в прод-боте (artez_bot/database.py _ORDER_EXTRA_COLS/order_payment_summary).
+_ORDER_EXTRA_COLS = """,
+    (SELECT COUNT(*) FROM order_items WHERE order_id=orders.id)::int AS item_count,
+    COALESCE((SELECT SUM(COALESCE(price_per_sqm,0)*COALESCE(sqm,0))
+              FROM order_items WHERE order_id=orders.id), 0) AS items_total_calc,
+    COALESCE((SELECT SUM(amount) FROM order_payments
+              WHERE order_id=orders.id AND NOT (confirmed=FALSE AND confirmed_at IS NOT NULL)), 0) AS paid_amount
+"""
+
+def order_payment_summary(o: dict) -> dict:
+    """Сумма позиций / К оплате / Оплачено / Долг — та же формула, что в
+    get_orders_with_debt и staff.html/_orderNet: сумма по order_items (или
+    total_price, если позиций нет), минус скидки, округление К оплате вниз
+    до 1000 (остаток < 1000 не считается долгом), минус подтверждённые платежи."""
+    items_total = float(o.get("items_total_calc") or 0)
+    base = items_total if items_total > 0 else float(o.get("total_price") or 0)
+    disc = (float(o.get("discount_sum") or 0)
+            + float(o.get("delivery_discount") or 0)
+            + float(o.get("manual_discount") or 0))
+    net_raw = max(0.0, base - disc)
+    net = net_raw - (net_raw % 1000)
+    paid = float(o.get("paid_amount") or 0)
+    return {"items_total": base, "net": net, "paid": paid, "debt": max(0.0, net - paid)}
+
 async def get_orders_by_phones(phones: list[str], company_id: int) -> list[dict]:
     """Заказы клиента по номерам телефона — «Статус заказа» ищет заказы не
     только по client_tg_id (сотрудник мог создать заказ вручную/конвертировать
@@ -8064,7 +8090,7 @@ async def get_orders_by_phones(phones: list[str], company_id: int) -> list[dict]
     if not pool or not phones: return []
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT * FROM orders WHERE client_phone = ANY($1) AND company_id=$2 ORDER BY created_at DESC",
+            f"SELECT *{_ORDER_EXTRA_COLS} FROM orders WHERE client_phone = ANY($1) AND company_id=$2 ORDER BY created_at DESC",
             phones, company_id)
         return [dict(r) for r in rows]
 
