@@ -2054,6 +2054,8 @@ async def show_order_measure_media(call: CallbackQuery, company_id: int, state: 
         logging.warning(f"get_order_items error: {e}")
         items = []
 
+    from main import fetch_global_bot_file_bytes
+
     sent_any = False
     for i, it in enumerate(items, 1):
         try:
@@ -2068,20 +2070,33 @@ async def show_order_measure_media(call: CallbackQuery, company_id: int, state: 
         if meta:
             caption += f"\n{meta}"
         try:
+            # tg_file_id принадлежит глобальному Cleano-боту (media_ch), а не боту
+            # компании — reuse напрямую не работает, поэтому байты скачиваются и
+            # пересылаются заново (см. fetch_global_bot_file_bytes в main.py).
             if len(media) == 1:
                 m = media[0]
+                fbytes = await fetch_global_bot_file_bytes(m["tg_file_id"])
+                if not fbytes:
+                    continue
+                ext = "mp4" if m.get("tg_file_type") == "video" else "jpg"
+                fin = BufferedInputFile(fbytes, filename=f"measure-{it['id']}.{ext}")
                 if m.get("tg_file_type") == "video":
-                    await call.bot.send_video(uid, m["tg_file_id"], caption=caption, protect_content=True)
+                    await call.bot.send_video(uid, fin, caption=caption, protect_content=True)
                 else:
-                    await call.bot.send_photo(uid, m["tg_file_id"], caption=caption, protect_content=True)
+                    await call.bot.send_photo(uid, fin, caption=caption, protect_content=True)
             else:
                 # Лимит Telegram-альбома — 10 файлов; caption можно задать только первому элементу.
-                group = [
-                    (InputMediaVideo if m.get("tg_file_type") == "video" else InputMediaPhoto)(
-                        media=m["tg_file_id"], caption=caption if idx == 0 else None,
-                    )
-                    for idx, m in enumerate(media[:10])
-                ]
+                group = []
+                for idx, m in enumerate(media[:10]):
+                    fbytes = await fetch_global_bot_file_bytes(m["tg_file_id"])
+                    if not fbytes:
+                        continue
+                    ext = "mp4" if m.get("tg_file_type") == "video" else "jpg"
+                    fin = BufferedInputFile(fbytes, filename=f"measure-{it['id']}-{idx}.{ext}")
+                    cls = InputMediaVideo if m.get("tg_file_type") == "video" else InputMediaPhoto
+                    group.append(cls(media=fin, caption=caption if idx == 0 else None))
+                if not group:
+                    continue
                 await call.bot.send_media_group(uid, group, protect_content=True)
             # Отмечаем успех ТОЛЬКО после реальной отправки (как в прод-боте) — иначе
             # при сбое отправки (напр. невалидный/чужой tg_file_id) sent_any уже был бы
@@ -2118,14 +2133,24 @@ async def show_order_photos(call: CallbackQuery, company_id: int, state: FSMCont
         await call.message.answer(t(lang, "no_photos"), reply_markup=_back_to_order_kb(lang, order_num))
         return
 
+    from main import fetch_global_bot_file_bytes
+
     type_keys = {"before": "photo_type_before", "after": "photo_type_after", "damage": "photo_type_damage"}
     for p in photos:
         caption = t(lang, type_keys.get(p.get("photo_type"), "photo_type_damage"))
         try:
+            # tg_file_id принадлежит глобальному Cleano-боту (media_ch), а не боту
+            # компании — reuse напрямую не работает, поэтому байты скачиваются и
+            # пересылаются заново (см. fetch_global_bot_file_bytes в main.py).
+            fbytes = await fetch_global_bot_file_bytes(p["tg_file_id"])
+            if not fbytes:
+                continue
+            ext = "mp4" if p.get("tg_file_type") == "video" else "jpg"
+            fin = BufferedInputFile(fbytes, filename=f"photo-{p.get('id', 0)}.{ext}")
             if p.get("tg_file_type") == "video":
-                await call.bot.send_video(uid, p["tg_file_id"], caption=caption, protect_content=True)
+                await call.bot.send_video(uid, fin, caption=caption, protect_content=True)
             else:
-                await call.bot.send_photo(uid, p["tg_file_id"], caption=caption, protect_content=True)
+                await call.bot.send_photo(uid, fin, caption=caption, protect_content=True)
         except Exception as e:
             logging.warning(f"send order photo error: {e}")
 

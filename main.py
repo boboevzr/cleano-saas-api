@@ -12603,15 +12603,14 @@ async def admin_bot_welcome_video_status(_=Depends(get_admin)):
     return {"ok": True, "ru": bool(ru), "uz": bool(uz)}
 
 
-async def fetch_bot_welcome_video_bytes(company_id: int, lang: str) -> bytes | None:
-    """Скачивает сырые байты видео-инструкции компании через глобальный Cleano-бот
-    (тем же file_id, которым его туда когда-то загрузили). Вызывается из
-    order_bot_handlers.set_language — там видео пересылается через СВОЙ бот
-    компании (message.bot), т.к. file_id одного бота не работает у другого."""
-    if not BOT_TOKEN:
-        return None
-    file_id = await db.get_config_for_company(f"bot_welcome_video_file_id_{lang}", company_id)
-    if not file_id:
+async def fetch_global_bot_file_bytes(file_id: str) -> bytes | None:
+    """Скачивает сырые байты любого файла, загруженного через глобальный Cleano-бот
+    (BOT_TOKEN) — фото/видео заказа, медиа замера, видео-инструкция. file_id этого
+    бота не работает у бота конкретной компании (order_bot_token), поэтому раздача
+    клиенту — не reuse file_id, а скачивание сюда и пересылка через message.bot
+    самой компании. Общий хелпер для fetch_bot_welcome_video_bytes и
+    order_bot_handlers.show_order_photos/show_order_measure_media."""
+    if not BOT_TOKEN or not file_id:
         return None
     try:
         async with aiohttp.ClientSession() as s:
@@ -12625,8 +12624,19 @@ async def fetch_bot_welcome_video_bytes(company_id: int, lang: str) -> bytes | N
             async with s.get(file_url, timeout=aiohttp.ClientTimeout(total=60)) as fr:
                 return await fr.read()
     except Exception as e:
-        logging.warning(f"fetch_bot_welcome_video_bytes error: {e}")
+        logging.warning(f"fetch_global_bot_file_bytes error: {e}")
         return None
+
+
+async def fetch_bot_welcome_video_bytes(company_id: int, lang: str) -> bytes | None:
+    """Скачивает сырые байты видео-инструкции компании через глобальный Cleano-бот
+    (тем же file_id, которым его туда когда-то загрузили). Вызывается из
+    order_bot_handlers.set_language — там видео пересылается через СВОЙ бот
+    компании (message.bot), т.к. file_id одного бота не работает у другого."""
+    file_id = await db.get_config_for_company(f"bot_welcome_video_file_id_{lang}", company_id)
+    if not file_id:
+        return None
+    return await fetch_global_bot_file_bytes(file_id)
 
 
 async def bot_register_client(phone: str, first_name: str, lang: str, company_id: int, tg_id: int) -> dict:
