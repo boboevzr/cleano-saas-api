@@ -2063,7 +2063,6 @@ async def show_order_measure_media(call: CallbackQuery, company_id: int, state: 
             media = []
         if not media:
             continue
-        sent_any = True
         caption = t(lang, "order_measure_caption").format(idx=i, service=_h(_svc_label(lang, it)), num=_h(order_num))
         meta = _item_meta_str(lang, it)
         if meta:
@@ -2084,6 +2083,11 @@ async def show_order_measure_media(call: CallbackQuery, company_id: int, state: 
                     for idx, m in enumerate(media[:10])
                 ]
                 await call.bot.send_media_group(uid, group, protect_content=True)
+            # Отмечаем успех ТОЛЬКО после реальной отправки (как в прод-боте) — иначе
+            # при сбое отправки (напр. невалидный/чужой tg_file_id) sent_any уже был бы
+            # True и фолбэк "Фото/видео замера пока нет" не показался бы — бот молчал
+            # бы совсем, без единого сообщения пользователю.
+            sent_any = True
         except Exception as e:
             logging.warning(f"send measure media error: {e}")
 
@@ -2124,6 +2128,11 @@ async def show_order_photos(call: CallbackQuery, company_id: int, state: FSMCont
                 await call.bot.send_photo(uid, p["tg_file_id"], caption=caption, protect_content=True)
         except Exception as e:
             logging.warning(f"send order photo error: {e}")
+
+    # Как в прод-боте: подтверждение шлётся ВСЕГДА после цикла — иначе, если
+    # send_photo/send_video упадёт на всех фото (напр. невалидный tg_file_id),
+    # пользователь не получит от бота вообще ничего.
+    await call.message.answer("✅", reply_markup=_back_to_order_kb(lang, order_num))
 
 
 # ══════════════════════════════════════
