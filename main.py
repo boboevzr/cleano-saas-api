@@ -2279,6 +2279,8 @@ async def update_lead_status(lead_id: int, body: dict,
         from datetime import datetime as _dt
         sched_pre = _dt.fromisoformat(scheduled_at_pre) if scheduled_at_pre and status == "callback" else None
         await db.update_lead_status(lead_id, status, scheduled_at=sched_pre)
+    if status in ("converted", "lost"):
+        await db.cancel_pending_lead_reminders(lead_id)
     # лог
     action_labels = {
         "new": "Сменил статус на «Новый»",

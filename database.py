@@ -885,8 +885,25 @@ async def create_tables():
         );
         CREATE INDEX IF NOT EXISTS idx_lead_reminders_staff ON lead_reminders(staff_id, sent_browser);
         """)
+        # Разовая чистка: напоминания, которые остались висеть (ещё не сработали)
+        # по лидам, уже закрытым (конвертированы/потеряны) до этого фикса.
+        # Идемпотентно — на следующих запусках просто ничего не находит.
+        await c.execute("""
+            DELETE FROM lead_reminders
+            WHERE sent_tg = FALSE AND sent_browser = FALSE
+              AND lead_id IN (SELECT id FROM leads WHERE status IN ('converted','lost'))
+        """)
 
     await ensure_agent_notifications_table()
+    # Разовая чистка: уведомления "Пора перезвонить", уже созданные по лидам,
+    # которые с тех пор закрыли (конвертированы/потеряны) — до этого фикса
+    # ничего их не убирало. Идемпотентно.
+    async with pool.acquire() as c:
+        await c.execute("""
+            DELETE FROM agent_notifications
+            WHERE action = 'callback'
+              AND lead_id IN (SELECT id FROM leads WHERE status IN ('converted','lost'))
+        """)
     await ensure_washer_notifications_table()
 
     # ── Шаг 4б: основная таблица заказов ────────────────────────────────
@@ -4742,6 +4759,22 @@ async def add_lead_call(lead_id: int, operator_id: int, action: str,
             VALUES ($1,$2,$3,$4,$5) RETURNING *
         """, lead_id, operator_id, action, note, scheduled_at)
         return dict(row) if row else None
+
+async def cancel_pending_lead_reminders(lead_id: int):
+    """Отменяет ещё не сработавшие напоминания по лиду и удаляет уже созданные
+    уведомления «Пора перезвонить» — вызывается при конвертации в заказ /
+    закрытии как потерянный, чтобы не слать и не показывать в списке
+    Уведомлений «Пора перезвонить» по уже закрытому лиду."""
+    if not pool: return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM lead_reminders WHERE lead_id=$1 AND sent_tg=FALSE AND sent_browser=FALSE",
+            lead_id
+        )
+        await conn.execute(
+            "DELETE FROM agent_notifications WHERE lead_id=$1 AND action='callback'",
+            lead_id
+        )
 
 async def get_lead_calls(lead_id: int):
     if not pool: return []
