@@ -5394,24 +5394,26 @@ async def create_cash_handover(
 ):
     row = await db.add_cash_handover(from_staff_id, to_staff_id, amount, note)
     handover_id = row.get("id")
+    # Эта запись создаётся вручную самим админом ("✅ Подтвердить приём") — в
+    # отличие от staff-инициированной передачи (тому нужно отдельное подтверждение
+    # получателя ради подотчётности), здесь админ уже сам удостоверяет факт передачи,
+    # поэтому сразу помечаем confirmed — иначе баланс "На руках" не менялся, пока
+    # получатель отдельно не подтвердит в Telegram, о чём никто не знал (см. фикс).
+    if handover_id:
+        row = await db.confirm_cash_handover(handover_id, to_staff_id)
 
     from_staff = await db.get_staff_by_id(from_staff_id)
     to_staff   = await db.get_staff_by_id(to_staff_id)
     from_name  = " ".join(filter(None, [from_staff.get("last_name",""), from_staff.get("first_name","")])).strip() if from_staff else f"#{from_staff_id}"
 
-    dm_text = (f"💵 <b>Вам сдают наличные</b>\n"
+    dm_text = (f"💵 <b>Вам сдали наличные</b>\n"
                f"От: {from_name}\n"
                f"Сумма: <b>{int(amount):,} сум</b>"
-               + (f"\nПримечание: {note}" if note else ""))
+               + (f"\nПримечание: {note}" if note else "")
+               + "\n\n✅ Уже зачтено на баланс.")
     if to_staff and to_staff.get("tg_id") and handover_id:
         tg_chat = int(to_staff["tg_id"])
-        msg_id = await _send_tg_with_kb(
-            tg_chat, dm_text,
-            keyboard={"inline_keyboard": [[
-                {"text": "✅ Подтвердить", "callback_data": f"cash_confirm:{handover_id}"},
-                {"text": "❌ Отклонить",   "callback_data": f"cash_reject:{handover_id}"},
-            ]]},
-        )
+        msg_id = await _send_tg_with_kb(tg_chat, dm_text, keyboard=None)
         if msg_id:
             asyncio.create_task(db.update_handover_tg_msg(handover_id, tg_chat, msg_id))
 
