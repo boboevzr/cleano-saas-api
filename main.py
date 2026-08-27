@@ -11429,9 +11429,9 @@ async def cleano_tg_webhook(request: Request):
     if company:
         await _cleano_bot_send(token, chat_id,
             f"✅ Sizning kompaniyangiz allaqachon ro'yxatdan o'tgan: <b>{company['name']}</b>\n"
-            f"Admin-panel: https://cleano.uz/admin.html?company_slug={company['slug']}\n\n"
+            f"Admin-panel: https://cleano.uz/admin.html?company_slug={company['slug']}&fresh=1\n\n"
             f"✅ Ваша компания уже зарегистрирована: <b>{company['name']}</b>\n"
-            f"Админ-панель: https://cleano.uz/admin.html?company_slug={company['slug']}")
+            f"Админ-панель: https://cleano.uz/admin.html?company_slug={company['slug']}&fresh=1")
     else:
         await _cleano_bot_send(token, chat_id,
             "👋 <b>Cleano</b>\n\nKompaniyani ro'yxatdan o'tkazishda telefon raqamingizni tasdiqlash uchun "
