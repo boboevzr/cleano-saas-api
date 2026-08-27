@@ -10374,6 +10374,25 @@ async def consume_cleano_phone_verification(phone: str):
         await conn.execute("DELETE FROM cleano_phone_verifications WHERE phone=$1", phone)
 
 
+async def list_cleano_bot_clients(limit: int = 200):
+    """Список всех, кто подтверждал телефон через @cleanouz_bot — для суперадмина
+    (список "клиентов" самого бота, отдельно от списка SaaS-компаний). Джойн с
+    companies по contact_tg_id показывает, привязан ли этот Telegram уже к
+    зарегистрированной компании (contact_phone может отличаться от phone здесь,
+    если владелец подтверждал одним номером, а регистрировал компанию с другим)."""
+    if not pool: return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT v.phone, v.verified_at, v.method, v.tg_id,
+                   c.id AS company_id, c.name AS company_name, c.slug AS company_slug
+            FROM cleano_phone_verifications v
+            LEFT JOIN companies c ON c.contact_tg_id = v.tg_id
+            ORDER BY v.verified_at DESC
+            LIMIT $1
+        """, limit)
+        return [dict(r) for r in rows]
+
+
 # ── Персистентная ссылка суперадмина t.me/<bot>?start=company_<id> ──────────
 
 async def save_pending_company_link(chat_id: int, company_id: int):

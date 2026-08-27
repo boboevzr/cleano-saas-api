@@ -11307,6 +11307,14 @@ async def public_saas_settings():
     return {"ok": True, "settings": settings}
 
 
+@app.get("/api/saas/cleano-bot-clients")
+async def saas_cleano_bot_clients(_=Depends(get_superadmin)):
+    """Список тех, кто подтверждал телефон через @cleanouz_bot — для карточки
+    "Telegram-бот Cleano" в superadmin.html."""
+    rows = await db.list_cleano_bot_clients()
+    return {"ok": True, "clients": rows}
+
+
 # ══════════════════════════════════════
 #  ПОДТВЕРЖДЕНИЕ ТЕЛЕФОНА ПРИ РЕГИСТРАЦИИ НА CLEANO.UZ (SMS или Telegram-бот)
 #  Отдельный бот от artez_bot (клиенты ARTEZ) — свой токен, своя таблица привязки.
