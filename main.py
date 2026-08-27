@@ -11357,14 +11357,17 @@ async def _cleano_bot_set_webhook(token: str):
         async with aiohttp.ClientSession() as s:
             r = await s.post(
                 f"https://api.telegram.org/bot{token}/setWebhook",
-                json={"url": url, "secret_token": secret, "allowed_updates": ["message"]},
+                json={"url": url, "secret_token": secret, "allowed_updates": ["message", "callback_query"]},
                 timeout=aiohttp.ClientTimeout(total=10),
             )
             data = await r.json()
             # Кнопка "Menu" рядом со строкой ввода — список команд, чтобы не набирать /start вручную.
             await s.post(
                 f"https://api.telegram.org/bot{token}/setMyCommands",
-                json={"commands": [{"command": "start", "description": "Bosh menyu / Главное меню"}]},
+                json={"commands": [
+                    {"command": "start", "description": "Bosh menyu / Главное меню"},
+                    {"command": "menu", "description": "Menyu / Меню"},
+                ]},
                 timeout=aiohttp.ClientTimeout(total=10),
             )
             await s.post(
@@ -11391,9 +11394,78 @@ async def _cleano_bot_send(token: str, chat_id, text: str, reply_markup: dict | 
         logging.warning(f"_cleano_bot_send error: {e}")
 
 
+async def _cleano_bot_answer_callback(token: str, callback_query_id: str):
+    """Гасит "часики" на инлайн-кнопке в Telegram — обязательно после любого callback_query,
+    иначе кнопка у клиента виснет в состоянии загрузки."""
+    if not token or not callback_query_id:
+        return
+    try:
+        async with aiohttp.ClientSession() as s:
+            await s.post(f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+                         json={"callback_query_id": callback_query_id},
+                         timeout=aiohttp.ClientTimeout(total=8))
+    except Exception as e:
+        logging.warning(f"_cleano_bot_answer_callback error: {e}")
+
+
+def _cleano_main_menu_kb(company: dict | None) -> dict:
+    """Главное меню @cleanouz_bot — инлайн-кнопки. 'Поделиться номером' у Telegram работает
+    только через reply-кнопку (request_contact), инлайн-кнопки этого не умеют — поэтому и
+    первичное, и повторное подтверждение идут через один и тот же callback cln_relink,
+    который в ответ шлёт ОТДЕЛЬНОЕ сообщение с reply-клавиатурой."""
+    if company:
+        rows = [
+            [{"text": "🌐 Админ-панель", "url": f"https://cleano.uz/admin.html?company_slug={company['slug']}&fresh=1"}],
+            [{"text": "📋 Моя компания", "callback_data": "cln_company"}],
+            [{"text": "📞 Поддержка Cleano", "callback_data": "cln_support"}],
+            [{"text": "🔄 Перепривязать Telegram", "callback_data": "cln_relink"}],
+        ]
+    else:
+        rows = [
+            [{"text": "📱 Подтвердить номер", "callback_data": "cln_relink"}],
+            [{"text": "📞 Поддержка Cleano", "callback_data": "cln_support"}],
+        ]
+    return {"inline_keyboard": rows}
+
+
+async def _cleano_send_main_menu(token: str, chat_id):
+    company = await db.get_company_by_contact_tg_id(chat_id)
+    await _cleano_bot_send(token, chat_id, "🏠 <b>Главное меню</b>", reply_markup=_cleano_main_menu_kb(company))
+
+
+async def _cleano_company_info_text(company: dict) -> str:
+    from datetime import date
+    sub = await db.get_saas_subscription(company["id"])
+    lines = [f"🏢 <b>{company['name']}</b>"]
+    if sub:
+        lines.append(f"📦 Тариф: {sub.get('plan_name') or sub.get('plan_slug') or company.get('plan')}")
+        end_date = sub.get("end_date")
+        if sub.get("status") == "trial":
+            days_left = (end_date - date.today()).days if end_date else None
+            lines.append(f"⏳ Демо-доступ — осталось {max(days_left, 0)} дн." if days_left is not None else "⏳ Демо-доступ")
+        else:
+            lines.append(f"✅ Полный доступ до {end_date.strftime('%d.%m.%Y')}" if end_date else "✅ Полный доступ")
+    else:
+        lines.append(f"📦 Тариф: {company.get('plan', '—')}")
+    if company.get("contact_phone"):
+        lines.append(f"📞 {company['contact_phone']}")
+    return "\n".join(lines)
+
+
+async def _cleano_support_text() -> str:
+    phone = await db.get_config("cleano_phone") or ""
+    tg = await db.get_config("cleano_telegram") or ""
+    lines = ["📞 <b>Поддержка Cleano</b>"]
+    if phone: lines.append(f"☎️ {phone}")
+    if tg: lines.append(f"✈️ {tg}")
+    if not phone and not tg: lines.append("Контакты пока не заполнены суперадмином.")
+    return "\n".join(lines)
+
+
 @app.post("/api/cleano/tg-webhook")
 async def cleano_tg_webhook(request: Request):
-    """Webhook Telegram-бота Cleano — только запрос номера и приём 'поделиться контактом'."""
+    """Webhook Telegram-бота Cleano — подтверждение телефона + главное меню (админ-панель,
+    инфо о компании, поддержка Cleano)."""
     token = await db.get_config("cleano_bot_token")
     if not token:
         return {"ok": True}
@@ -11403,6 +11475,31 @@ async def cleano_tg_webhook(request: Request):
         raise HTTPException(status_code=403, detail="Invalid secret token")
 
     update = await request.json()
+
+    cq = update.get("callback_query")
+    if cq:
+        chat_id = ((cq.get("message") or {}).get("chat") or {}).get("id")
+        await _cleano_bot_answer_callback(token, cq.get("id"))
+        if not chat_id:
+            return {"ok": True}
+        data = cq.get("data") or ""
+        if data == "cln_company":
+            company = await db.get_company_by_contact_tg_id(chat_id)
+            await _cleano_bot_send(token, chat_id,
+                await _cleano_company_info_text(company) if company
+                else "⚠️ Telegram ещё не привязан ни к одной компании.")
+        elif data == "cln_support":
+            await _cleano_bot_send(token, chat_id, await _cleano_support_text())
+        elif data == "cln_relink":
+            share_keyboard = {
+                "keyboard": [[{"text": "📱 Raqamni ulashish / Поделиться номером", "request_contact": True}]],
+                "resize_keyboard": True, "one_time_keyboard": True,
+            }
+            await _cleano_bot_send(token, chat_id,
+                "Поделитесь контактом кнопкой ниже, чтобы подтвердить/перепривязать номер.",
+                reply_markup=share_keyboard)
+        return {"ok": True}
+
     msg = update.get("message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
     if not chat_id:
@@ -11423,6 +11520,7 @@ async def cleano_tg_webhook(request: Request):
                 f"✅ Telegram muvaffaqiyatli ulandi: <b>{name}</b>\n\n"
                 f"✅ Telegram успешно привязан: <b>{name}</b>",
                 reply_markup={"remove_keyboard": True})
+            await _cleano_send_main_menu(token, chat_id)
             return {"ok": True}
         await db.save_cleano_tg_link(phone, chat_id)
         await db.mark_cleano_phone_verified(phone, "telegram", tg_id=chat_id)
@@ -11430,6 +11528,7 @@ async def cleano_tg_webhook(request: Request):
             "✅ Raqam tasdiqlandi! Endi cleano.uz saytiga qaytib, ro'yxatdan o'tishni yakunlashingiz mumkin."
             "\n\n✅ Номер подтверждён! Вернитесь на cleano.uz и завершите регистрацию.",
             reply_markup={"remove_keyboard": True})
+        await _cleano_send_main_menu(token, chat_id)
         return {"ok": True}
 
     text = (msg.get("text") or "").strip()
@@ -11455,22 +11554,10 @@ async def cleano_tg_webhook(request: Request):
             reply_markup=share_keyboard)
         return {"ok": True}
 
-    # Любой другой текст (не только /start) ведёт себя как главное меню — чтобы не нужно было
-    # набирать команду вручную (пользователь может просто написать что угодно или нажать
-    # на кнопку меню рядом со строкой ввода, которая показывает /start в списке команд).
-    company = await db.get_company_by_contact_tg_id(chat_id)
-    if company:
-        await _cleano_bot_send(token, chat_id,
-            f"✅ Sizning kompaniyangiz allaqachon ro'yxatdan o'tgan: <b>{company['name']}</b>\n"
-            f"Admin-panel: https://cleano.uz/admin.html?company_slug={company['slug']}&fresh=1\n\n"
-            f"✅ Ваша компания уже зарегистрирована: <b>{company['name']}</b>\n"
-            f"Админ-панель: https://cleano.uz/admin.html?company_slug={company['slug']}&fresh=1")
-    else:
-        await _cleano_bot_send(token, chat_id,
-            "👋 <b>Cleano</b>\n\nKompaniyani ro'yxatdan o'tkazishda telefon raqamingizni tasdiqlash uchun "
-            "pastdagi tugma orqali raqamingizni ulashing.\n\nПодтвердите номер телефона для регистрации "
-            "компании — поделитесь контактом кнопкой ниже.",
-            reply_markup=share_keyboard)
+    # Любой другой текст (не только /start, /menu) — главное меню, чтобы не нужно было
+    # помнить команды (пользователь может просто написать что угодно или нажать на кнопку
+    # меню рядом со строкой ввода, которая показывает /start в списке команд).
+    await _cleano_send_main_menu(token, chat_id)
     return {"ok": True}
 
 
