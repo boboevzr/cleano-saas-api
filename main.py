@@ -11421,13 +11421,15 @@ async def cleano_tg_webhook(request: Request):
             name = company["name"] if company else ""
             await _cleano_bot_send(token, chat_id,
                 f"✅ Telegram muvaffaqiyatli ulandi: <b>{name}</b>\n\n"
-                f"✅ Telegram успешно привязан: <b>{name}</b>")
+                f"✅ Telegram успешно привязан: <b>{name}</b>",
+                reply_markup={"remove_keyboard": True})
             return {"ok": True}
         await db.save_cleano_tg_link(phone, chat_id)
         await db.mark_cleano_phone_verified(phone, "telegram", tg_id=chat_id)
         await _cleano_bot_send(token, chat_id,
             "✅ Raqam tasdiqlandi! Endi cleano.uz saytiga qaytib, ro'yxatdan o'tishni yakunlashingiz mumkin."
-            "\n\n✅ Номер подтверждён! Вернитесь на cleano.uz и завершите регистрацию.")
+            "\n\n✅ Номер подтверждён! Вернитесь на cleano.uz и завершите регистрацию.",
+            reply_markup={"remove_keyboard": True})
         return {"ok": True}
 
     text = (msg.get("text") or "").strip()
