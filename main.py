@@ -10733,6 +10733,7 @@ class CompanyCreateRequest(BaseModel):
     city_uz:      str = ""
     workshop_lat: float | None = None
     workshop_lng: float | None = None
+    contact_phone: str | None = None  # опционально — если уже подтверждён через @cleanouz_bot, привяжется сразу
 
 class CompanyUpdateRequest(BaseModel):
     name:             str | None = None
@@ -10907,12 +10908,34 @@ async def _provision_company(name: str, slug: str, plan: str, max_branches: int,
 @app.post("/api/saas/companies")
 async def saas_create_company(req: CompanyCreateRequest, _=Depends(get_superadmin)):
     slug = req.slug.lower().strip()
+    contact_phone = (req.contact_phone or "").strip()
+    # Проверка ДО провижининга — иначе при конфликте телефона компания уже была бы
+    # создана, а запрос упал бы с ошибкой (осиротевшая наполовину созданная компания).
+    if contact_phone and await db.check_company_field_exists("contact_phone", contact_phone):
+        raise HTTPException(status_code=409, detail="Этот телефон уже используется другой компанией")
+
     company, credentials, secret_key = await _provision_company(
         req.name, slug, req.plan, req.max_branches, req.max_staff,
         city_ru=req.city_ru.strip(), city_uz=req.city_uz.strip(),
         workshop_lat=req.workshop_lat, workshop_lng=req.workshop_lng)
     if not company:
         raise HTTPException(status_code=409, detail="Slug уже занят")
+
+    # Если для этого номера УЖЕ есть свежее подтверждение через @cleanouz_bot (клиент
+    # заранее поделился контактом с ботом) — привязываем Telegram сразу, как при обычной
+    # публичной регистрации. Если подтверждения ещё нет — просто сохраняем номер,
+    # суперадмин отправит клиенту персистентную Telegram-ссылку (telegram-link ниже),
+    # чтобы тот подтвердил номер через бота уже после создания компании.
+    phone_linked = False
+    if contact_phone:
+        normalized_phone = normalize_phone(contact_phone)
+        verification = await db.get_cleano_phone_verification(normalized_phone)
+        update_fields = {"contact_phone": contact_phone}
+        if verification:
+            update_fields["contact_tg_id"] = verification.get("tg_id")
+            await db.consume_cleano_phone_verification(normalized_phone)
+            phone_linked = True
+        await db.update_company(company["id"], update_fields)
 
     plan = await db.get_saas_plan_by_slug(req.plan)
     if plan:
@@ -10933,7 +10956,7 @@ async def saas_create_company(req: CompanyCreateRequest, _=Depends(get_superadmi
             await db.create_saas_subscription(company["id"], plan["id"], start, end,
                                                notes="Создано суперадмином — демо-доступ", status="trial")
 
-    return {"ok": True, "company": dict(company), "secret_key": secret_key, "credentials": credentials}
+    return {"ok": True, "company": dict(company), "secret_key": secret_key, "credentials": credentials, "phone_linked": phone_linked}
 
 
 class PublicRegisterRequest(BaseModel):
@@ -12891,12 +12914,27 @@ async def saas_delete_branch(company_id: int, branch_id: int, _=Depends(get_supe
 
 @app.delete("/api/saas/companies/{company_id}")
 async def saas_delete_company(company_id: int, _=Depends(get_superadmin)):
+    """Мягкое удаление (архивация) — компания и все её данные остаются в БД, просто
+    перестают быть активными и помечаются архивной. Физическое удаление (delete_company_cascade)
+    больше не вызывается отсюда: тестовые компании удалялись и переиспользовали id
+    следующей созданной (см. фикс setval в database.create_tables)."""
     if company_id <= 1:
         raise HTTPException(status_code=400, detail="Эту компанию удалить нельзя")
     company = await db.get_company(company_id)
     if not company:
         raise HTTPException(status_code=404, detail="Компания не найдена")
-    await db.delete_company_cascade(company_id)
+    ok = await db.archive_company(company_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Компания уже архивирована")
+    return {"ok": True}
+
+
+@app.post("/api/saas/companies/{company_id}/restore")
+async def saas_restore_company(company_id: int, _=Depends(get_superadmin)):
+    company = await db.get_company(company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Компания не найдена")
+    await db.restore_company(company_id)
     return {"ok": True}
 
 

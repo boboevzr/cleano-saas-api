@@ -138,6 +138,7 @@ async def create_tables():
         ALTER TABLE companies ADD COLUMN IF NOT EXISTS tg_admin_link   TEXT         DEFAULT NULL;
         ALTER TABLE companies ADD COLUMN IF NOT EXISTS tg_admin_id     BIGINT       DEFAULT NULL;
         ALTER TABLE companies ADD COLUMN IF NOT EXISTS logo_url        TEXT         DEFAULT NULL;
+        ALTER TABLE companies ADD COLUMN IF NOT EXISTS archived_at     TIMESTAMPTZ  DEFAULT NULL;
         CREATE TABLE IF NOT EXISTS branches (
             id                   SERIAL PRIMARY KEY,
             company_id           INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -154,15 +155,23 @@ async def create_tables():
             UNIQUE(company_id, slug)
         );
         """)
-        # Seed default company (id=1) — branches are managed via admin panel, not seeded here
-        await c.execute("""
+        # Seed default company (id=1) — branches are managed via admin panel, not seeded here.
+        # setval — ТОЛЬКО когда seed реально произошёл (первый запуск на чистой БД): explicit
+        # id=1 в INSERT обходит sequence, и без setval следующий auto-generated id совпал бы
+        # с 1. Раньше setval выполнялся БЕЗУСЛОВНО на каждом старте — GREATEST(MAX(id),1)
+        # откатывал sequence вниз при каждом деплое ПОСЛЕ удаления компании, из-за чего новая
+        # компания повторно получала id только что удалённой (см. archive_company — теперь
+        # компании вообще не удаляются физически, но sequence чинится и на будущее).
+        seeded = await c.fetchval("""
         INSERT INTO companies (id, name, slug, secret_key, plan, active)
         VALUES (1, 'default', 'default', 'change_me_before_use', 'starter', TRUE)
-        ON CONFLICT DO NOTHING;
+        ON CONFLICT DO NOTHING
+        RETURNING id;
         """)
-        await c.execute(
-            "SELECT setval('companies_id_seq', GREATEST((SELECT MAX(id) FROM companies), 1), true)"
-        )
+        if seeded is not None:
+            await c.execute(
+                "SELECT setval('companies_id_seq', GREATEST((SELECT MAX(id) FROM companies), 1), true)"
+            )
 
     # ── Шаг 1: основные таблицы ──────────────────────────────────────────
     async with pool.acquire() as c:
@@ -9852,10 +9861,30 @@ async def get_all_companies():
     if not pool: return []
     async with pool.acquire() as conn:
         return await conn.fetch(
-            "SELECT id, name, slug, plan, max_branches, max_staff, active, created_at, "
+            "SELECT id, name, slug, plan, max_branches, max_staff, active, created_at, archived_at, "
             "contact_name, contact_phone, contact_email, inn, legal_name, address, notes, logo_url "
             "FROM companies WHERE id > 0 ORDER BY id"
         )
+
+async def archive_company(company_id: int) -> bool:
+    """Мягкое удаление — компания и все её данные остаются в БД (см. delete_company_cascade,
+    физическое удаление намеренно больше не используется в UI суперадмина), просто скрывается
+    из активного использования. Заодно не освобождает id для переиспользования — в отличие от
+    физического DELETE, из-за которого auto-increment мог откатиться назад при следующем
+    деплое (см. фикс setval в create_tables)."""
+    if not pool: return False
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE companies SET archived_at=NOW(), active=FALSE WHERE id=$1 AND archived_at IS NULL",
+            company_id)
+        return result.split()[-1] != '0'
+
+async def restore_company(company_id: int) -> bool:
+    if not pool: return False
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE companies SET archived_at=NULL WHERE id=$1", company_id)
+        return result.split()[-1] != '0'
 
 async def get_company(company_id: int):
     if not pool: return None
