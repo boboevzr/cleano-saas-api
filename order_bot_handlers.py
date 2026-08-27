@@ -808,7 +808,12 @@ def _branch_phone_list(branch: dict) -> list[str]:
             raw = []
     out = []
     for p in raw:
-        num = p.get("n") if isinstance(p, dict) else p
+        if isinstance(p, dict):
+            if p.get("bot") is False:
+                continue
+            num = p.get("n")
+        else:
+            num = p
         if num:
             out.append(str(num))
     return out
