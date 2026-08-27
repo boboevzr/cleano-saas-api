@@ -10297,8 +10297,10 @@ async def delete_site_faq_item(faq_id: int, company_id: int) -> bool:
 #  SAAS PLANS / SUBSCRIPTIONS / PAYMENTS
 # ══════════════════════════════════════
 
-async def check_company_field_exists(column: str, value: str) -> bool:
-    """Проверка на дубликат перед регистрацией (публичная форма cleano.uz).
+async def check_company_field_exists(column: str, value: str, exclude_company_id: int | None = None) -> bool:
+    """Проверка на дубликат — и перед регистрацией (публичная форма cleano.uz), и при
+    редактировании компании суперадмином (exclude_company_id исключает саму компанию,
+    иначе повторное сохранение её же неизменённого телефона ложно считалось бы дублем).
     column — строго из белого списка, никогда не из пользовательского ввода напрямую."""
     if not pool: return False
     allowed_cols = {"name", "slug", "contact_phone", "contact_email"}
@@ -10309,12 +10311,16 @@ async def check_company_field_exists(column: str, value: str) -> bool:
             digits = re.sub(r"\D", "", value)
             if not digits:
                 return False
-            row = await conn.fetchval(
-                "SELECT 1 FROM companies WHERE regexp_replace(contact_phone, '\\D', '', 'g') = $1 "
-                "AND contact_phone IS NOT NULL AND contact_phone <> '' LIMIT 1", digits)
+            query = ("SELECT 1 FROM companies WHERE regexp_replace(contact_phone, '\\D', '', 'g') = $1 "
+                      "AND contact_phone IS NOT NULL AND contact_phone <> ''")
+            params = [digits]
         else:
-            row = await conn.fetchval(
-                f"SELECT 1 FROM companies WHERE lower({column}) = lower($1) LIMIT 1", value.strip())
+            query = f"SELECT 1 FROM companies WHERE lower({column}) = lower($1)"
+            params = [value.strip()]
+        if exclude_company_id is not None:
+            query += f" AND id != ${len(params)+1}"
+            params.append(exclude_company_id)
+        row = await conn.fetchval(query + " LIMIT 1", *params)
         return bool(row)
 
 

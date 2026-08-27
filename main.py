@@ -11150,6 +11150,9 @@ async def saas_update_company(company_id: int, req: CompanyUpdateRequest, _=Depe
     if not c:
         raise HTTPException(status_code=404, detail="Компания не найдена")
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if updates.get("contact_phone") and await db.check_company_field_exists(
+            "contact_phone", updates["contact_phone"], exclude_company_id=company_id):
+        raise HTTPException(status_code=409, detail="Этот телефон уже используется другой компанией")
     await db.update_company(company_id, updates)
     return {"ok": True}
 
