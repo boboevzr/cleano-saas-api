@@ -10455,6 +10455,15 @@ async def consume_pending_company_link(chat_id: int):
         await conn.execute("DELETE FROM cleano_pending_company_link WHERE chat_id=$1", chat_id)
 
 
+async def get_cleano_phone_by_tg_id(tg_id: int) -> str | None:
+    """Обратный поиск к save_cleano_tg_link — для кнопки "Начать регистрацию" в главном
+    меню @cleanouz_bot (префилл уже подтверждённого номера на форме cleano-landing.html)."""
+    if not pool: return None
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT phone FROM cleano_tg_links WHERE tg_id=$1 ORDER BY created_at DESC LIMIT 1", tg_id)
+
+
 async def get_cleano_tg_lang(tg_id: int) -> str | None:
     if not pool: return None
     async with pool.acquire() as conn:

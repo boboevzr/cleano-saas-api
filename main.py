@@ -11463,6 +11463,7 @@ _CLN_T = {
         "full_generic": "✅ Полный доступ",
         "share_prompt": "Поделитесь контактом кнопкой ниже, чтобы подтвердить/перепривязать номер.",
         "share_btn": "📱 Поделиться номером",
+        "btn_register": "📝 Начать регистрацию",
     },
     "uz": {
         "choose_lang": "🌐 Interfeys tilini tanlang:",
@@ -11488,6 +11489,7 @@ _CLN_T = {
         "full_generic": "✅ To'liq kirish",
         "share_prompt": "Raqamni tasdiqlash/qayta ulash uchun pastdagi tugma orqali kontaktingizni ulashing.",
         "share_btn": "📱 Raqamni ulashish",
+        "btn_register": "📝 Ro'yxatdan o'tishni boshlash",
     },
 }
 
@@ -11506,11 +11508,13 @@ def _cleano_share_kb(lang: str) -> dict:
     }
 
 
-def _cleano_main_menu_kb(company: dict | None, lang: str) -> dict:
+def _cleano_main_menu_kb(company: dict | None, lang: str, phone: str | None = None) -> dict:
     """Главное меню @cleanouz_bot — инлайн-кнопки. 'Поделиться номером' у Telegram работает
     только через reply-кнопку (request_contact), инлайн-кнопки этого не умеют — поэтому
     подтверждение/перепривязка (cln_relink) в ответ шлёт ОТДЕЛЬНОЕ сообщение с
-    reply-клавиатурой (см. _cleano_share_kb)."""
+    reply-клавиатурой (см. _cleano_share_kb). phone — уже подтверждённый через бота номер
+    (если есть), пробрасывается в форму регистрации на сайте параметром ?phone=, чтобы
+    не заставлять вводить и подтверждать его там ещё раз."""
     t = _CLN_T[lang]
     if company:
         rows = [
@@ -11520,8 +11524,13 @@ def _cleano_main_menu_kb(company: dict | None, lang: str) -> dict:
             [{"text": t["btn_settings"], "callback_data": "cln_settings"}],
         ]
     else:
+        reg_url = "https://cleano.uz/cleano-landing.html"
+        if phone:
+            import urllib.parse
+            reg_url += f"?phone={urllib.parse.quote(phone)}"
         rows = [
             [{"text": t["btn_confirm_phone"], "callback_data": "cln_relink"}],
+            [{"text": t["btn_register"], "url": reg_url}],
             [{"text": t["btn_support"], "callback_data": "cln_support"}],
         ]
     return {"inline_keyboard": rows}
@@ -11575,12 +11584,13 @@ async def _cleano_send_main_menu(token: str, chat_id, lang: str, clear_keyboard:
     company = await db.get_company_by_contact_tg_id(chat_id)
     t = _CLN_T[lang]
     about = await db.get_config(f"cleano_about_{lang}") or t["about_fallback"]
-    phone = await db.get_config("cleano_phone") or ""
+    support_phone = await db.get_config("cleano_phone") or ""
     lines = [t["menu_title"], "", about]
-    if phone:
-        lines.append(f"☎️ {phone}")
+    if support_phone:
+        lines.append(f"☎️ {support_phone}")
     text = "\n".join(lines)
-    kb = _cleano_main_menu_kb(company, lang)
+    own_phone = None if company else await db.get_cleano_phone_by_tg_id(chat_id)
+    kb = _cleano_main_menu_kb(company, lang, phone=own_phone)
     image_b64 = await db.get_config("cleano_bot_main_image")
     if image_b64:
         await _cleano_bot_send_photo(token, chat_id, image_b64, caption=text, reply_markup=kb)
@@ -11720,6 +11730,12 @@ async def cleano_tg_webhook(request: Request):
     # ещё (даже перед меню/подтверждением номера) — выбор языка в две строки (RU/UZ).
     lang = await db.get_cleano_tg_lang(chat_id)
     if lang is None:
+        # Чистим клавиатуру ДО выбора языка — иначе зависшая с прошлой сессии reply-кнопка
+        # "Поделиться номером" оставалась бы висеть до первого выбора языка (эта ветка
+        # раньше возвращала ответ до того, как код доходил до _cleano_send_main_menu, где
+        # clear_keyboard обрабатывается для /start).
+        if text in ("/start", "/menu"):
+            await _cleano_bot_send(token, chat_id, "🌐", reply_markup={"remove_keyboard": True})
         await _cleano_bot_send(token, chat_id,
             f"{_CLN_T['ru']['choose_lang']}\n{_CLN_T['uz']['choose_lang']}",
             reply_markup=_cleano_lang_kb())
