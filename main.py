@@ -11464,6 +11464,7 @@ _CLN_T = {
         "share_prompt": "Поделитесь контактом кнопкой ниже, чтобы подтвердить/перепривязать номер.",
         "share_btn": "📱 Поделиться номером",
         "btn_register": "📝 Начать регистрацию",
+        "need_phone_hint": "👉 Сначала подтвердите номер телефона кнопкой ниже — после этого станет доступна регистрация компании.",
     },
     "uz": {
         "choose_lang": "🌐 Interfeys tilini tanlang:",
@@ -11490,6 +11491,7 @@ _CLN_T = {
         "share_prompt": "Raqamni tasdiqlash/qayta ulash uchun pastdagi tugma orqali kontaktingizni ulashing.",
         "share_btn": "📱 Raqamni ulashish",
         "btn_register": "📝 Ro'yxatdan o'tishni boshlash",
+        "need_phone_hint": "👉 Avval pastdagi tugma orqali telefon raqamingizni tasdiqlang — shundan keyin kompaniyani roʻyxatdan oʻtkazish mumkin boʻladi.",
     },
 }
 
@@ -11523,14 +11525,20 @@ def _cleano_main_menu_kb(company: dict | None, lang: str, phone: str | None = No
             [{"text": t["btn_support"], "callback_data": "cln_support"}],
             [{"text": t["btn_settings"], "callback_data": "cln_settings"}],
         ]
+    elif phone:
+        # Номер уже подтверждён (был "Поделиться номером") — предлагаем регистрацию,
+        # кнопка повторного подтверждения больше не нужна.
+        import urllib.parse
+        reg_url = f"https://cleano.uz/cleano-landing.html?phone={urllib.parse.quote(phone)}"
+        rows = [
+            [{"text": t["btn_register"], "url": reg_url}],
+            [{"text": t["btn_support"], "callback_data": "cln_support"}],
+        ]
     else:
-        reg_url = "https://cleano.uz/cleano-landing.html"
-        if phone:
-            import urllib.parse
-            reg_url += f"?phone={urllib.parse.quote(phone)}"
+        # Номер ещё не подтверждён — регистрацию предлагать рано (пока некуда привязать
+        # созданную компанию), только подтверждение номера + поддержка.
         rows = [
             [{"text": t["btn_confirm_phone"], "callback_data": "cln_relink"}],
-            [{"text": t["btn_register"], "url": reg_url}],
             [{"text": t["btn_support"], "callback_data": "cln_support"}],
         ]
     return {"inline_keyboard": rows}
@@ -11585,11 +11593,13 @@ async def _cleano_send_main_menu(token: str, chat_id, lang: str, clear_keyboard:
     t = _CLN_T[lang]
     about = await db.get_config(f"cleano_about_{lang}") or t["about_fallback"]
     support_phone = await db.get_config("cleano_phone") or ""
+    own_phone = None if company else await db.get_cleano_phone_by_tg_id(chat_id)
     lines = [t["menu_title"], "", about]
     if support_phone:
         lines.append(f"☎️ {support_phone}")
+    if not company and not own_phone:
+        lines += ["", t["need_phone_hint"]]
     text = "\n".join(lines)
-    own_phone = None if company else await db.get_cleano_phone_by_tg_id(chat_id)
     kb = _cleano_main_menu_kb(company, lang, phone=own_phone)
     image_b64 = await db.get_config("cleano_bot_main_image")
     if image_b64:
