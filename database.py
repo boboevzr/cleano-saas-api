@@ -4572,6 +4572,41 @@ async def get_admin_attendance(year: int, month: int, staff_id: int = None) -> l
         result.sort(key=lambda x: x["date"], reverse=True)
         return result
 
+async def get_next_lead_num(company_id: int) -> tuple[str, str]:
+    """Аналог get_next_order_num (см. выше) — но для leads.lead_num/lead_code. Раньше эти
+    поля строились из ГЛОБАЛЬНОГО leads.id (см. create_lead ниже), поэтому счётчик шёл
+    общим через ВСЕ SaaS-компании разом — у компании B первый лид мог оказаться сразу
+    "L-0157". Тот же баг, что был найден и исправлен для order_num 2026-08-21, но для
+    лидов перенесён не был. company_id=1 (ARTEZ) — префикс не трогаем, чтобы продолжить
+    уже накопленную нумерацию без разрыва."""
+    if company_id == 1:
+        lead_prefix, code_prefix = "LEAD-", "L-"
+    else:
+        slug = None
+        if pool:
+            async with pool.acquire() as conn:
+                slug = await conn.fetchval("SELECT slug FROM companies WHERE id=$1", company_id)
+        tag = re.sub(r'[^A-Z0-9]', '', (slug or '').upper())[:12] or f"C{company_id}"
+        lead_prefix, code_prefix = f"LEAD-{tag}-", f"L-{tag}-"
+    if not pool:
+        return f"{lead_prefix}1001", f"{code_prefix}1001"
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT lead_num FROM leads
+            WHERE lead_num LIKE $1 AND company_id=$2
+            ORDER BY id DESC LIMIT 1
+        """, f"{lead_prefix}%", company_id)
+        if row and row["lead_num"]:
+            try:
+                last_num = int(row["lead_num"].rsplit("-", 1)[-1])
+            except (ValueError, IndexError):
+                last_num = 1000
+        else:
+            last_num = 1000
+        next_num = last_num + 1
+        return f"{lead_prefix}{next_num}", f"{code_prefix}{next_num}"
+
+
 async def create_lead(data: dict, company_id: int | None = None) -> dict:
     """company_id: явный параметр для вызовов вне обычного request-контекста (например,
     из order_bot_handlers.py — общий вебхук на все компании, contextvar _cid() там не
@@ -4615,9 +4650,8 @@ async def create_lead(data: dict, company_id: int | None = None) -> dict:
             data.get("volunteer_id"), data.get("location"), data.get("location_address"),
             source, data.get("client_tg_id"),
             data.get("pickup_date", ""), data.get("pickup_time", ""), promo_id, cid)
-        rid      = row["id"]
-        lead_num = f"LEAD-{rid:04d}"
-        lead_code = f"L-{rid:04d}"
+        rid = row["id"]
+        lead_num, lead_code = await get_next_lead_num(cid)
         await conn.execute(
             "UPDATE leads SET lead_num=$1, lead_code=$2 WHERE id=$3",
             lead_num, lead_code, rid
