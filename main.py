@@ -11282,6 +11282,7 @@ async def saas_delete_staff(company_id: int, staff_id: int, _=Depends(get_supera
 CLEANO_CONFIG_KEYS = [
     "cleano_phone", "cleano_telegram", "cleano_instagram", "cleano_facebook", "cleano_whatsapp",
     "cleano_office_lat", "cleano_office_lng", "cleano_office_address", "cleano_bot_username",
+    "cleano_about_ru", "cleano_about_uz",
 ]
 # Секретные ключи Cleano — доступны только суперадмину, НИКОГДА не попадают в public-settings
 CLEANO_SECRET_CONFIG_KEYS = ["cleano_bot_token"]
@@ -11298,6 +11299,8 @@ class SaasGlobalSettingsRequest(BaseModel):
     cleano_office_address: str | None = None
     cleano_bot_username:   str | None = None
     cleano_bot_token:      str | None = None
+    cleano_about_ru:       str | None = None
+    cleano_about_uz:       str | None = None
 
 @app.get("/api/saas/global-settings")
 async def saas_get_global_settings(_=Depends(get_superadmin)):
@@ -11336,6 +11339,33 @@ async def saas_cleano_bot_clients(_=Depends(get_superadmin)):
     "Telegram-бот Cleano" в superadmin.html."""
     rows = await db.list_cleano_bot_clients()
     return {"ok": True, "clients": rows}
+
+
+@app.post("/api/saas/cleano-bot-image")
+async def sa_upload_cleano_bot_image(file: UploadFile = File(...), _=Depends(get_superadmin)):
+    """Картинка главного меню @cleanouz_bot — хранится как data-URI (см. _cleano_bot_send_photo:
+    единственный отправитель этой картинки — сам cleanouz_bot, поэтому Telegram file_id тут не
+    нужен вообще, raw-байты из БД проще и без пробем валидности file_id между ботами."""
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Файл должен быть изображением")
+    data = await file.read()
+    if len(data) > 5_000_000:
+        raise HTTPException(status_code=400, detail="Изображение слишком большое (макс. 5 МБ)")
+    b64 = f"data:{file.content_type};base64,{base64.b64encode(data).decode('ascii')}"
+    await db.set_config("cleano_bot_main_image", b64)
+    return {"ok": True}
+
+
+@app.delete("/api/saas/cleano-bot-image")
+async def sa_delete_cleano_bot_image(_=Depends(get_superadmin)):
+    await db.set_config("cleano_bot_main_image", "")
+    return {"ok": True}
+
+
+@app.get("/api/saas/cleano-bot-image-status")
+async def sa_cleano_bot_image_status(_=Depends(get_superadmin)):
+    img = await db.get_config("cleano_bot_main_image")
+    return {"ok": True, "has_image": bool(img)}
 
 
 # ══════════════════════════════════════
@@ -11408,57 +11438,184 @@ async def _cleano_bot_answer_callback(token: str, callback_query_id: str):
         logging.warning(f"_cleano_bot_answer_callback error: {e}")
 
 
-def _cleano_main_menu_kb(company: dict | None) -> dict:
+_CLN_T = {
+    "ru": {
+        "choose_lang": "🌐 Выберите язык интерфейса:",
+        "lang_changed": "✅ Язык изменён на русский",
+        "menu_title": "🏠 Главное меню",
+        "about_fallback": "Cleano — SaaS-платформа для химчисток и клининговых компаний: сайт, Telegram-бот и CRM под ключ.",
+        "btn_admin": "🌐 Админ-панель",
+        "btn_company": "📋 Моя компания",
+        "btn_support": "📞 Поддержка Cleano",
+        "btn_settings": "⚙️ Настройки",
+        "btn_confirm_phone": "📱 Подтвердить номер",
+        "btn_change_lang": "🌐 Сменить язык",
+        "btn_relink": "🔄 Перепривязать Telegram",
+        "btn_back": "◀️ Назад",
+        "settings_title": "⚙️ <b>Настройки</b>",
+        "support_title": "📞 <b>Поддержка Cleano</b>",
+        "support_empty": "Контакты пока не заполнены суперадмином.",
+        "not_linked": "⚠️ Telegram ещё не привязан ни к одной компании.",
+        "plan_label": "📦 Тариф",
+        "trial_days": "⏳ Демо-доступ — осталось {n} дн.",
+        "trial_generic": "⏳ Демо-доступ",
+        "full_until": "✅ Полный доступ до {d}",
+        "full_generic": "✅ Полный доступ",
+        "share_prompt": "Поделитесь контактом кнопкой ниже, чтобы подтвердить/перепривязать номер.",
+        "share_btn": "📱 Поделиться номером",
+    },
+    "uz": {
+        "choose_lang": "🌐 Interfeys tilini tanlang:",
+        "lang_changed": "✅ Til o'zbekchaga o'zgartirildi",
+        "menu_title": "🏠 Bosh menyu",
+        "about_fallback": "Cleano — kimyoviy tozalash va klining kompaniyalari uchun SaaS-platforma: sayt, Telegram-bot va CRM.",
+        "btn_admin": "🌐 Admin-panel",
+        "btn_company": "📋 Mening kompaniyam",
+        "btn_support": "📞 Cleano qo'llab-quvvatlash",
+        "btn_settings": "⚙️ Sozlamalar",
+        "btn_confirm_phone": "📱 Raqamni tasdiqlash",
+        "btn_change_lang": "🌐 Tilni o'zgartirish",
+        "btn_relink": "🔄 Telegramni qayta ulash",
+        "btn_back": "◀️ Orqaga",
+        "settings_title": "⚙️ <b>Sozlamalar</b>",
+        "support_title": "📞 <b>Cleano qo'llab-quvvatlash</b>",
+        "support_empty": "Superadmin hali kontaktlarni to'ldirmagan.",
+        "not_linked": "⚠️ Telegram hali birorta kompaniyaga ulanmagan.",
+        "plan_label": "📦 Tarif",
+        "trial_days": "⏳ Demo-kirish — {n} kun qoldi.",
+        "trial_generic": "⏳ Demo-kirish",
+        "full_until": "✅ To'liq kirish {d} gacha",
+        "full_generic": "✅ To'liq kirish",
+        "share_prompt": "Raqamni tasdiqlash/qayta ulash uchun pastdagi tugma orqali kontaktingizni ulashing.",
+        "share_btn": "📱 Raqamni ulashish",
+    },
+}
+
+
+def _cleano_lang_kb() -> dict:
+    return {"inline_keyboard": [
+        [{"text": "🇷🇺 Русский язык", "callback_data": "cln_lang_ru"}],
+        [{"text": "🇺🇿 O'zbek tili", "callback_data": "cln_lang_uz"}],
+    ]}
+
+
+def _cleano_share_kb(lang: str) -> dict:
+    return {
+        "keyboard": [[{"text": _CLN_T[lang]["share_btn"], "request_contact": True}]],
+        "resize_keyboard": True, "one_time_keyboard": True,
+    }
+
+
+def _cleano_main_menu_kb(company: dict | None, lang: str) -> dict:
     """Главное меню @cleanouz_bot — инлайн-кнопки. 'Поделиться номером' у Telegram работает
-    только через reply-кнопку (request_contact), инлайн-кнопки этого не умеют — поэтому и
-    первичное, и повторное подтверждение идут через один и тот же callback cln_relink,
-    который в ответ шлёт ОТДЕЛЬНОЕ сообщение с reply-клавиатурой."""
+    только через reply-кнопку (request_contact), инлайн-кнопки этого не умеют — поэтому
+    подтверждение/перепривязка (cln_relink) в ответ шлёт ОТДЕЛЬНОЕ сообщение с
+    reply-клавиатурой (см. _cleano_share_kb)."""
+    t = _CLN_T[lang]
     if company:
         rows = [
-            [{"text": "🌐 Админ-панель", "url": f"https://cleano.uz/admin.html?company_slug={company['slug']}&fresh=1"}],
-            [{"text": "📋 Моя компания", "callback_data": "cln_company"}],
-            [{"text": "📞 Поддержка Cleano", "callback_data": "cln_support"}],
-            [{"text": "🔄 Перепривязать Telegram", "callback_data": "cln_relink"}],
+            [{"text": t["btn_admin"], "url": f"https://cleano.uz/admin.html?company_slug={company['slug']}&fresh=1"}],
+            [{"text": t["btn_company"], "callback_data": "cln_company"}],
+            [{"text": t["btn_support"], "callback_data": "cln_support"}],
+            [{"text": t["btn_settings"], "callback_data": "cln_settings"}],
         ]
     else:
         rows = [
-            [{"text": "📱 Подтвердить номер", "callback_data": "cln_relink"}],
-            [{"text": "📞 Поддержка Cleano", "callback_data": "cln_support"}],
+            [{"text": t["btn_confirm_phone"], "callback_data": "cln_relink"}],
+            [{"text": t["btn_support"], "callback_data": "cln_support"}],
         ]
     return {"inline_keyboard": rows}
 
 
-async def _cleano_send_main_menu(token: str, chat_id):
+def _cleano_settings_kb(lang: str) -> dict:
+    t = _CLN_T[lang]
+    return {"inline_keyboard": [
+        [{"text": t["btn_change_lang"], "callback_data": "cln_lang"}],
+        [{"text": t["btn_relink"], "callback_data": "cln_relink"}],
+        [{"text": t["btn_back"], "callback_data": "cln_menu"}],
+    ]}
+
+
+async def _cleano_resolve_lang(chat_id) -> str:
+    lang = await db.get_cleano_tg_lang(chat_id)
+    return lang if lang in ("ru", "uz") else "ru"
+
+
+async def _cleano_bot_send_photo(token: str, chat_id, image_b64: str, caption: str, reply_markup: dict | None = None):
+    """Картинка главного меню — хранится как data-URI base64 в конфиге (тот же приём, что и
+    logo_url компании, см. company_upload_logo), НЕ как Telegram file_id: единственный
+    отправитель — этот же бот, так что кросс-бот-проблема file_id тут не актуальна, а raw-байты
+    проще и надёжнее (не нужно ничего кэшировать/восстанавливать при недействительном file_id)."""
+    if not token or not chat_id or not image_b64:
+        return
+    import json
+    try:
+        b64data = image_b64.split(",", 1)[1] if "," in image_b64 else image_b64
+        photo_bytes = base64.b64decode(b64data)
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        form.add_field("caption", caption)
+        form.add_field("parse_mode", "HTML")
+        if reply_markup:
+            form.add_field("reply_markup", json.dumps(reply_markup))
+        form.add_field("photo", photo_bytes, filename="cleano.jpg", content_type="image/jpeg")
+        async with aiohttp.ClientSession() as s:
+            await s.post(f"https://api.telegram.org/bot{token}/sendPhoto", data=form,
+                         timeout=aiohttp.ClientTimeout(total=15))
+    except Exception as e:
+        logging.warning(f"_cleano_bot_send_photo error: {e}")
+
+
+async def _cleano_send_main_menu(token: str, chat_id, lang: str, clear_keyboard: bool = False):
+    """clear_keyboard=True шлёт крошечное сообщение с remove_keyboard ПЕРЕД самим меню —
+    Telegram не даёт одновременно убрать reply-клавиатуру и показать inline-кнопки в одном
+    sendMessage/sendPhoto, поэтому это два отдельных сообщения."""
+    if clear_keyboard:
+        await _cleano_bot_send(token, chat_id, "🏠", reply_markup={"remove_keyboard": True})
     company = await db.get_company_by_contact_tg_id(chat_id)
-    await _cleano_bot_send(token, chat_id, "🏠 <b>Главное меню</b>", reply_markup=_cleano_main_menu_kb(company))
+    t = _CLN_T[lang]
+    about = await db.get_config(f"cleano_about_{lang}") or t["about_fallback"]
+    phone = await db.get_config("cleano_phone") or ""
+    lines = [t["menu_title"], "", about]
+    if phone:
+        lines.append(f"☎️ {phone}")
+    text = "\n".join(lines)
+    kb = _cleano_main_menu_kb(company, lang)
+    image_b64 = await db.get_config("cleano_bot_main_image")
+    if image_b64:
+        await _cleano_bot_send_photo(token, chat_id, image_b64, caption=text, reply_markup=kb)
+    else:
+        await _cleano_bot_send(token, chat_id, text, reply_markup=kb)
 
 
-async def _cleano_company_info_text(company: dict) -> str:
+async def _cleano_company_info_text(company: dict, lang: str) -> str:
     from datetime import date
+    t = _CLN_T[lang]
     sub = await db.get_saas_subscription(company["id"])
     lines = [f"🏢 <b>{company['name']}</b>"]
     if sub:
-        lines.append(f"📦 Тариф: {sub.get('plan_name') or sub.get('plan_slug') or company.get('plan')}")
+        lines.append(f"{t['plan_label']}: {sub.get('plan_name') or sub.get('plan_slug') or company.get('plan')}")
         end_date = sub.get("end_date")
         if sub.get("status") == "trial":
             days_left = (end_date - date.today()).days if end_date else None
-            lines.append(f"⏳ Демо-доступ — осталось {max(days_left, 0)} дн." if days_left is not None else "⏳ Демо-доступ")
+            lines.append(t["trial_days"].format(n=max(days_left, 0)) if days_left is not None else t["trial_generic"])
         else:
-            lines.append(f"✅ Полный доступ до {end_date.strftime('%d.%m.%Y')}" if end_date else "✅ Полный доступ")
+            lines.append(t["full_until"].format(d=end_date.strftime('%d.%m.%Y')) if end_date else t["full_generic"])
     else:
-        lines.append(f"📦 Тариф: {company.get('plan', '—')}")
+        lines.append(f"{t['plan_label']}: {company.get('plan', '—')}")
     if company.get("contact_phone"):
         lines.append(f"📞 {company['contact_phone']}")
     return "\n".join(lines)
 
 
-async def _cleano_support_text() -> str:
+async def _cleano_support_text(lang: str) -> str:
+    t = _CLN_T[lang]
     phone = await db.get_config("cleano_phone") or ""
     tg = await db.get_config("cleano_telegram") or ""
-    lines = ["📞 <b>Поддержка Cleano</b>"]
+    lines = [t["support_title"]]
     if phone: lines.append(f"☎️ {phone}")
     if tg: lines.append(f"✈️ {tg}")
-    if not phone and not tg: lines.append("Контакты пока не заполнены суперадмином.")
+    if not phone and not tg: lines.append(t["support_empty"])
     return "\n".join(lines)
 
 
@@ -11483,21 +11640,26 @@ async def cleano_tg_webhook(request: Request):
         if not chat_id:
             return {"ok": True}
         data = cq.get("data") or ""
-        if data == "cln_company":
+        lang = await _cleano_resolve_lang(chat_id)
+        if data in ("cln_lang_ru", "cln_lang_uz"):
+            new_lang = "ru" if data == "cln_lang_ru" else "uz"
+            await db.set_cleano_tg_lang(chat_id, new_lang)
+            await _cleano_bot_send(token, chat_id, _CLN_T[new_lang]["lang_changed"])
+            await _cleano_send_main_menu(token, chat_id, new_lang)
+        elif data == "cln_lang":
+            await _cleano_bot_send(token, chat_id, _CLN_T[lang]["choose_lang"], reply_markup=_cleano_lang_kb())
+        elif data == "cln_menu":
+            await _cleano_send_main_menu(token, chat_id, lang)
+        elif data == "cln_settings":
+            await _cleano_bot_send(token, chat_id, _CLN_T[lang]["settings_title"], reply_markup=_cleano_settings_kb(lang))
+        elif data == "cln_company":
             company = await db.get_company_by_contact_tg_id(chat_id)
             await _cleano_bot_send(token, chat_id,
-                await _cleano_company_info_text(company) if company
-                else "⚠️ Telegram ещё не привязан ни к одной компании.")
+                await _cleano_company_info_text(company, lang) if company else _CLN_T[lang]["not_linked"])
         elif data == "cln_support":
-            await _cleano_bot_send(token, chat_id, await _cleano_support_text())
+            await _cleano_bot_send(token, chat_id, await _cleano_support_text(lang))
         elif data == "cln_relink":
-            share_keyboard = {
-                "keyboard": [[{"text": "📱 Raqamni ulashish / Поделиться номером", "request_contact": True}]],
-                "resize_keyboard": True, "one_time_keyboard": True,
-            }
-            await _cleano_bot_send(token, chat_id,
-                "Поделитесь контактом кнопкой ниже, чтобы подтвердить/перепривязать номер.",
-                reply_markup=share_keyboard)
+            await _cleano_bot_send(token, chat_id, _CLN_T[lang]["share_prompt"], reply_markup=_cleano_share_kb(lang))
         return {"ok": True}
 
     msg = update.get("message") or {}
@@ -11508,6 +11670,7 @@ async def cleano_tg_webhook(request: Request):
     contact = msg.get("contact")
     if contact and contact.get("phone_number"):
         phone = normalize_phone(contact["phone_number"])
+        lang = await _cleano_resolve_lang(chat_id)
         # Если это переход по персистентной ссылке суперадмина (t.me/<bot>?start=company_<id>) —
         # привязываем Telegram НАПРЯМУЮ к указанной компании, а не через сопоставление по номеру.
         pending_company_id = await db.get_pending_company_link(chat_id)
@@ -11520,7 +11683,7 @@ async def cleano_tg_webhook(request: Request):
                 f"✅ Telegram muvaffaqiyatli ulandi: <b>{name}</b>\n\n"
                 f"✅ Telegram успешно привязан: <b>{name}</b>",
                 reply_markup={"remove_keyboard": True})
-            await _cleano_send_main_menu(token, chat_id)
+            await _cleano_send_main_menu(token, chat_id, lang)
             return {"ok": True}
         await db.save_cleano_tg_link(phone, chat_id)
         await db.mark_cleano_phone_verified(phone, "telegram", tg_id=chat_id)
@@ -11528,15 +11691,13 @@ async def cleano_tg_webhook(request: Request):
             "✅ Raqam tasdiqlandi! Endi cleano.uz saytiga qaytib, ro'yxatdan o'tishni yakunlashingiz mumkin."
             "\n\n✅ Номер подтверждён! Вернитесь на cleano.uz и завершите регистрацию.",
             reply_markup={"remove_keyboard": True})
-        await _cleano_send_main_menu(token, chat_id)
+        await _cleano_send_main_menu(token, chat_id, lang)
         return {"ok": True}
 
     text = (msg.get("text") or "").strip()
-    share_keyboard = {
-        "keyboard": [[{"text": "📱 Raqamni ulashish / Поделиться номером", "request_contact": True}]],
-        "resize_keyboard": True, "one_time_keyboard": True,
-    }
-    # Персистентная ссылка суперадмина: /start company_<id>
+
+    # Персистентная ссылка суперадмина: /start company_<id> — редкий, инициированный
+    # суперадмином путь (оставлен двуязычным как раньше, без гейта по выбору языка).
     if text.startswith("/start company_"):
         try:
             target_company_id = int(text.split("company_", 1)[1].strip())
@@ -11547,17 +11708,27 @@ async def cleano_tg_webhook(request: Request):
             await _cleano_bot_send(token, chat_id, "⚠️ Havola noto'g'ri yoki eskirgan.\n\n⚠️ Ссылка неверна или устарела.")
             return {"ok": True}
         await db.save_pending_company_link(chat_id, target_company_id)
+        lang = await _cleano_resolve_lang(chat_id)
         await _cleano_bot_send(token, chat_id,
             f"👋 <b>Cleano</b>\n\n<b>{company['name']}</b> nomidan Telegram-ni ulash uchun "
             f"pastdagi tugma orqali raqamingizni ulashing.\n\n"
             f"Поделитесь контактом кнопкой ниже, чтобы привязать Telegram к компании <b>{company['name']}</b>.",
-            reply_markup=share_keyboard)
+            reply_markup=_cleano_share_kb(lang))
         return {"ok": True}
 
-    # Любой другой текст (не только /start, /menu) — главное меню, чтобы не нужно было
-    # помнить команды (пользователь может просто написать что угодно или нажать на кнопку
-    # меню рядом со строкой ввода, которая показывает /start в списке команд).
-    await _cleano_send_main_menu(token, chat_id)
+    # Первое обращение этого Telegram-аккаунта — язык ещё не выбран. Гейт ПЕРЕД чем угодно
+    # ещё (даже перед меню/подтверждением номера) — выбор языка в две строки (RU/UZ).
+    lang = await db.get_cleano_tg_lang(chat_id)
+    if lang is None:
+        await _cleano_bot_send(token, chat_id,
+            f"{_CLN_T['ru']['choose_lang']}\n{_CLN_T['uz']['choose_lang']}",
+            reply_markup=_cleano_lang_kb())
+        return {"ok": True}
+
+    # /start и любой другой текст — главное меню (не нужно помнить команды). Именно на
+    # /start ВСЕГДА чистим клавиатуру — могла зависнуть reply-клавиатура «Поделиться номером»
+    # с прошлого раза, если пользователь ушёл, не нажав её.
+    await _cleano_send_main_menu(token, chat_id, lang, clear_keyboard=(text in ("/start", "/menu")))
     return {"ok": True}
 
 

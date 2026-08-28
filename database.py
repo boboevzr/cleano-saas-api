@@ -691,6 +691,12 @@ async def create_tables():
             company_id  INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
             expires_at  TIMESTAMPTZ NOT NULL
         )""",
+        # Язык интерфейса @cleanouz_bot по Telegram-аккаунту (не привязан к компании —
+        # это ДО регистрации/привязки тоже нужно, см. cleano_tg_webhook первый /start).
+        """CREATE TABLE IF NOT EXISTS cleano_tg_lang (
+            tg_id  BIGINT PRIMARY KEY,
+            lang   VARCHAR(2) NOT NULL DEFAULT 'ru'
+        )""",
         # forgot-password: попытки подтверждения кода пишут маркер purpose='reset_attempt'
         # с кодом-словом "attempt" (7 символов) — старая схема (code VARCHAR(6),
         # purpose CHECK без 'reset_attempt') валила это StringDataRightTruncationError
@@ -10447,6 +10453,21 @@ async def consume_pending_company_link(chat_id: int):
     if not pool: return
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM cleano_pending_company_link WHERE chat_id=$1", chat_id)
+
+
+async def get_cleano_tg_lang(tg_id: int) -> str | None:
+    if not pool: return None
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT lang FROM cleano_tg_lang WHERE tg_id=$1", tg_id)
+
+
+async def set_cleano_tg_lang(tg_id: int, lang: str):
+    if not pool: return
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO cleano_tg_lang (tg_id, lang) VALUES ($1, $2)
+            ON CONFLICT (tg_id) DO UPDATE SET lang=$2
+        """, tg_id, lang)
 
 
 async def get_saas_plan_by_slug(slug: str):
