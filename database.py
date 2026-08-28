@@ -2699,6 +2699,8 @@ async def save_site_order(data: dict, source: str = "site") -> str:
     """Сохраняет заявку без обязательного Telegram ID. source: 'site' | 'staff'"""
     if not pool:
         return data.get("order_num", "")
+    if not await is_subscription_active(_cid()):
+        raise SubscriptionExpiredError()
     source_note = {"site": "Заявка создана через сайт", "staff": "Заявка создана сотрудником"}.get(source, "Заявка создана")
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -4613,6 +4615,8 @@ async def create_lead(data: dict, company_id: int | None = None) -> dict:
     настроен per-request). Если не передан — берём из contextvar, как раньше."""
     if not pool: return None
     cid = company_id if company_id is not None else _cid()
+    if not await is_subscription_active(cid):
+        raise SubscriptionExpiredError()
     # Тег акции (только видимость для сотрудников, не расходует окно) — только для
     # лидов с сайта/бота, привязанных к зарегистрированному пользователю с живым окном
     promo_id = None
@@ -10710,6 +10714,31 @@ async def update_company_site_design(company_id: int, template_key: str, palette
             "UPDATE companies SET site_template_key=$2, site_palette_key=$3 WHERE id=$1",
             company_id, template_key, palette_key
         )
+
+
+class SubscriptionExpiredError(Exception):
+    """Поднимается из create_lead/save_site_order, когда у компании нет действующей
+    подписки (демо или оплаченной) — мягкое ограничение: старые данные/вход не
+    трогаем, блокируем только СОЗДАНИЕ новых лидов/заказов."""
+    pass
+
+
+async def is_subscription_active(company_id: int) -> bool:
+    """company_id=1 (ARTEZ) — реальная живая компания, исключение (тот же паттерн,
+    что и в get_next_order_num — не подчиняется общим SaaS-правилам подписки)."""
+    if company_id == 1:
+        return True
+    if not pool: return True
+    from datetime import date
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT end_date FROM saas_subscriptions
+            WHERE company_id=$1
+            ORDER BY created_at DESC LIMIT 1
+        """, company_id)
+    if not row or not row["end_date"]:
+        return False
+    return row["end_date"] >= date.today()
 
 
 async def get_saas_subscription(company_id: int):

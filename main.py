@@ -104,6 +104,17 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         headers={"Access-Control-Allow-Origin": "*"},
     )
 
+@app.exception_handler(db.SubscriptionExpiredError)
+async def subscription_expired_handler(request: Request, exc: "db.SubscriptionExpiredError"):
+    """create_lead()/save_site_order() поднимают это, когда у компании нет действующей
+    подписки — единая точка перехвата вместо правки каждого из ~7 эндпоинтов, которые
+    их вызывают (сайт, staff.html, агент-кабинет, конвертация лида в заказ и т.д.)."""
+    return JSONResponse(
+        status_code=402,
+        content={"detail": "Демо-период компании закончился. Обратитесь к владельцу компании для оплаты тарифа."},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logging.error(f"Unhandled exception on {request.method} {request.url.path}: {type(exc).__name__}: {exc}")
