@@ -8398,6 +8398,11 @@ SITE_SETTINGS_DEFAULTS = {
     # Пусто по умолчанию: реальный дефолт живёт в config company_id=0 и копируется
     # в новую компанию при регистрации (см. seed_company_order_rules).
     "order_rules": "",
+    # Режим "техработ" сайта/бота — ГЛОБАЛЬНЫЙ дефолт "false" (не ломает уже живые
+    # компании, у которых просто нет этой строки в config). Для НОВЫХ компаний
+    # явно ставится "true" в _provision_company — см. комментарий там.
+    "site_maintenance_mode": "false",
+    "bot_maintenance_mode": "false",
 }
 
 async def _get_cfg(key: str) -> str:
@@ -8427,7 +8432,7 @@ async def get_site_settings(company_slug: str = None):
         "agent_cta_text_ru", "agent_cta_text_uz",
         "agent_learnmore_text_ru", "agent_learnmore_text_uz",
         "site_video_enabled", "site_video_placement",
-        "order_rules",
+        "order_rules", "site_maintenance_mode",
     ]
     result = {}
     for key in PUBLIC_KEYS:
@@ -8521,6 +8526,8 @@ class SiteSettings(BaseModel):
     site_video_enabled:      str | None = None
     site_video_placement:    str | None = None
     order_rules:             str | None = None
+    site_maintenance_mode:   str | None = None
+    bot_maintenance_mode:    str | None = None
 
 @app.get("/api/admin/settings/site")
 async def get_admin_site_settings(_=Depends(get_admin)):
@@ -10902,6 +10909,14 @@ async def _provision_company(name: str, slug: str, plan: str, max_branches: int,
     await db.set_config_for_company("admin_pass", master_password, company["id"])
     credentials.append({"level": "company", "role": "master_password", "login": "—", "password": master_password})
 
+    # Новая компания включается в режим "техработ" на сайте И в боте по умолчанию —
+    # настройки (контакты, бот, номера филиалов) ещё не заполнены, и без этого
+    # реальные посетители видели бы то пустые данные, то (что хуже) чужие/дефолтные
+    # ARTEZ-заглушки (см. фиксы order.successText, auth.tgVar3Html этой же сессии).
+    # Владелец выключает тоглы сам, когда сайт/бот готовы к реальным клиентам.
+    await db.set_config_for_company("site_maintenance_mode", "true", company["id"])
+    await db.set_config_for_company("bot_maintenance_mode", "true", company["id"])
+
     return company, credentials, secret_key
 
 
@@ -11852,6 +11867,29 @@ async def order_bot_webhook(secret: str, request: Request):
         raise HTTPException(status_code=403, detail="Invalid secret token")
     db.set_request_company(company_id)
     body = await request.json()
+
+    # Тогл "техработ" бота (см. site_maintenance_mode для сайта — тот же смысл, отдельный
+    # ключ, т.к. сайт и бот компания может включать/выключать независимо). У новой компании
+    # включён по умолчанию (_provision_company), пока не заполнены реальные настройки —
+    # без этого клиент получал бы полноценный, но недонастроенный бот. Ответ шлём напрямую
+    # через Telegram API, МИНУЯ диспетчер целиком — не хотим, чтобы хоть один хендлер
+    # (FSM, БД-запросы) вообще выполнился, пока бот в этом режиме.
+    maintenance = await db.get_config_for_company("bot_maintenance_mode", company_id)
+    if maintenance == "true":
+        chat_id = ((body.get("message") or {}).get("chat") or {}).get("id") \
+            or (((body.get("callback_query") or {}).get("message") or {}).get("chat") or {}).get("id")
+        if chat_id:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    await s.post(f"https://api.telegram.org/bot{token}/sendMessage", json={
+                        "chat_id": chat_id,
+                        "text": "🚧 Ведутся технические работы. Пожалуйста, попробуйте позже.\n\n"
+                                "🚧 Texnik ishlar olib borilmoqda. Iltimos, keyinroq urinib ko'ring.",
+                    }, timeout=aiohttp.ClientTimeout(total=8))
+            except Exception as e:
+                logging.warning(f"order_bot maintenance notice error: {e}")
+        return {"ok": True}
+
     bot = _get_order_bot_instance(token)
     dp = _get_order_bot_dispatcher()
     result = await dp.feed_webhook_update(bot, body, company_id=company_id)
