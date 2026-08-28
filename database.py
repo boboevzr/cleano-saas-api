@@ -10366,6 +10366,22 @@ async def delete_site_faq_item(faq_id: int, company_id: int) -> bool:
 #  SAAS PLANS / SUBSCRIPTIONS / PAYMENTS
 # ══════════════════════════════════════
 
+async def get_company_by_phone(phone: str):
+    """Компания, чей contact_phone (номерами, без учёта форматирования) совпадает —
+    для @cleanouz_bot/cleano-landing.html: телефон уже подтверждён владельцем через бота
+    (Telegram-верификация доказывает владение номером), но contact_tg_id компании мог
+    быть проставлен ДРУГИМ путём (напр. вручную суперадмином в contact_phone, минуя бота
+    вообще) — тогда обычный get_company_by_contact_tg_id(chat_id) её не найдёт."""
+    if not pool: return None
+    digits = re.sub(r"\D", "", phone)
+    if not digits: return None
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT id, name, slug, contact_tg_id FROM companies WHERE "
+            "regexp_replace(contact_phone, '\\D', '', 'g') = $1 "
+            "AND contact_phone IS NOT NULL AND contact_phone <> '' LIMIT 1", digits)
+
+
 async def check_company_field_exists(column: str, value: str, exclude_company_id: int | None = None) -> bool:
     """Проверка на дубликат — и перед регистрацией (публичная форма cleano.uz), и при
     редактировании компании суперадмином (exclude_company_id исключает саму компанию,

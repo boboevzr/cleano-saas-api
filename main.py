@@ -11605,10 +11605,21 @@ async def _cleano_send_main_menu(token: str, chat_id, lang: str, clear_keyboard:
     if clear_keyboard:
         await _cleano_bot_send(token, chat_id, "🏠", reply_markup={"remove_keyboard": True})
     company = await db.get_company_by_contact_tg_id(chat_id)
+    own_phone = None if company else await db.get_cleano_phone_by_tg_id(chat_id)
+    if not company and own_phone:
+        # Номер этого чата подтверждён через бота, но контакт компании (contact_tg_id)
+        # мог быть проставлен ДРУГИМ путём — напр. суперадмин вписал этот же номер
+        # вручную в contact_phone компании, минуя бота вообще (см. company-by-verified-
+        # -phone для того же случая на cleano-landing.html). Раз номер совпал и он
+        # подтверждён — это и есть владелец, довязываем contact_tg_id, чтобы дальше
+        # компания узнавалась как обычно (get_company_by_contact_tg_id).
+        matched = await db.get_company_by_phone(own_phone)
+        if matched and not matched["contact_tg_id"]:
+            await db.update_company(matched["id"], {"contact_tg_id": chat_id})
+            company = await db.get_company(matched["id"])
     t = _CLN_T[lang]
     about = await db.get_config(f"cleano_about_{lang}") or t["about_fallback"]
     support_phone = await db.get_config("cleano_phone") or ""
-    own_phone = None if company else await db.get_cleano_phone_by_tg_id(chat_id)
     lines = [t["menu_title"], "", about]
     if support_phone:
         lines.append(f"☎️ {support_phone}")
@@ -11901,6 +11912,23 @@ async def cleano_phone_verify_status(phone: str):
     phone = normalize_phone(phone)
     v = await db.get_cleano_phone_verification(phone)
     return {"ok": True, "verified": v is not None, "method": v["method"] if v else None}
+
+
+@app.get("/api/saas/company-by-verified-phone")
+async def company_by_verified_phone(phone: str):
+    """Slug компании по номеру — ТОЛЬКО если он недавно (<30 мин) подтверждён через
+    @cleanouz_bot этим же номером. Без этого условия был бы публичный неавторизованный
+    оракул "номер → чья компания" (перебор чужих номеров). Используется на
+    cleano-landing.html, когда телефон из ссылки бота уже занят другой компанией —
+    чтобы предложить сразу перейти в её admin.html, а не молча отказать."""
+    normalized = normalize_phone(phone)
+    verification = await db.get_cleano_phone_verification(normalized)
+    if not verification:
+        return {"ok": True, "slug": None}
+    company = await db.get_company_by_phone(phone)
+    if not company:
+        return {"ok": True, "slug": None}
+    return {"ok": True, "slug": company["slug"], "name": company["name"]}
 
 
 # ══════════════════════════════════════
