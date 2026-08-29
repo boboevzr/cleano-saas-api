@@ -9902,13 +9902,22 @@ async def get_sms_dispatches_for_export(start_date: str, end_date: str) -> list:
 # ══════════════════════════════════════
 
 async def get_all_companies():
+    """sub_end_date/sub_status — из ПОСЛЕДНЕЙ подписки компании (LATERAL, не отдельный
+    запрос на каждую компанию) — чтобы список сразу показывал, у кого истёк/истекает
+    тариф, без захода в карточку каждой компании по отдельности."""
     if not pool: return []
     async with pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT id, name, slug, plan, max_branches, max_staff, active, created_at, archived_at, "
-            "contact_name, contact_phone, contact_email, inn, legal_name, address, notes, logo_url "
-            "FROM companies WHERE id > 0 ORDER BY id"
-        )
+        return await conn.fetch("""
+            SELECT c.id, c.name, c.slug, c.plan, c.max_branches, c.max_staff, c.active, c.created_at, c.archived_at,
+                   c.contact_name, c.contact_phone, c.contact_email, c.inn, c.legal_name, c.address, c.notes, c.logo_url,
+                   s.end_date AS sub_end_date, s.status AS sub_status
+            FROM companies c
+            LEFT JOIN LATERAL (
+                SELECT end_date, status FROM saas_subscriptions
+                WHERE company_id = c.id ORDER BY created_at DESC LIMIT 1
+            ) s ON true
+            WHERE c.id > 0 ORDER BY c.id
+        """)
 
 async def archive_company(company_id: int) -> bool:
     """Мягкое удаление — компания и все её данные остаются в БД (см. delete_company_cascade,
