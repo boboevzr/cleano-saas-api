@@ -13453,6 +13453,32 @@ async def company_get_subscription(staff=Depends(get_current_staff)):
     return {"ok": True, "subscription": dict(sub) if sub else None}
 
 
+@app.get("/api/company/subscriptions")
+async def company_get_subscriptions(staff=Depends(get_current_staff)):
+    """История подписок компании — то же, что видит суперадмин
+    (GET /saas/companies/{id}/subscriptions), но своим доступом и без поля
+    notes (внутренние пометки суперадмина не для владельца компании)."""
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только admin")
+    company_id = staff.get("company_id") or 1
+    subs = await db.get_saas_subscriptions_all(company_id)
+    return {"ok": True, "subscriptions": [
+        {k: v for k, v in dict(s).items() if k != "notes"} for s in subs
+    ]}
+
+
+@app.get("/api/company/payments")
+async def company_get_payments(staff=Depends(get_current_staff)):
+    """История оплат компании — аналогично, без поля note."""
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только admin")
+    company_id = staff.get("company_id") or 1
+    payments = await db.get_saas_payments(company_id)
+    return {"ok": True, "payments": [
+        {k: v for k, v in dict(p).items() if k != "note"} for p in payments
+    ]}
+
+
 class CheckoutRequest(BaseModel):
     plan_id: int
     months: int = 1
