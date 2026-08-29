@@ -108,10 +108,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 async def subscription_expired_handler(request: Request, exc: "db.SubscriptionExpiredError"):
     """create_lead()/save_site_order() поднимают это, когда у компании нет действующей
     подписки — единая точка перехвата вместо правки каждого из ~7 эндпоинтов, которые
-    их вызывают (сайт, staff.html, агент-кабинет, конвертация лида в заказ и т.д.)."""
+    их вызывают (сайт, staff.html, агент-кабинет, конвертация лида в заказ и т.д.).
+    Текст НАМЕРЕННО нейтральный — этот же 402 видит и сотрудник компании (staff.html),
+    и обычный посетитель сайта компании (site-common.js показывает detail напрямую
+    клиенту, см. submitOrder/extractErrorMessage) — им нельзя знать, что у их
+    поставщика услуг закончилась оплата SaaS-подписки. Владелец компании видит
+    реальный статус подписки отдельно, на странице тарифа в admin.html."""
     return JSONResponse(
         status_code=402,
-        content={"detail": "Демо-период компании закончился. Обратитесь к владельцу компании для оплаты тарифа."},
+        content={"detail": "Извините, сейчас ведутся технические работы. Пожалуйста, попробуйте немного позже."},
         headers={"Access-Control-Allow-Origin": "*"},
     )
 
