@@ -1129,6 +1129,31 @@ async def send_platform_sms(phone: str, message: str) -> bool:
         return False
 
 
+async def get_platform_eskiz_balance() -> int | None:
+    """Без кэша (в отличие от get_eskiz_balance_cached, читаемого на каждой загрузке
+    публичного сайта) — вызывается только по кнопке "Проверить баланс" в superadmin.html."""
+    email    = await db.get_config("platform_eskiz_email")
+    password = await db.get_config("platform_eskiz_password")
+    if not email or not password:
+        return None
+    token = await _platform_eskiz_get_token()
+    if not token:
+        return None
+    try:
+        async with aiohttp.ClientSession() as s:
+            r = await s.get(
+                "https://notify.eskiz.uz/api/user/get-limit",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=aiohttp.ClientTimeout(total=8),
+            )
+            data = await r.json()
+        balance = data.get("data", {}).get("balance")
+        return int(balance) if balance is not None else None
+    except Exception as e:
+        logging.warning(f"get_platform_eskiz_balance error: {e}")
+        return None
+
+
 _SUB_REMINDER_TEXT_RU_DEFAULT = "⚠️ Cleano: подписка компании «{name}» истекает {end_date} (осталось {days} дн.). Оплатите тариф, чтобы не потерять доступ к сайту и боту."
 _SUB_REMINDER_TEXT_UZ_DEFAULT = "⚠️ Cleano: «{name}» kompaniyasining obunasi {end_date} sanasida tugaydi ({days} kun qoldi). Sayt va botga kirishni yo'qotmaslik uchun tarifni to'lang."
 
@@ -1174,12 +1199,22 @@ async def _send_subscription_reminders():
 
 
 async def _subscription_reminder_worker():
+    """Время отправки читается из настроек ЗАНОВО на каждом витке (не при старте
+    процесса) — чтобы суперадмин мог поменять его в superadmin.html, и это применилось
+    без рестарта сервиса на следующий же расчёт цели сна."""
     from datetime import timezone as _tz, timedelta as _td
     _TZ5 = _tz(_td(hours=5))
     while True:
         from datetime import datetime as _dt
+        hh, mm = 10, 0
+        try:
+            time_str = await db.get_config("subscription_reminder_time")
+            if time_str and ":" in time_str:
+                hh, mm = (int(x) for x in time_str.split(":", 1))
+        except Exception:
+            pass
         now = _dt.now(_TZ5)
-        target = now.replace(hour=10, minute=0, second=0, microsecond=0)
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if now >= target:
             target = target + _td(days=1)
         await asyncio.sleep((target - now).total_seconds())
@@ -11447,6 +11482,7 @@ CLEANO_CONFIG_KEYS = [
     "subscription_reminder_days_before", "subscription_reminder_days_after",
     "subscription_reminder_sms_enabled", "subscription_reminder_tg_enabled",
     "subscription_reminder_text_ru", "subscription_reminder_text_uz",
+    "subscription_reminder_time",
     "platform_eskiz_email", "platform_eskiz_from",
 ]
 # Секретные ключи Cleano — доступны только суперадмину, НИКОГДА не попадают в public-settings
@@ -11472,6 +11508,7 @@ class SaasGlobalSettingsRequest(BaseModel):
     subscription_reminder_tg_enabled:  str | None = None
     subscription_reminder_text_ru:     str | None = None
     subscription_reminder_text_uz:     str | None = None
+    subscription_reminder_time:        str | None = None
     platform_eskiz_email:    str | None = None
     platform_eskiz_password: str | None = None
     platform_eskiz_from:     str | None = None
@@ -11496,6 +11533,12 @@ async def saas_update_global_settings(req: SaasGlobalSettingsRequest, _=Depends(
     if req.cleano_bot_token is not None and req.cleano_bot_token.strip():
         webhook_result = await _cleano_bot_set_webhook(req.cleano_bot_token.strip())
     return {"ok": True, "webhook": webhook_result}
+
+
+@app.get("/api/saas/platform-eskiz-balance")
+async def saas_platform_eskiz_balance(_=Depends(get_superadmin)):
+    balance = await get_platform_eskiz_balance()
+    return {"ok": True, "balance": balance}
 
 
 @app.get("/api/saas/public-settings")
