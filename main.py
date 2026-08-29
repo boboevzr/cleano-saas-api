@@ -1154,8 +1154,8 @@ async def get_platform_eskiz_balance() -> int | None:
         return None
 
 
-_SUB_REMINDER_TEXT_RU_DEFAULT = "⚠️ Cleano: подписка компании «{name}» истекает {end_date} (осталось {days} дн.). Оплатите тариф, чтобы не потерять доступ к сайту и боту."
-_SUB_REMINDER_TEXT_UZ_DEFAULT = "⚠️ Cleano: «{name}» kompaniyasining obunasi {end_date} sanasida tugaydi ({days} kun qoldi). Sayt va botga kirishni yo'qotmaslik uchun tarifni to'lang."
+_SUB_REMINDER_TEXT_RU_DEFAULT = "Cleano: до окончания тарифа компании «{name}» осталось {days} дн. (истекает {end_date}). Просим произвести оплату, чтобы сохранить доступ к сайту и боту."
+_SUB_REMINDER_TEXT_UZ_DEFAULT = "Cleano: «{name}» kompaniyasining tarif muddati {days} kun ichida tugaydi (tugash sanasi: {end_date}). Sayt va botga kirishni saqlab qolish uchun to'lovni amalga oshirishingizni so'raymiz."
 
 async def _send_subscription_reminders():
     """Ежедневная рассылка напоминаний об истечении подписки — всем компаниям сразу
