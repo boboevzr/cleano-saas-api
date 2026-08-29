@@ -1156,6 +1156,8 @@ async def get_platform_eskiz_balance() -> int | None:
 
 _SUB_REMINDER_TEXT_RU_DEFAULT = "Cleano: до окончания тарифа компании «{name}» осталось {days} дн. (истекает {end_date}). Просим произвести оплату, чтобы сохранить доступ к сайту и боту."
 _SUB_REMINDER_TEXT_UZ_DEFAULT = "Cleano: «{name}» kompaniyasining tarif muddati {days} kun ichida tugaydi (tugash sanasi: {end_date}). Sayt va botga kirishni saqlab qolish uchun to'lovni amalga oshirishingizni so'raymiz."
+_SUB_REMINDER_TEXT_EXPIRED_RU_DEFAULT = "Cleano: тариф компании «{name}» истёк {days} дн. назад ({end_date}). Через {days_to_close} дн. доступ к сайту и боту будет полностью закрыт. Пожалуйста, произведите оплату как можно скорее."
+_SUB_REMINDER_TEXT_EXPIRED_UZ_DEFAULT = "Cleano: «{name}» kompaniyasining tarifi {days} kun oldin tugadi ({end_date}). {days_to_close} kundan so'ng sayt va botga kirish to'liq yopiladi. Iltimos, imkon qadar tezroq to'lovni amalga oshiring."
 
 async def _send_subscription_reminders():
     """Ежедневная рассылка напоминаний об истечении подписки — всем компаниям сразу
@@ -1170,6 +1172,8 @@ async def _send_subscription_reminders():
         return
     text_ru = await db.get_config("subscription_reminder_text_ru") or _SUB_REMINDER_TEXT_RU_DEFAULT
     text_uz = await db.get_config("subscription_reminder_text_uz") or _SUB_REMINDER_TEXT_UZ_DEFAULT
+    text_expired_ru = await db.get_config("subscription_reminder_text_expired_ru") or _SUB_REMINDER_TEXT_EXPIRED_RU_DEFAULT
+    text_expired_uz = await db.get_config("subscription_reminder_text_expired_uz") or _SUB_REMINDER_TEXT_EXPIRED_UZ_DEFAULT
     bot_token = await db.get_config("cleano_bot_token")
     today = datetime.now(timezone.utc).date()
 
@@ -1184,8 +1188,15 @@ async def _send_subscription_reminders():
         days_left = (sub["end_date"] - today).days
         if not (-days_after <= days_left <= days_before):
             continue
-        ctx = {"name": c["name"], "end_date": sub["end_date"].strftime("%d.%m.%Y"), "days": abs(days_left)}
-        msg = f"{text_ru.format(**ctx)}\n\n{text_uz.format(**ctx)}"
+        # days_left < 0 — тариф уже истёк: отдельный текст с обратным отсчётом до полного
+        # закрытия доступа (days_to_close), не тот же "до истечения осталось N дней".
+        if days_left < 0:
+            ctx = {"name": c["name"], "end_date": sub["end_date"].strftime("%d.%m.%Y"),
+                   "days": abs(days_left), "days_to_close": days_after - abs(days_left)}
+            msg = f"{text_expired_ru.format(**ctx)}\n\n{text_expired_uz.format(**ctx)}"
+        else:
+            ctx = {"name": c["name"], "end_date": sub["end_date"].strftime("%d.%m.%Y"), "days": days_left}
+            msg = f"{text_ru.format(**ctx)}\n\n{text_uz.format(**ctx)}"
         if sms_on and c.get("contact_phone"):
             try:
                 await send_platform_sms(c["contact_phone"], msg)
@@ -11482,6 +11493,7 @@ CLEANO_CONFIG_KEYS = [
     "subscription_reminder_days_before", "subscription_reminder_days_after",
     "subscription_reminder_sms_enabled", "subscription_reminder_tg_enabled",
     "subscription_reminder_text_ru", "subscription_reminder_text_uz",
+    "subscription_reminder_text_expired_ru", "subscription_reminder_text_expired_uz",
     "subscription_reminder_time",
     "platform_eskiz_email", "platform_eskiz_from",
 ]
@@ -11508,6 +11520,8 @@ class SaasGlobalSettingsRequest(BaseModel):
     subscription_reminder_tg_enabled:  str | None = None
     subscription_reminder_text_ru:     str | None = None
     subscription_reminder_text_uz:     str | None = None
+    subscription_reminder_text_expired_ru: str | None = None
+    subscription_reminder_text_expired_uz: str | None = None
     subscription_reminder_time:        str | None = None
     platform_eskiz_email:    str | None = None
     platform_eskiz_password: str | None = None
