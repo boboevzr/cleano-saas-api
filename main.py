@@ -1159,17 +1159,21 @@ _SUB_REMINDER_TEXT_UZ_DEFAULT = "Cleano: «{name}» kompaniyasining tarif muddat
 _SUB_REMINDER_TEXT_EXPIRED_RU_DEFAULT = "Cleano: тариф компании «{name}» истёк {days} дн. назад ({end_date}). Через {days_to_close} дн. доступ к сайту и боту будет полностью закрыт. Пожалуйста, произведите оплату как можно скорее."
 _SUB_REMINDER_TEXT_EXPIRED_UZ_DEFAULT = "Cleano: «{name}» kompaniyasining tarifi {days} kun oldin tugadi ({end_date}). {days_to_close} kundan so'ng sayt va botga kirish to'liq yopiladi. Iltimos, imkon qadar tezroq to'lovni amalga oshiring."
 
-async def _send_subscription_reminders():
+async def _send_subscription_reminders() -> list[dict]:
     """Ежедневная рассылка напоминаний об истечении подписки — всем компаниям сразу
     (настройки глобальные, не per-company), от N дней ДО истечения до M дней ПОСЛЕ.
     company_id=1 (ARTEZ) — исключение, как и везде в подписочной логике (см.
-    is_subscription_active/get_next_order_num)."""
+    is_subscription_active/get_next_order_num). Возвращает список результатов по
+    каждой компании В ОКНЕ рассылки — используется и воркером (просто логирует),
+    и ручным "Отправить сейчас" из superadmin.html для диагностики "почему не пришло"
+    (нет contact_phone/contact_tg_id, канал выключен, ошибка отправки и т.д.)."""
+    results: list[dict] = []
     days_before = int(await db.get_config("subscription_reminder_days_before") or "5")
     days_after  = int(await db.get_config("subscription_reminder_days_after") or "5")
     sms_on = (await db.get_config("subscription_reminder_sms_enabled")) != "false"
     tg_on  = (await db.get_config("subscription_reminder_tg_enabled")) != "false"
     if not sms_on and not tg_on:
-        return
+        return results
     text_ru = await db.get_config("subscription_reminder_text_ru") or _SUB_REMINDER_TEXT_RU_DEFAULT
     text_uz = await db.get_config("subscription_reminder_text_uz") or _SUB_REMINDER_TEXT_UZ_DEFAULT
     text_expired_ru = await db.get_config("subscription_reminder_text_expired_ru") or _SUB_REMINDER_TEXT_EXPIRED_RU_DEFAULT
@@ -1197,16 +1201,31 @@ async def _send_subscription_reminders():
         else:
             ctx = {"name": c["name"], "end_date": sub["end_date"].strftime("%d.%m.%Y"), "days": days_left}
             msg = f"{text_ru.format(**ctx)}\n\n{text_uz.format(**ctx)}"
-        if sms_on and c.get("contact_phone"):
-            try:
-                await send_platform_sms(c["contact_phone"], msg)
-            except Exception as e:
-                logging.warning(f"subscription reminder SMS to company {cid} failed: {e}")
-        if tg_on and c.get("contact_tg_id") and bot_token:
-            try:
-                await _cleano_bot_send(bot_token, c["contact_tg_id"], msg)
-            except Exception as e:
-                logging.warning(f"subscription reminder TG to company {cid} failed: {e}")
+        row = {"company_id": cid, "company_name": c["name"], "days_left": days_left,
+               "sms": "skipped", "tg": "skipped"}
+        if sms_on:
+            if not c.get("contact_phone"):
+                row["sms"] = "no_phone"
+            else:
+                try:
+                    row["sms"] = "sent" if await send_platform_sms(c["contact_phone"], msg) else "failed"
+                except Exception as e:
+                    logging.warning(f"subscription reminder SMS to company {cid} failed: {e}")
+                    row["sms"] = "failed"
+        if tg_on:
+            if not c.get("contact_tg_id"):
+                row["tg"] = "no_telegram"
+            elif not bot_token:
+                row["tg"] = "no_bot_token"
+            else:
+                try:
+                    await _cleano_bot_send(bot_token, c["contact_tg_id"], msg)
+                    row["tg"] = "sent"
+                except Exception as e:
+                    logging.warning(f"subscription reminder TG to company {cid} failed: {e}")
+                    row["tg"] = "failed"
+        results.append(row)
+    return results
 
 
 async def _subscription_reminder_worker():
@@ -11553,6 +11572,17 @@ async def saas_update_global_settings(req: SaasGlobalSettingsRequest, _=Depends(
 async def saas_platform_eskiz_balance(_=Depends(get_superadmin)):
     balance = await get_platform_eskiz_balance()
     return {"ok": True, "balance": balance}
+
+
+@app.post("/api/saas/subscription-reminders/run-now")
+async def saas_run_subscription_reminders_now(_=Depends(get_superadmin)):
+    """Ручной запуск рассылки, в обход расписания воркера — он спит до заранее
+    вычисленной цели и не подхватывает смену subscription_reminder_time мгновенно
+    (только на следующем витке после текущего сна). Возвращает результат по каждой
+    компании в окне рассылки — видно, кому отправлено и почему нет (нет телефона/
+    Telegram, канал выключен, ошибка отправки)."""
+    results = await _send_subscription_reminders()
+    return {"ok": True, "results": results}
 
 
 @app.get("/api/saas/public-settings")
