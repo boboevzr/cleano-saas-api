@@ -151,6 +151,7 @@ async def startup():
     await db.ensure_sms_operator_prices()
     await db.ensure_saas_schema()
     asyncio.create_task(_sms_dispatch_worker())
+    asyncio.create_task(_subscription_reminder_worker())
     # Webhook не нужен — бот работает в режиме polling (ARTEZ-BOT сервис на Railway)
     # if BOT_TOKEN and APP_URL:
     #     asyncio.create_task(_set_tg_webhook())
@@ -1057,6 +1058,135 @@ async def send_sms(phone: str, message: str) -> bool:
             body = await resp.text()
             logging.error(f"❌ Eskiz SMS error: {resp.status} {body}")
             return False
+
+
+_platform_eskiz_token = ""
+
+async def _platform_eskiz_get_token() -> str:
+    """Токен отдельного, ПЛАТФОРМЕННОГО Eskiz-аккаунта (platform_eskiz_*, настраивается
+    в superadmin.html) — используется ТОЛЬКО для напоминаний об оплате подписки, не для
+    SMS отдельных компаний (у send_sms/_eskiz_get_token свой, per-company аккаунт через
+    _cid()). Слать напоминание об истёкшей подписке через Eskiz САМОЙ этой компании было
+    бы нелогично — её аккаунт может быть не настроен, особенно если она как раз не платит."""
+    global _platform_eskiz_token
+    email    = await db.get_config("platform_eskiz_email")
+    password = await db.get_config("platform_eskiz_password")
+    if not email or not password:
+        return await db.get_config("platform_eskiz_token") or ""
+    token = _platform_eskiz_token or await db.get_config("platform_eskiz_token") or ""
+    async with aiohttp.ClientSession() as session:
+        if token:
+            resp = await session.patch(
+                "https://notify.eskiz.uz/api/auth/refresh",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status == 200:
+                data = await resp.json()
+                new_token = data.get("data", {}).get("token", token)
+                if new_token != token:
+                    token = new_token
+                    await db.set_config("platform_eskiz_token", token)
+                _platform_eskiz_token = token
+                return token
+        resp = await session.post(
+            "https://notify.eskiz.uz/api/auth/login",
+            data={"email": email, "password": password},
+        )
+        if resp.status == 200:
+            data = await resp.json()
+            token = data.get("data", {}).get("token", "")
+            if token:
+                await db.set_config("platform_eskiz_token", token)
+                _platform_eskiz_token = token
+        else:
+            body = await resp.text()
+            logging.error(f"❌ Platform Eskiz login failed: {resp.status} {body}")
+    return token
+
+
+async def send_platform_sms(phone: str, message: str) -> bool:
+    email    = await db.get_config("platform_eskiz_email")
+    password = await db.get_config("platform_eskiz_password")
+    if not email or not password:
+        logging.warning("⚠️ platform_eskiz_email/password не заданы — SMS не отправлен")
+        return False
+    token = await _platform_eskiz_get_token()
+    if not token:
+        logging.error("❌ Platform Eskiz: не удалось получить токен")
+        return False
+    mobile = phone.lstrip("+")
+    from_sender = await db.get_config("platform_eskiz_from") or ""
+    async with aiohttp.ClientSession() as session:
+        resp = await session.post(
+            "https://notify.eskiz.uz/api/message/sms/send",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"mobile_phone": mobile, "message": message, "from": from_sender},
+        )
+        if resp.status == 200:
+            return True
+        body = await resp.text()
+        logging.error(f"❌ Platform Eskiz SMS error: {resp.status} {body}")
+        return False
+
+
+_SUB_REMINDER_TEXT_RU_DEFAULT = "⚠️ Cleano: подписка компании «{name}» истекает {end_date} (осталось {days} дн.). Оплатите тариф, чтобы не потерять доступ к сайту и боту."
+_SUB_REMINDER_TEXT_UZ_DEFAULT = "⚠️ Cleano: «{name}» kompaniyasining obunasi {end_date} sanasida tugaydi ({days} kun qoldi). Sayt va botga kirishni yo'qotmaslik uchun tarifni to'lang."
+
+async def _send_subscription_reminders():
+    """Ежедневная рассылка напоминаний об истечении подписки — всем компаниям сразу
+    (настройки глобальные, не per-company), от N дней ДО истечения до M дней ПОСЛЕ.
+    company_id=1 (ARTEZ) — исключение, как и везде в подписочной логике (см.
+    is_subscription_active/get_next_order_num)."""
+    days_before = int(await db.get_config("subscription_reminder_days_before") or "5")
+    days_after  = int(await db.get_config("subscription_reminder_days_after") or "5")
+    sms_on = (await db.get_config("subscription_reminder_sms_enabled")) != "false"
+    tg_on  = (await db.get_config("subscription_reminder_tg_enabled")) != "false"
+    if not sms_on and not tg_on:
+        return
+    text_ru = await db.get_config("subscription_reminder_text_ru") or _SUB_REMINDER_TEXT_RU_DEFAULT
+    text_uz = await db.get_config("subscription_reminder_text_uz") or _SUB_REMINDER_TEXT_UZ_DEFAULT
+    bot_token = await db.get_config("cleano_bot_token")
+    today = datetime.now(timezone.utc).date()
+
+    companies = await db.get_all_companies()
+    for c in companies:
+        cid = c["id"]
+        if cid == 1:
+            continue
+        sub = await db.get_saas_subscription(cid)
+        if not sub or not sub.get("end_date"):
+            continue
+        days_left = (sub["end_date"] - today).days
+        if not (-days_after <= days_left <= days_before):
+            continue
+        ctx = {"name": c["name"], "end_date": sub["end_date"].strftime("%d.%m.%Y"), "days": abs(days_left)}
+        msg = f"{text_ru.format(**ctx)}\n\n{text_uz.format(**ctx)}"
+        if sms_on and c.get("contact_phone"):
+            try:
+                await send_platform_sms(c["contact_phone"], msg)
+            except Exception as e:
+                logging.warning(f"subscription reminder SMS to company {cid} failed: {e}")
+        if tg_on and c.get("contact_tg_id") and bot_token:
+            try:
+                await _cleano_bot_send(bot_token, c["contact_tg_id"], msg)
+            except Exception as e:
+                logging.warning(f"subscription reminder TG to company {cid} failed: {e}")
+
+
+async def _subscription_reminder_worker():
+    from datetime import timezone as _tz, timedelta as _td
+    _TZ5 = _tz(_td(hours=5))
+    while True:
+        from datetime import datetime as _dt
+        now = _dt.now(_TZ5)
+        target = now.replace(hour=10, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target = target + _td(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            await _send_subscription_reminders()
+        except Exception as e:
+            logging.warning(f"subscription reminder error: {e}")
 
 
 def _order_num_short(order_num: str) -> str:
@@ -11314,9 +11444,13 @@ CLEANO_CONFIG_KEYS = [
     "cleano_phone", "cleano_telegram", "cleano_instagram", "cleano_facebook", "cleano_whatsapp",
     "cleano_office_lat", "cleano_office_lng", "cleano_office_address", "cleano_bot_username",
     "cleano_about_ru", "cleano_about_uz",
+    "subscription_reminder_days_before", "subscription_reminder_days_after",
+    "subscription_reminder_sms_enabled", "subscription_reminder_tg_enabled",
+    "subscription_reminder_text_ru", "subscription_reminder_text_uz",
+    "platform_eskiz_email", "platform_eskiz_from",
 ]
 # Секретные ключи Cleano — доступны только суперадмину, НИКОГДА не попадают в public-settings
-CLEANO_SECRET_CONFIG_KEYS = ["cleano_bot_token"]
+CLEANO_SECRET_CONFIG_KEYS = ["cleano_bot_token", "platform_eskiz_password"]
 
 class SaasGlobalSettingsRequest(BaseModel):
     yandex_maps_key: str | None = None
@@ -11332,6 +11466,15 @@ class SaasGlobalSettingsRequest(BaseModel):
     cleano_bot_token:      str | None = None
     cleano_about_ru:       str | None = None
     cleano_about_uz:       str | None = None
+    subscription_reminder_days_before: str | None = None
+    subscription_reminder_days_after:  str | None = None
+    subscription_reminder_sms_enabled: str | None = None
+    subscription_reminder_tg_enabled:  str | None = None
+    subscription_reminder_text_ru:     str | None = None
+    subscription_reminder_text_uz:     str | None = None
+    platform_eskiz_email:    str | None = None
+    platform_eskiz_password: str | None = None
+    platform_eskiz_from:     str | None = None
 
 @app.get("/api/saas/global-settings")
 async def saas_get_global_settings(_=Depends(get_superadmin)):
