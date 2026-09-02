@@ -1234,10 +1234,17 @@ async def _send_subscription_reminders() -> list[dict]:
     return results
 
 
+_sub_reminder_wake = asyncio.Event()
+
 async def _subscription_reminder_worker():
     """Время отправки читается из настроек ЗАНОВО на каждом витке (не при старте
     процесса) — чтобы суперадмин мог поменять его в superadmin.html, и это применилось
-    без рестарта сервиса на следующий же расчёт цели сна."""
+    без рестарта сервиса на следующий же расчёт цели сна. Само ожидание — не голый
+    asyncio.sleep, а wait_for на _sub_reminder_wake: сохранение subscription_reminder_time
+    в saas_update_global_settings делает .set() на этот event и будит воркер РАНЬШЕ конца
+    сна, чтобы он сразу пересчитал цель по новому времени — иначе смена времени применялась
+    бы только после того, как ТЕКУЩИЙ (уже вычисленный по старому времени) сон естественно
+    закончится, что могло занять до 24 часов."""
     from datetime import timezone as _tz, timedelta as _td
     _TZ5 = _tz(_td(hours=5))
     while True:
@@ -1253,7 +1260,15 @@ async def _subscription_reminder_worker():
         target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if now >= target:
             target = target + _td(days=1)
-        await asyncio.sleep((target - now).total_seconds())
+        try:
+            await asyncio.wait_for(_sub_reminder_wake.wait(), timeout=(target - now).total_seconds())
+        except asyncio.TimeoutError:
+            pass
+        _sub_reminder_wake.clear()
+        if _dt.now(_TZ5) < target:
+            # разбужены досрочно сменой времени, а не концом сна — просто пересчитываем
+            # цель на следующем витке, ничего не шлём раньше срока
+            continue
         try:
             await _send_subscription_reminders()
         except Exception as e:
@@ -11573,6 +11588,8 @@ async def saas_update_global_settings(req: SaasGlobalSettingsRequest, _=Depends(
     webhook_result = None
     if req.cleano_bot_token is not None and req.cleano_bot_token.strip():
         webhook_result = await _cleano_bot_set_webhook(req.cleano_bot_token.strip())
+    if req.subscription_reminder_time is not None:
+        _sub_reminder_wake.set()
     return {"ok": True, "webhook": webhook_result}
 
 
