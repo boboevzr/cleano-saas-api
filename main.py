@@ -1198,9 +1198,11 @@ async def _send_subscription_reminders() -> list[dict]:
             ctx = {"name": c["name"], "end_date": sub["end_date"].strftime("%d.%m.%Y"),
                    "days": abs(days_left), "days_to_close": days_after - abs(days_left)}
             msg = f"{text_expired_ru.format(**ctx)}\n\n{text_expired_uz.format(**ctx)}"
+            sms_msg = text_expired_uz.format(**ctx)
         else:
             ctx = {"name": c["name"], "end_date": sub["end_date"].strftime("%d.%m.%Y"), "days": days_left}
             msg = f"{text_ru.format(**ctx)}\n\n{text_uz.format(**ctx)}"
+            sms_msg = text_uz.format(**ctx)
         row = {"company_id": cid, "company_name": c["name"], "days_left": days_left,
                "sms": "skipped", "tg": "skipped"}
         if sms_on:
@@ -1208,7 +1210,11 @@ async def _send_subscription_reminders() -> list[dict]:
                 row["sms"] = "no_phone"
             else:
                 try:
-                    row["sms"] = "sent" if await send_platform_sms(c["contact_phone"], msg) else "failed"
+                    # Eskiz модерирует SMS ПОСИМВОЛЬНО — склеенный RU+UZ текст никогда не
+                    # совпадёт с одобренным шаблоном, поэтому в SMS уходит только UZ
+                    # (единственный язык, который сейчас реально прошёл модерацию в Eskiz).
+                    # В Telegram (msg ниже) ограничения нет — там остаётся двуязычный текст.
+                    row["sms"] = "sent" if await send_platform_sms(c["contact_phone"], sms_msg) else "failed"
                 except Exception as e:
                     logging.warning(f"subscription reminder SMS to company {cid} failed: {e}")
                     row["sms"] = "failed"
