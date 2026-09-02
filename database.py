@@ -9909,7 +9909,7 @@ async def get_all_companies():
     async with pool.acquire() as conn:
         return await conn.fetch("""
             SELECT c.id, c.name, c.slug, c.plan, c.max_branches, c.max_staff, c.active, c.created_at, c.archived_at,
-                   c.contact_name, c.contact_phone, c.contact_email, c.inn, c.legal_name, c.address, c.notes, c.logo_url,
+                   c.contact_name, c.contact_phone, c.contact_tg_id, c.contact_email, c.inn, c.legal_name, c.address, c.notes, c.logo_url,
                    s.end_date AS sub_end_date, s.status AS sub_status
             FROM companies c
             LEFT JOIN LATERAL (
