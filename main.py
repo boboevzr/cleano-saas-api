@@ -11168,6 +11168,8 @@ async def saas_create_company(req: CompanyCreateRequest, _=Depends(get_superadmi
             await db.consume_cleano_phone_verification(normalized_phone)
             phone_linked = True
         await db.update_company(company["id"], update_fields)
+        if verification and verification.get("tg_id"):
+            await db.clear_stale_cleano_tg_link(verification["tg_id"], company["id"])
 
     plan = await db.get_saas_plan_by_slug(req.plan)
     if plan:
@@ -11723,11 +11725,22 @@ _CLN_T = {
         "support_title": "📞 <b>Поддержка Cleano</b>",
         "support_empty": "Контакты пока не заполнены суперадмином.",
         "not_linked": "⚠️ Telegram ещё не привязан ни к одной компании.",
+        "company_title": "🏠 <b>Моя компания</b>",
         "plan_label": "📦 Тариф",
         "trial_days": "⏳ Демо-доступ — осталось {n} дн.",
         "trial_generic": "⏳ Демо-доступ",
         "full_until": "✅ Полный доступ до {d}",
         "full_generic": "✅ Полный доступ",
+        "period_label": "📅 Доступ с {s} по {e}",
+        "contact_name_label": "👤 Ответственное лицо",
+        "company_phone_label": "📞 Телефон компании",
+        "branches_label": "🏢 Филиалы ({n})",
+        "no_branches": "🏢 Филиалы не добавлены",
+        "branch_no_phone": "без номера",
+        "groups_label": "💬 Telegram-группы и каналы",
+        "group_line": "Группа",
+        "channel_line": "Канал",
+        "admin_line": "Админ-группа",
         "share_prompt": "Поделитесь контактом кнопкой ниже, чтобы подтвердить/перепривязать номер.",
         "share_btn": "📱 Поделиться номером",
         "btn_register": "📝 Начать регистрацию",
@@ -11750,11 +11763,22 @@ _CLN_T = {
         "support_title": "📞 <b>Cleano qo'llab-quvvatlash</b>",
         "support_empty": "Superadmin hali kontaktlarni to'ldirmagan.",
         "not_linked": "⚠️ Telegram hali birorta kompaniyaga ulanmagan.",
+        "company_title": "🏠 <b>Mening kompaniyam</b>",
         "plan_label": "📦 Tarif",
         "trial_days": "⏳ Demo-kirish — {n} kun qoldi.",
         "trial_generic": "⏳ Demo-kirish",
         "full_until": "✅ To'liq kirish {d} gacha",
         "full_generic": "✅ To'liq kirish",
+        "period_label": "📅 Kirish muddati: {s} — {e}",
+        "contact_name_label": "👤 Mas'ul shaxs",
+        "company_phone_label": "📞 Kompaniya telefoni",
+        "branches_label": "🏢 Filiallar ({n})",
+        "no_branches": "🏢 Filiallar qo'shilmagan",
+        "branch_no_phone": "raqamsiz",
+        "groups_label": "💬 Telegram guruh va kanallar",
+        "group_line": "Guruh",
+        "channel_line": "Kanal",
+        "admin_line": "Admin-guruh",
         "share_prompt": "Raqamni tasdiqlash/qayta ulash uchun pastdagi tugma orqali kontaktingizni ulashing.",
         "share_btn": "📱 Raqamni ulashish",
         "btn_register": "📝 Ro'yxatdan o'tishni boshlash",
@@ -11867,6 +11891,7 @@ async def _cleano_send_main_menu(token: str, chat_id, lang: str, clear_keyboard:
         # компания узнавалась как обычно (get_company_by_contact_tg_id).
         matched = await db.get_company_by_phone(own_phone)
         if matched and not matched["contact_tg_id"]:
+            await db.clear_stale_cleano_tg_link(chat_id, matched["id"])
             await db.update_company(matched["id"], {"contact_tg_id": chat_id})
             company = await db.get_company(matched["id"])
     t = _CLN_T[lang]
@@ -11887,13 +11912,16 @@ async def _cleano_send_main_menu(token: str, chat_id, lang: str, clear_keyboard:
 
 
 async def _cleano_company_info_text(company: dict, lang: str) -> str:
+    import json as _json
     from datetime import date
     t = _CLN_T[lang]
     sub = await db.get_saas_subscription(company["id"])
-    lines = [f"🏢 <b>{company['name']}</b>"]
+    lines = [t["company_title"], "", f"🏢 <b>{company['name']}</b>"]
     if sub:
         lines.append(f"{t['plan_label']}: {sub.get('plan_name') or sub.get('plan_slug') or company.get('plan')}")
-        end_date = sub.get("end_date")
+        start_date, end_date = sub.get("start_date"), sub.get("end_date")
+        if start_date and end_date:
+            lines.append(t["period_label"].format(s=start_date.strftime('%d.%m.%Y'), e=end_date.strftime('%d.%m.%Y')))
         if sub.get("status") == "trial":
             days_left = (end_date - date.today()).days if end_date else None
             lines.append(t["trial_days"].format(n=max(days_left, 0)) if days_left is not None else t["trial_generic"])
@@ -11901,8 +11929,36 @@ async def _cleano_company_info_text(company: dict, lang: str) -> str:
             lines.append(t["full_until"].format(d=end_date.strftime('%d.%m.%Y')) if end_date else t["full_generic"])
     else:
         lines.append(f"{t['plan_label']}: {company.get('plan', '—')}")
+    if company.get("contact_name"):
+        lines.append(f"{t['contact_name_label']}: {company['contact_name']}")
     if company.get("contact_phone"):
-        lines.append(f"📞 {company['contact_phone']}")
+        lines.append(f"{t['company_phone_label']}: {company['contact_phone']}")
+
+    branches = await db.get_branches(company["id"])
+    lines.append("")
+    lines.append(t["branches_label"].format(n=len(branches)) if branches else t["no_branches"])
+    for b in branches:
+        name = (b["name_uz"] or b["name_ru"]) if lang == "uz" else b["name_ru"]
+        raw_phones = b["phones"]
+        try:
+            raw_phones = _json.loads(raw_phones) if isinstance(raw_phones, str) else (raw_phones or [])
+        except (TypeError, ValueError):
+            raw_phones = []
+        phone_nums = [p.get("n") for p in raw_phones if isinstance(p, dict) and p.get("n")]
+        lines.append(f"• {name}: {', '.join(phone_nums) if phone_nums else t['branch_no_phone']}")
+
+    tg_lines = []
+    if company.get("tg_group_link"):
+        tg_lines.append(f"{t['group_line']}: {company['tg_group_link']}")
+    if company.get("tg_channel_link"):
+        tg_lines.append(f"{t['channel_line']}: {company['tg_channel_link']}")
+    if company.get("tg_admin_link"):
+        tg_lines.append(f"{t['admin_line']}: {company['tg_admin_link']}")
+    if tg_lines:
+        lines.append("")
+        lines.append(t["groups_label"])
+        lines.extend(tg_lines)
+
     return "\n".join(lines)
 
 
@@ -11973,6 +12029,7 @@ async def cleano_tg_webhook(request: Request):
         # привязываем Telegram НАПРЯМУЮ к указанной компании, а не через сопоставление по номеру.
         pending_company_id = await db.get_pending_company_link(chat_id)
         if pending_company_id:
+            await db.clear_stale_cleano_tg_link(chat_id, pending_company_id)
             await db.update_company(pending_company_id, {"contact_tg_id": chat_id})
             await db.consume_pending_company_link(chat_id)
             company = await db.get_company(pending_company_id)

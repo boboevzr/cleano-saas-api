@@ -9955,6 +9955,20 @@ async def get_company_by_contact_tg_id(tg_id: int):
             "SELECT id, name, slug FROM companies WHERE contact_tg_id=$1 ORDER BY id DESC LIMIT 1", tg_id
         )
 
+
+async def clear_stale_cleano_tg_link(tg_id: int, keep_company_id: int):
+    """Один Telegram-аккаунт может быть привязан только к ОДНОЙ компании — перед тем как
+    привязать его к keep_company_id, снимаем эту привязку с любой другой компании, у
+    которой она осталась от предыдущей привязки (переиспользование тестового номера между
+    компаниями, повторная привязка после смены владельца и т.п.). Без этого две компании
+    могли бы одновременно хранить один и тот же contact_tg_id, и get_company_by_contact_tg_id
+    возвращала бы не ту, что была привязана только что, а ту, что с большим id."""
+    if not pool: return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE companies SET contact_tg_id=NULL WHERE contact_tg_id=$1 AND id<>$2",
+            tg_id, keep_company_id)
+
 async def create_company(name: str, slug: str, secret_key: str,
                           plan: str = "starter", max_branches: int = 5, max_staff: int = 50):
     if not pool: return None
