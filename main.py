@@ -11352,19 +11352,38 @@ async def saas_impersonate_company(company_id: int, _=Depends(get_superadmin)):
     return {"ok": True, "token": token, "company_name": c["name"], "slug": c["slug"]}
 
 
-@app.get("/api/saas/companies/{company_id}/telegram-link")
-async def saas_company_telegram_link(company_id: int, _=Depends(get_superadmin)):
-    """Персистентная ссылка t.me/<bot>?start=company_<id> — суперадмин отправляет её клиенту
-    (WhatsApp/SMS/лично), клиент открывает бота и делится контактом, чтобы привязать Telegram
-    к своей компании (без этого доступ к admin.html заблокирован)."""
+async def _saas_company_telegram_link(company_id: int, force_new: bool):
     c = await db.get_company(company_id)
     if not c:
         raise HTTPException(status_code=404, detail="Компания не найдена")
     bot_username = await db.get_config("cleano_bot_username")
     if not bot_username:
         raise HTTPException(status_code=503, detail="Username Cleano-бота не настроен в Глобальных настройках")
-    link = f"https://t.me/{bot_username}?start=company_{company_id}"
+    token = None if force_new else c["tg_link_token"]
+    if not token:
+        token = secrets.token_urlsafe(16)
+        await db.update_company(company_id, {"tg_link_token": token})
+    link = f"https://t.me/{bot_username}?start=company_{company_id}_{token}"
     return {"ok": True, "link": link, "linked": bool(c["contact_tg_id"])}
+
+@app.get("/api/saas/companies/{company_id}/telegram-link")
+async def saas_company_telegram_link(company_id: int, _=Depends(get_superadmin)):
+    """Персистентная ссылка t.me/<bot>?start=company_<id>_<token> — суперадмин отправляет её
+    клиенту (WhatsApp/SMS/лично), клиент открывает бота и делится контактом, чтобы привязать
+    Telegram к своей компании (без этого доступ к admin.html заблокирован).
+
+    Токен ОБЯЗАТЕЛЕН — без него company_id (последовательное число, легко перебирается)
+    сам по себе был бы единственной "защитой" ссылки: любой, кто угадает/переберёт id
+    другой компании, мог бы поделиться СВОИМ контактом и привязать её Telegram-канал себе,
+    получая чужие уведомления и видя чужие данные компании ("Моя компания" в боте).
+    Токен генерируется один раз и переиспользуется, пока не запросят регенерацию явно."""
+    return await _saas_company_telegram_link(company_id, force_new=False)
+
+@app.post("/api/saas/companies/{company_id}/telegram-link/regenerate")
+async def saas_company_telegram_link_regenerate(company_id: int, _=Depends(get_superadmin)):
+    """Инвалидирует старую ссылку (если её кто-то мог увидеть/переслать не туда) —
+    старый токен просто перезаписывается, старая ссылка с ним перестаёт работать."""
+    return await _saas_company_telegram_link(company_id, force_new=True)
 
 
 @app.get("/api/saas/companies/{company_id}/config")
@@ -12071,12 +12090,17 @@ async def cleano_tg_webhook(request: Request):
     # Персистентная ссылка суперадмина: /start company_<id> — редкий, инициированный
     # суперадмином путь (оставлен двуязычным как раньше, без гейта по выбору языка).
     if text.startswith("/start company_"):
+        payload = text.split("company_", 1)[1].strip()
+        id_part, _, given_token = payload.partition("_")
         try:
-            target_company_id = int(text.split("company_", 1)[1].strip())
-        except (IndexError, ValueError):
+            target_company_id = int(id_part)
+        except ValueError:
             target_company_id = None
         company = await db.get_company(target_company_id) if target_company_id else None
-        if not company:
+        # given_token обязателен и должен совпадать с company['tg_link_token'] — иначе
+        # голого company_id (последовательное число) хватило бы, чтобы перебором привязать
+        # ЧУЖУЮ компанию к своему Telegram-аккаунту (см. фикс 2026-09-02).
+        if not company or not company.get("tg_link_token") or given_token != company["tg_link_token"]:
             await _cleano_bot_send(token, chat_id, "⚠️ Havola noto'g'ri yoki eskirgan.\n\n⚠️ Ссылка неверна или устарела.")
             return {"ok": True}
         await db.save_pending_company_link(chat_id, target_company_id)

@@ -139,6 +139,7 @@ async def create_tables():
         ALTER TABLE companies ADD COLUMN IF NOT EXISTS tg_admin_id     BIGINT       DEFAULT NULL;
         ALTER TABLE companies ADD COLUMN IF NOT EXISTS logo_url        TEXT         DEFAULT NULL;
         ALTER TABLE companies ADD COLUMN IF NOT EXISTS archived_at     TIMESTAMPTZ  DEFAULT NULL;
+        ALTER TABLE companies ADD COLUMN IF NOT EXISTS tg_link_token   TEXT         DEFAULT NULL;
         CREATE TABLE IF NOT EXISTS branches (
             id                   SERIAL PRIMARY KEY,
             company_id           INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -9993,7 +9994,7 @@ async def update_company(company_id: int, updates: dict) -> bool:
     allowed = {"name", "slug", "secret_key", "plan", "max_branches", "max_staff", "active", "timezone", "trial_days",
                "legal_name", "inn", "address", "contact_name", "contact_phone", "contact_email", "notes",
                "whatsapp", "instagram", "tg_group_link", "tg_group_id", "tg_channel_link", "tg_channel_id",
-               "tg_admin_link", "tg_admin_id", "logo_url", "contact_tg_id"}
+               "tg_admin_link", "tg_admin_id", "logo_url", "contact_tg_id", "tg_link_token"}
     fields = {k: v for k, v in updates.items() if k in allowed}
     if not fields: return True
     cols = ", ".join(f"{k}=${i+2}" for i, k in enumerate(fields))
