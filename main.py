@@ -1154,9 +1154,9 @@ async def get_platform_eskiz_balance() -> int | None:
         return None
 
 
-_SUB_REMINDER_TEXT_RU_DEFAULT = "Cleano: до окончания тарифа компании «{name}» осталось {days} дн. (истекает {end_date}). Просим произвести оплату, чтобы сохранить доступ к сайту и боту."
+_SUB_REMINDER_TEXT_RU_DEFAULT = 'Cleano: do okonchaniya tarifa "{name}" ostalos {days} dn. (do {end_date}). Prosim oplatit, chtoby sohranit dostup k saytu i botu.'
 _SUB_REMINDER_TEXT_UZ_DEFAULT = "Cleano: «{name}» kompaniyasining tarif muddati {days} kun ichida tugaydi (tugash sanasi: {end_date}). Sayt va botga kirishni saqlab qolish uchun to'lovni amalga oshirishingizni so'raymiz."
-_SUB_REMINDER_TEXT_EXPIRED_RU_DEFAULT = "Cleano: тариф компании «{name}» истёк {days} дн. назад ({end_date}). Через {days_to_close} дн. доступ к сайту и боту будет полностью закрыт. Пожалуйста, произведите оплату как можно скорее."
+_SUB_REMINDER_TEXT_EXPIRED_RU_DEFAULT = 'Cleano: tarif "{name}" istek {days} dn. nazad ({end_date}). Cherez {days_to_close} dn. dostup budet zakryt. Prosim oplatit poskoree.'
 _SUB_REMINDER_TEXT_EXPIRED_UZ_DEFAULT = "Cleano: «{name}» kompaniyasining tarifi {days} kun oldin tugadi ({end_date}). {days_to_close} kundan so'ng sayt va botga kirish to'liq yopiladi. Iltimos, imkon qadar tezroq to'lovni amalga oshiring."
 
 async def _send_subscription_reminders() -> list[dict]:
