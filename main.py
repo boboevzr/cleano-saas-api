@@ -1441,6 +1441,14 @@ async def get_optional_user(authorization: str = Header(None)):
         return None
 
 
+async def _reject_if_subscription_closed(company_id: int):
+    """Полное закрытие доступа к admin.html после истечения грейс-периода неоплаченной
+    подписки — см. db.is_subscription_hard_closed. Общий helper для всех точек входа
+    (staff-логин, admin-логин, уже выданные токены) — единая формулировка сообщения."""
+    if await db.is_subscription_hard_closed(company_id):
+        raise HTTPException(status_code=402,
+            detail="Доступ закрыт — тариф компании не оплачен. Свяжитесь с Cleano для продления.")
+
 async def get_current_staff(authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Не авторизован")
@@ -1454,6 +1462,7 @@ async def get_current_staff(authorization: str = Header(None)):
     # Admin panel token — resolve to real admin staff record (company_id from JWT)
     if payload.get("sub") == "admin":
         company_id = payload.get("company_id", 1)
+        await _reject_if_subscription_closed(company_id)
         admin_staff = await db.get_company_admin_staff(company_id)
         if admin_staff:
             return dict(admin_staff)
@@ -1468,6 +1477,7 @@ async def get_current_staff(authorization: str = Header(None)):
     s = dict(staff)
     # company_id from DB record (authoritative), fallback to token claim
     s.setdefault("company_id", payload.get("company_id", 1))
+    await _reject_if_subscription_closed(s["company_id"])
     return s
 
 
@@ -1592,6 +1602,8 @@ async def staff_login(req: StaffLoginRequest):
 
     if not valid:
         raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+
+    await _reject_if_subscription_closed(company_id)
 
     token = create_staff_token(staff["id"], staff["login"], staff["role"],
                                company_id=staff.get("company_id") or 1)
@@ -4229,6 +4241,7 @@ async def get_admin(authorization: str = Header(None)):
             raise HTTPException(status_code=403, detail="Нет доступа")
     except JWTError:
         raise HTTPException(status_code=401, detail="Недействительный токен")
+    await _reject_if_subscription_closed(payload.get("company_id", 1))
     return True
 
 @app.post("/api/admin/login")
@@ -4248,6 +4261,7 @@ async def admin_login(req: AdminLoginRequest):
         raise HTTPException(status_code=401, detail="Неверный логин или пароль")
     if not pwd_context.verify(req.password[:72], staff["password_hash"]):
         raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+    await _reject_if_subscription_closed(company_id)
     if staff["role"] == "admin":
         token = create_admin_token(company_id)
     else:
@@ -8681,6 +8695,11 @@ async def get_site_settings(company_slug: str = None):
         sms_registration_available = balance is not None and balance >= 1000
     result["sms_registration_available"] = sms_registration_available
 
+    # Полное закрытие доступа за неоплату (см. db.is_subscription_hard_closed) — отдельный
+    # от site_maintenance_mode флаг: причина другая (неоплата, не "ещё не настроено"),
+    # фронтенд показывает отдельный текст оверлея (site-common.js).
+    result["subscription_closed"] = await db.is_subscription_hard_closed(cid)
+
     return {"ok": True, "settings": result}
 
 
@@ -12228,6 +12247,25 @@ async def order_bot_webhook(secret: str, request: Request):
         raise HTTPException(status_code=403, detail="Invalid secret token")
     db.set_request_company(company_id)
     body = await request.json()
+
+    # Полное закрытие доступа за неоплату — проверяем ПЕРЕД тоглом техработ (другая причина,
+    # другое сообщение; см. db.is_subscription_hard_closed / result["subscription_closed"]
+    # для сайта). Владелец не может выключить это тоглом — только оплатой (продлевает
+    # суперадмин вручную, см. решение в памяти сессии).
+    if await db.is_subscription_hard_closed(company_id):
+        chat_id = ((body.get("message") or {}).get("chat") or {}).get("id") \
+            or (((body.get("callback_query") or {}).get("message") or {}).get("chat") or {}).get("id")
+        if chat_id:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    await s.post(f"https://api.telegram.org/bot{token}/sendMessage", json={
+                        "chat_id": chat_id,
+                        "text": "🔒 Доступ закрыт — тариф компании не оплачен.\n\n"
+                                "🔒 Kompaniya tarifi to'lanmagani uchun kirish yopildi.",
+                    }, timeout=aiohttp.ClientTimeout(total=8))
+            except Exception as e:
+                logging.warning(f"order_bot subscription-closed notice error: {e}")
+        return {"ok": True}
 
     # Тогл "техработ" бота (см. site_maintenance_mode для сайта — тот же смысл, отдельный
     # ключ, т.к. сайт и бот компания может включать/выключать независимо). У новой компании

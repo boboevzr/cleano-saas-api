@@ -10765,6 +10765,33 @@ async def is_subscription_active(company_id: int) -> bool:
     return row["end_date"] >= date.today()
 
 
+async def is_subscription_hard_closed(company_id: int) -> bool:
+    """Полное закрытие доступа (сайт + бот + вход в admin.html) — наступает не сразу
+    в день истечения (см. is_subscription_active — та мягкая проверка блокирует только
+    СОЗДАНИЕ новых лидов/заказов), а через subscription_reminder_days_after дней ПОСЛЕ
+    окончания подписки — тот же грейс-период, что обещает SMS/TG-напоминание
+    ('через {days_to_close} дн. доступ будет полностью закрыт', см. _send_subscription_reminders
+    в main.py). company_id=1 (ARTEZ) — исключение, как и везде в подписочной логике."""
+    if company_id == 1:
+        return False
+    if not pool: return False
+    from datetime import date
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT end_date FROM saas_subscriptions
+            WHERE company_id=$1
+            ORDER BY created_at DESC LIMIT 1
+        """, company_id)
+    if not row or not row["end_date"]:
+        return False
+    days_after_str = await get_config("subscription_reminder_days_after")
+    try:
+        days_after = int(days_after_str) if days_after_str else 5
+    except ValueError:
+        days_after = 5
+    return (date.today() - row["end_date"]).days > days_after
+
+
 async def get_saas_subscription(company_id: int):
     """Текущая активная (или последняя) подписка компании с данными плана."""
     if not pool: return None
