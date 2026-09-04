@@ -4004,15 +4004,18 @@ async def my_order_items(order_num: str, user = Depends(get_current_user)):
     order = await db.get_order_by_num_and_phone(order_num, user["phone"], cid)
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден")
-    items = await db.get_order_items(order["id"])
+    billing = await db.get_order_items_billing(order["id"])
     safe = [{
         "id": it["id"], "service": it["service"],
         "service_ru": it.get("service_ru"), "service_uz": it.get("service_uz"),
         "width_cm": it.get("width_cm"), "length_cm": it.get("length_cm"),
         "sqm": it.get("sqm"), "price_per_sqm": it.get("price_per_sqm"),
         "total_sum": it.get("total_sum"), "measure_status": it.get("measure_status"),
-    } for it in items]
-    return {"ok": True, "items": safe}
+        # Досчёт до минимума по позиции/заказу — см. db.get_order_items_billing
+        "billed_sqm": it.get("billed_sqm"), "pos_min": it.get("pos_min"),
+        "pos_clamped": it.get("pos_clamped"), "billed_total": it.get("billed_total"),
+    } for it in billing["items"]]
+    return {"ok": True, "items": safe, "groups": billing["groups"], "order_total": billing["order_total"]}
 
 
 @app.get("/api/orders/{order_num}/photos")

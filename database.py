@@ -3221,6 +3221,80 @@ async def get_orders_items_totals(order_ids: list[int]) -> dict[int, float]:
     return totals
 
 
+async def get_order_items_billing(order_id: int) -> dict:
+    """Позиции заказа с детализацией мин.по.позиции/мин.по.заказу — та же логика
+    расчёта, что get_orders_items_totals() (см. её комментарий), но возвращает
+    ДЕТАЛИЗАЦИЮ по каждой позиции и группе услуг, а не только итог по заказу —
+    для клиентского личного кабинета (показать, что и почему досчитано до минимума),
+    старая функция для списка заказов сознательно не тронута."""
+    if not pool:
+        return {"items": [], "groups": [], "order_total": 0.0}
+    async with pool.acquire() as conn:
+        items = await conn.fetch(
+            "SELECT id, service, service_ru, service_uz, width_cm, length_cm, sqm, "
+            "price_per_sqm, total_sum, measure_status FROM order_items "
+            "WHERE order_id = $1 ORDER BY id", order_id)
+    prices = await get_all_prices()
+    ru_map, uz_map = await _price_match_maps()
+
+    def find_match(it):
+        return (ru_map.get(it["service_ru"]) or uz_map.get(it["service_uz"])
+                or ru_map.get(it["service"]) or uz_map.get(it["service"]))
+
+    enriched = []
+    groups: dict = {}
+    order_total = 0.0
+
+    for it in items:
+        sqm   = float(it["sqm"] or 0)
+        price = float(it["price_per_sqm"] or 0)
+        raw_total = float(it["total_sum"] or 0)
+        m = find_match(it)
+        catalog = prices.get(m[0], {}).get(m[1]) if m else None
+        pos_min = float(catalog["min_order"]) if (catalog and catalog.get("min_order")) else None
+        pos_clamped = bool(pos_min and sqm and sqm < pos_min)
+        billed_sqm = pos_min if pos_clamped else sqm
+        billed_total = (billed_sqm * price) if (billed_sqm and price) else raw_total
+
+        row = dict(it)
+        row["billed_sqm"] = billed_sqm
+        row["pos_min"] = pos_min
+        row["pos_clamped"] = pos_clamped
+        row["billed_total"] = billed_total
+        enriched.append(row)
+
+        if it["service"]:
+            gkey = it["service_ru"] or (f"{m[0]}::{m[1]}" if m else it["service"])
+            g = groups.setdefault(gkey, {
+                "label": it["service_ru"] or it["service"],
+                "billed_sqm": 0.0, "raw_sqm": 0.0, "count": 0,
+                "billed_amount": 0.0, "match": m,
+            })
+            g["billed_sqm"]    += billed_sqm
+            g["raw_sqm"]       += sqm
+            g["count"]         += 1
+            g["billed_amount"] += billed_total
+        else:
+            order_total += raw_total
+
+    group_list = []
+    for gkey, g in groups.items():
+        m = g["match"]
+        catalog = prices.get(m[0], {}).get(m[1]) if m else None
+        group_min = float(catalog["min_order_total"]) if (catalog and catalog.get("min_order_total")) else None
+        price = float(catalog["price"]) if (catalog and catalog.get("price")) else None
+        qty = g["billed_sqm"] if g["billed_sqm"] > 0 else g["count"]
+        group_clamped = bool(group_min and qty < group_min and price)
+        group_amount = (group_min * price) if group_clamped else g["billed_amount"]
+        group_list.append({
+            "label": g["label"], "billed_sqm": g["billed_sqm"], "raw_sqm": g["raw_sqm"],
+            "min_order_total": group_min, "group_clamped": group_clamped, "amount": group_amount,
+        })
+        order_total += group_amount
+
+    return {"items": enriched, "groups": group_list, "order_total": order_total}
+
+
 async def get_admin_orders(status: str = None, statuses: list = None, branch: str = None,
                             limit: int = 50, offset: int = 0):
     """Список заказов с постраничностью, всегда scoped на company_id. statuses (набор,
