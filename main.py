@@ -7250,7 +7250,7 @@ async def admin_measure_item(order_id: int, item_id: int, staff=Depends(get_curr
         media = await db.get_item_media(item_id)
         if not media:
             raise HTTPException(status_code=400, detail="Добавьте фото или видео замера")
-        item = await db.submit_item_measure(item_id)
+        item = await db.submit_item_measure(item_id, staff.get("id"))
         if not item:
             raise HTTPException(status_code=400, detail="Ошибка при отправке на проверку")
         sname = f"{staff.get('last_name','')} {staff.get('first_name','')}".strip() or staff.get('login','')
@@ -7284,24 +7284,30 @@ async def admin_measure_item(order_id: int, item_id: int, staff=Depends(get_curr
         else:
             item = await db.approve_item_measure(item_id)
         try:
-            washer_login = item.get("washer_login")
-            if washer_login:
-                washer = await db.get_staff_by_login(washer_login)
-                if washer:
-                    order_row = await db.get_order_by_id(order_id)
-                    order_num = (order_row or {}).get("order_num") or f"#{order_id}"
-                    svc       = item.get("service") or "позиция"
-                    push_body = f"«{svc}» — замер принят. Отличная работа!"
-                    asyncio.create_task(send_web_push(
-                        washer["id"],
-                        f"✅ Замер утверждён — {order_num}",
-                        push_body,
-                        order_id=order_id, item_id=item_id, push_type="measure_approved"
-                    ))
-                    await db.create_washer_notification(
-                        washer["id"], order_id, order_num, push_body,
-                        item_id=item_id, notification_type="measure_approved"
-                    )
+            # measure_submitted_by — тот, кто реально отправил замер на проверку;
+            # washer_login (НАЗНАЧЕННЫЙ мойщик) — резерв только для позиций,
+            # отправленных ДО этого фикса (у них measure_submitted_by ещё NULL).
+            recipient_id = item.get("measure_submitted_by")
+            if not recipient_id:
+                washer_login = item.get("washer_login")
+                if washer_login:
+                    washer = await db.get_staff_by_login(washer_login)
+                    recipient_id = washer["id"] if washer else None
+            if recipient_id:
+                order_row = await db.get_order_by_id(order_id)
+                order_num = (order_row or {}).get("order_num") or f"#{order_id}"
+                svc       = item.get("service") or "позиция"
+                push_body = f"«{svc}» — замер принят. Отличная работа!"
+                asyncio.create_task(send_web_push(
+                    recipient_id,
+                    f"✅ Замер утверждён — {order_num}",
+                    push_body,
+                    order_id=order_id, item_id=item_id, push_type="measure_approved"
+                ))
+                await db.create_washer_notification(
+                    recipient_id, order_id, order_num, push_body,
+                    item_id=item_id, notification_type="measure_approved"
+                )
         except Exception as _pe:
             logging.warning(f"measure approved push error: {_pe}")
     elif action == "direct_approve":
@@ -7316,24 +7322,27 @@ async def admin_measure_item(order_id: int, item_id: int, staff=Depends(get_curr
             raise HTTPException(status_code=400, detail="Укажите причину отклонения")
         item = await db.reject_item_measure(item_id, note)
         try:
-            washer_login = item.get("washer_login")
-            if washer_login:
-                washer = await db.get_staff_by_login(washer_login)
-                if washer:
-                    order_row = await db.get_order_by_id(order_id)
-                    order_num = (order_row or {}).get("order_num") or f"#{order_id}"
-                    svc = item.get("service") or "позиция"
-                    push_body = f"«{svc}» — {note}"
-                    asyncio.create_task(send_web_push(
-                        washer["id"],
-                        f"❌ Замер отклонён — {order_num}",
-                        push_body,
-                        order_id=order_id, item_id=item_id, push_type="measure_rejected"
-                    ))
-                    await db.create_washer_notification(
-                        washer["id"], order_id, order_num, push_body,
-                        item_id=item_id, notification_type="measure_rejected"
-                    )
+            recipient_id = item.get("measure_submitted_by")
+            if not recipient_id:
+                washer_login = item.get("washer_login")
+                if washer_login:
+                    washer = await db.get_staff_by_login(washer_login)
+                    recipient_id = washer["id"] if washer else None
+            if recipient_id:
+                order_row = await db.get_order_by_id(order_id)
+                order_num = (order_row or {}).get("order_num") or f"#{order_id}"
+                svc = item.get("service") or "позиция"
+                push_body = f"«{svc}» — {note}"
+                asyncio.create_task(send_web_push(
+                    recipient_id,
+                    f"❌ Замер отклонён — {order_num}",
+                    push_body,
+                    order_id=order_id, item_id=item_id, push_type="measure_rejected"
+                ))
+                await db.create_washer_notification(
+                    recipient_id, order_id, order_num, push_body,
+                    item_id=item_id, notification_type="measure_rejected"
+                )
         except Exception as _pe:
             logging.warning(f"measure reject push error: {_pe}")
     else:

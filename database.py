@@ -400,6 +400,7 @@ async def create_tables():
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS deadline DATE DEFAULT NULL",
         # Замеры: причина отклонения
         "ALTER TABLE order_items ADD COLUMN IF NOT EXISTS reject_note TEXT DEFAULT NULL",
+        "ALTER TABLE order_items ADD COLUMN IF NOT EXISTS measure_submitted_by INTEGER REFERENCES staff(id) ON DELETE SET NULL DEFAULT NULL",
         # Название услуги на обоих языках (заполняется при сохранении из справочника —
         # раньше service хранил готовую строку на языке интерфейса сотрудника в момент
         # сохранения, из-за чего позиции показывались вперемешку RU/UZ клиенту)
@@ -6775,14 +6776,19 @@ async def reject_payment(payment_id: int, rejected_by: int, note: str = "") -> d
             await _recalc_payment_status(conn, row["order_id"])
         return dict(row) if row else {}
 
-async def submit_item_measure(item_id: int) -> dict:
+async def submit_item_measure(item_id: int, submitted_by: int | None = None) -> dict:
+    """submitted_by — кто реально нажал "Отправить на проверку" (staff_id текущего
+    пользователя) — запоминаем отдельно от washer_login (это НАЗНАЧЕННЫЙ мойщик,
+    может отличаться от того, кто фактически замерил и отправил, если позицию
+    переназначали); уведомление об утверждении/отклонении должно идти именно
+    отправителю, см. approve/reject в main.py."""
     if not pool: return {}
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            UPDATE order_items SET measure_status='submitted', reject_note=NULL
+            UPDATE order_items SET measure_status='submitted', reject_note=NULL, measure_submitted_by=$2
             WHERE id=$1 AND sqm IS NOT NULL
             RETURNING *
-        """, item_id)
+        """, item_id, submitted_by)
         return dict(row) if row else {}
 
 async def approve_item_measure(item_id: int) -> dict:
