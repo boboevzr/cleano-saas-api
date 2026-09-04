@@ -5387,8 +5387,12 @@ async def preview_receipt(body: dict, _=Depends(get_admin)):
 
 @app.get("/api/admin/orders/{order_id}/items")
 async def admin_get_order_items(order_id: int, _=Depends(get_current_staff)):
-    items = await db.get_order_items(order_id)
-    return {"ok": True, "items": items}
+    # get_order_items_billing — та же логика мин.по.позиции/мин.по.заказу, что и в
+    # клиентском кабинете (см. db.get_order_items_billing); карточка заказа в admin.html
+    # раньше просто суммировала total_sum по позициям, вообще без учёта минимумов —
+    # расходилась и со списком заказов (get_orders_items_totals), и с реальным счётом.
+    billing = await db.get_order_items_billing(order_id)
+    return {"ok": True, "items": billing["items"], "groups": billing["groups"], "order_total": billing["order_total"]}
 
 class OrderItemRequest(BaseModel):
     service: str

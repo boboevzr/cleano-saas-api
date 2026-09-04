@@ -3232,9 +3232,7 @@ async def get_order_items_billing(order_id: int) -> dict:
         return {"items": [], "groups": [], "order_total": 0.0}
     async with pool.acquire() as conn:
         items = await conn.fetch(
-            "SELECT id, service, service_ru, service_uz, width_cm, length_cm, sqm, "
-            "price_per_sqm, total_sum, measure_status FROM order_items "
-            "WHERE order_id = $1 ORDER BY id", order_id)
+            "SELECT * FROM order_items WHERE order_id = $1 ORDER BY id", order_id)
     prices = await get_all_prices()
     ru_map, uz_map = await _price_match_maps()
 
@@ -3247,15 +3245,20 @@ async def get_order_items_billing(order_id: int) -> dict:
     order_total = 0.0
 
     for it in items:
-        sqm   = float(it["sqm"] or 0)
+        # Эффективные размер/сумма — та же формула, что COALESCE(actual_total_sum,
+        # price_per_sqm*COALESCE(actual_sqm,sqm)), используемая по всей базе для
+        # реальных денежных расчётов (см. get_daily_cash_summary и т.п.): если менеджер
+        # скорректировал замер (actual_sqm/actual_total_sum), клампинг и итог считаются
+        # ПО СКОРРЕКТИРОВАННЫМ значениям, а не по изначально сданным sqm/total_sum.
         price = float(it["price_per_sqm"] or 0)
-        raw_total = float(it["total_sum"] or 0)
+        eff_sqm = float(it["actual_sqm"]) if it["actual_sqm"] is not None else float(it["sqm"] or 0)
+        eff_total = float(it["actual_total_sum"]) if it["actual_total_sum"] is not None else (eff_sqm * price)
         m = find_match(it)
         catalog = prices.get(m[0], {}).get(m[1]) if m else None
         pos_min = float(catalog["min_order"]) if (catalog and catalog.get("min_order")) else None
-        pos_clamped = bool(pos_min and sqm and sqm < pos_min)
-        billed_sqm = pos_min if pos_clamped else sqm
-        billed_total = (billed_sqm * price) if (billed_sqm and price) else raw_total
+        pos_clamped = bool(pos_min and eff_sqm and eff_sqm < pos_min)
+        billed_sqm = pos_min if pos_clamped else eff_sqm
+        billed_total = (billed_sqm * price) if (billed_sqm and price) else eff_total
 
         row = dict(it)
         row["billed_sqm"] = billed_sqm
@@ -3272,11 +3275,11 @@ async def get_order_items_billing(order_id: int) -> dict:
                 "billed_amount": 0.0, "match": m,
             })
             g["billed_sqm"]    += billed_sqm
-            g["raw_sqm"]       += sqm
+            g["raw_sqm"]       += eff_sqm
             g["count"]         += 1
             g["billed_amount"] += billed_total
         else:
-            order_total += raw_total
+            order_total += eff_total
 
     group_list = []
     for gkey, g in groups.items():
@@ -3288,7 +3291,7 @@ async def get_order_items_billing(order_id: int) -> dict:
         group_clamped = bool(group_min and qty < group_min and price)
         group_amount = (group_min * price) if group_clamped else g["billed_amount"]
         group_list.append({
-            "label": g["label"], "billed_sqm": g["billed_sqm"], "raw_sqm": g["raw_sqm"],
+            "label": g["label"], "billed_sqm": g["billed_sqm"], "raw_sqm": g["raw_sqm"], "count": g["count"],
             "min_order_total": group_min, "group_clamped": group_clamped, "amount": group_amount,
         })
         order_total += group_amount
