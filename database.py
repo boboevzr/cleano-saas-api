@@ -6277,17 +6277,30 @@ async def get_tg_clients(search: str = "", limit: int = 200) -> list[dict]:
         return [dict(r) for r in rows]
 
 async def upsert_push_subscription(staff_id: int, endpoint: str, p256dh: str, auth: str):
-    # NB: конфликт по (staff_id, endpoint), а не по endpoint одному — иначе один
-    # физический браузер, использованный для входа под разными staff_id (включая
-    # разные компании в SaaS), "крал" бы подписку друг у друга при переподписке
-    # (см. комментарий у CREATE UNIQUE INDEX idx_push_staff_endpoint).
+    # Один физический endpoint (браузер/устройство) технически может доставить
+    # push только ОДНОМУ логическому владельцу за раз — composite UNIQUE(staff_id,
+    # endpoint) позволял НЕСКОЛЬКИМ staff_id (в т.ч. из разных компаний в SaaS)
+    # держать подписку на один и тот же endpoint одновременно, но т.к.
+    # initWebPush() на фронте переиспользует уже существующую PushManager-
+    # подписку браузера (getSubscription() перед subscribe()), это приводило к
+    # тому, что push, адресованный ОДНОМУ сотруднику, физически доставлялся на
+    # общее устройство и был виден любому, кто ранее подписывался с него —
+    # включая утечку между компаниями (см. зеркальный фикс в проде, ARTEZ-1226,
+    # 2026-09-05). При входе/переподписке endpoint теперь явно переходит к
+    # текущему сотруднику — старые записи других staff_id на этом же endpoint
+    # удаляются, так что физическое устройство в любой момент "принадлежит"
+    # ровно одному staff_id (тому, кто последним залогинился на нём).
     if not pool: return
     async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO push_subscriptions (staff_id, endpoint, p256dh, auth)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (staff_id, endpoint) DO UPDATE SET p256dh=$3, auth=$4
-        """, staff_id, endpoint, p256dh, auth)
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM push_subscriptions WHERE endpoint=$1 AND staff_id<>$2",
+                endpoint, staff_id)
+            await conn.execute("""
+                INSERT INTO push_subscriptions (staff_id, endpoint, p256dh, auth)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (staff_id, endpoint) DO UPDATE SET p256dh=$3, auth=$4
+            """, staff_id, endpoint, p256dh, auth)
 
 async def get_push_subscriptions(staff_id: int):
     if not pool: return []
