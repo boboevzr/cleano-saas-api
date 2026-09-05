@@ -3293,6 +3293,7 @@ async def get_order_items_billing(order_id: int) -> dict:
         group_list.append({
             "label": g["label"], "billed_sqm": g["billed_sqm"], "raw_sqm": g["raw_sqm"], "count": g["count"],
             "min_order_total": group_min, "group_clamped": group_clamped, "amount": group_amount,
+            "unit_key": (catalog or {}).get("unit_key") or "m2",
         })
         order_total += group_amount
 

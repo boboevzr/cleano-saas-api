@@ -4775,6 +4775,16 @@ async def admin_get_prices(_=Depends(get_admin)):
     prices = await db.get_all_prices()
     return {"ok": True, "prices": prices}
 
+@app.get("/api/staff/prices")
+async def staff_get_prices(_=Depends(get_current_staff)):
+    """Company-scoped прайс-лист для НЕ-admin ролей (мойщик/менеджер/callcenter) — staff.html
+    раньше для этого дёргал публичный /api/prices без company_slug и токена, который в
+    таком случае молча отдаёт прайс company_id=1 (см. фикс staffRenderItems). get_admin
+    сюда не подходит — доступен только роли admin, а карточку заказа/добавление позиций
+    используют и остальные роли; get_current_staff резолвит company_id из их же JWT."""
+    prices = await db.get_all_prices()
+    return {"ok": True, "prices": prices}
+
 @app.put("/api/admin/prices")
 async def admin_set_price(req: SetPriceRequest, _=Depends(get_admin)):
     if not req.service_key.strip():
@@ -4801,6 +4811,12 @@ async def get_services_public(company_slug: str = None):
 
 @app.get("/api/admin/services")
 async def admin_get_services(_=Depends(get_admin)):
+    svcs = await db.get_services()
+    return {"ok": True, "services": svcs}
+
+@app.get("/api/staff/services")
+async def staff_get_services(_=Depends(get_current_staff)):
+    """Company-scoped справочник услуг для не-admin ролей — см. /api/staff/prices рядом."""
     svcs = await db.get_services()
     return {"ok": True, "services": svcs}
 
