@@ -6649,6 +6649,27 @@ async def reject_payment(order_id: int, payment_id: int,
     return {"ok": True, "payment": row}
 
 
+def _sniff_media_type(content: bytes, file_path: str = "") -> str:
+    """Определяет Content-Type по магическим байтам, а не по расширению в
+    file_path из Telegram — для части чеков (напр. photos/file_*.jpg,
+    отданных TG без нормального расширения) ext-проверка давала "" →
+    application/octet-stream, и Chrome вместо показа в новом окне скачивал
+    файл без расширения (зеркало прод-фикса, 2026-09-05)."""
+    if content[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if content[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if content[4:8] == b"ftyp":
+        return "video/mp4"
+    if content[:4] == b"GIF8":
+        return "image/gif"
+    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+    return ("video/mp4" if ext in ("mp4", "mov", "avi") else
+            "image/jpeg" if ext in ("jpg", "jpeg") else
+            "image/png"  if ext == "png" else
+            "image/jpeg")  # чек почти всегда фото — безопаснее показать, чем скачать бинарник
+
+
 @app.get("/api/admin/orders/{order_id}/payments/{payment_id}/receipt-file")
 async def get_receipt_file(order_id: int, payment_id: int, staff=Depends(get_current_staff)):
     """Возвращает URL для просмотра чека через TG."""
@@ -6677,13 +6698,9 @@ async def get_receipt_file(order_id: int, payment_id: int, staff=Depends(get_cur
             file_path = data["result"]["file_path"]
             file_url  = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
             # Проксируем содержимое — браузер не может напрямую читать TG-файлы (CORS)
-            ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
-            ctype = ("video/mp4" if ext in ("mp4","mov","avi") else
-                     "image/jpeg" if ext in ("jpg","jpeg") else
-                     "image/png"  if ext == "png" else
-                     "application/octet-stream")
             async with s.get(file_url, timeout=aiohttp.ClientTimeout(total=30)) as fr:
                 content = await fr.read()
+        ctype = _sniff_media_type(content, file_path)
         return StreamingResponse(iter([content]), media_type=ctype,
                                  headers={"Content-Disposition": "inline"})
     except HTTPException:
@@ -6718,11 +6735,9 @@ async def get_driver_payment_receipt(payment_id: int, _=Depends(get_current_staf
                 raise HTTPException(status_code=404, detail="Файл не найден в TG")
             file_path = data["result"]["file_path"]
             file_url  = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-            ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
-            ctype = ("image/jpeg" if ext in ("jpg","jpeg") else
-                     "image/png"  if ext == "png" else "image/jpeg")
             async with s.get(file_url, timeout=aiohttp.ClientTimeout(total=30)) as fr:
                 content = await fr.read()
+        ctype = _sniff_media_type(content, file_path)
         return StreamingResponse(iter([content]), media_type=ctype,
                                  headers={"Content-Disposition": "inline"})
     except HTTPException:
