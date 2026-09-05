@@ -11235,6 +11235,12 @@ async def _provision_company(name: str, slug: str, plan: str, max_branches: int,
     await db.set_config_for_company("site_maintenance_mode", "true", company["id"])
     await db.set_config_for_company("bot_maintenance_mode", "true", company["id"])
 
+    # Видео-карточка на сайте: глобальный дефолт SITE_SETTINGS_DEFAULTS — "hero"
+    # (старое поведение для компаний, ни разу не трогавших этот тумблер), но для
+    # НОВЫХ компаний нужен именно плавающий виджет — ставим явно, как и остальные
+    # дефолты новой компании выше.
+    await db.set_config_for_company("site_video_placement", "floating", company["id"])
+
     return company, credentials, secret_key
 
 
