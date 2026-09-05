@@ -5266,11 +5266,21 @@ async def get_crm_client_orders(phone: str, limit: int = 20) -> list[dict]:
     cid = _cid()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT order_num, source, service, status, created_at, total_price, branch, address
+            SELECT id, order_num, source, service, status, created_at, total_price, branch, address
             FROM orders WHERE client_phone = $1 AND company_id=$3
             ORDER BY created_at DESC LIMIT $2
         """, phone, limit, cid)
-        return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    # total_price — сырое поле, проставляется один раз при создании заказа (быстрые заявки
+    # с сайта) и никогда не пересчитывается из order_items — для заказов с измеряемыми
+    # позициями часто NULL, и в любом случае без учёта мин.по.позиции/по.заказу. Подменяем
+    # на клампингованный итог из order_items, если он есть (та же get_orders_items_totals,
+    # что и в списке заказов) — иначе история в карточке клиента расходится со списком.
+    totals = await get_orders_items_totals([r["id"] for r in result])
+    for r in result:
+        if r["id"] in totals:
+            r["total_price"] = totals[r["id"]]
+    return result
 
 
 async def get_crm_clients_count() -> dict:
