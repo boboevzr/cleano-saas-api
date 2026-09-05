@@ -6952,7 +6952,16 @@ async def get_route(route_id: int) -> dict | None:
             WHERE ro.route_id=$1
             ORDER BY ro.sort_order, ro.id
         """, route_id)
-        route["stops"] = [dict(s) for s in stops]
+        stops_list = [dict(s) for s in stops]
+        # items_total выше — сырой SUM(price_per_sqm*sqm) без учёта мин.по.позиции/по.заказу
+        # (тот же класс, что уже был в get_admin_orders до фикса) — подменяем на
+        # клампингованный итог, иначе Итого/долг на остановке маршрута занижены для
+        # заказов, попавших под минимум, по сравнению со списком/карточкой заказа.
+        totals = await get_orders_items_totals([s["order_id"] for s in stops_list])
+        for s in stops_list:
+            if s["order_id"] in totals:
+                s["items_total"] = totals[s["order_id"]]
+        route["stops"] = stops_list
         return route
 
 async def update_route(route_id: int, data: dict) -> dict:
