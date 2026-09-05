@@ -377,6 +377,13 @@ async def create_tables():
         "ALTER TABLE leads ADD COLUMN IF NOT EXISTS volunteer_id   INTEGER REFERENCES staff(id)",
         "ALTER TABLE leads ADD COLUMN IF NOT EXISTS converted_order VARCHAR(20)",
         "ALTER TABLE leads ADD COLUMN IF NOT EXISTS lead_code       VARCHAR(20) UNIQUE",
+        # Уведомление в TG-группе о новом лиде: chat_id/message_id/текст сохраняются,
+        # чтобы при взятии лида ЧЕРЕЗ ВЕБ (admin.html/staff.html), а не по кнопке
+        # прямо в Telegram, можно было отредактировать ТО ЖЕ сообщение в группе —
+        # убрать кнопку "Взять лид" и дописать "✅ Взял(а): Имя" (зеркало прод).
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS tg_chat_id      BIGINT DEFAULT NULL",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS tg_message_id   BIGINT DEFAULT NULL",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS tg_msg_text     TEXT   DEFAULT NULL",
         "ALTER TABLE leads DROP CONSTRAINT IF EXISTS leads_status_check",
         "ALTER TABLE leads ADD CONSTRAINT leads_status_check CHECK (status IN ('new','contacted','callback','converted','lost','no_answer'))",
         # Агент: временный пароль
@@ -4880,6 +4887,16 @@ async def get_lead_by_id(lead_id: int):
             LEFT JOIN staff asgn ON asgn.id = l.assigned_to
             WHERE l.id = $1 AND l.company_id = $2
         """, lead_id, cid)
+
+async def set_lead_tg_message(lead_id: int, chat_id: int, message_id: int, text: str):
+    """Сохраняет chat_id/message_id/текст уведомления о лиде в TG-группе — нужно,
+    чтобы отредактировать ЭТО ЖЕ сообщение при взятии лида через веб (см. комментарий
+    у ALTER TABLE leads ADD COLUMN tg_chat_id)."""
+    if not pool: return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE leads SET tg_chat_id=$1, tg_message_id=$2, tg_msg_text=$3 WHERE id=$4",
+            chat_id, message_id, text, lead_id)
 
 # ── lead_calls (журнал звонков) ───────────────────────────────────────
 
