@@ -99,7 +99,13 @@ async def init_db():
     if not DB_URL:
         logging.warning("DATABASE_URL not set, DB disabled")
         return
-    pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
+    # max_size=5 (было) — тот же класс бага, что уронил прод 06.09 (см. artez_api):
+    # asyncpg pool.acquire() не имеет таймаута, при исчерпании пула ЛЮБОЙ запрос к БД
+    # зависает навечно вместо ошибки. Размер пула зависит от числа ОДНОВРЕМЕННЫХ
+    # запросов к БД в моменте, а не от числа компаний-арендаторов в базе — не поднимаем
+    # до сотен, чтобы не упереться в собственный max_connections Postgres (обычно
+    # ограничен на тарифе) и не тратить память на простаивающие соединения.
+    pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=25)
     await create_tables()
     logging.info("✅ API: Database connected")
 
