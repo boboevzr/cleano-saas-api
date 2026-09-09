@@ -8657,6 +8657,22 @@ async def save_delivery_discount(discount: float = Body(..., embed=True), _=Depe
     return {"ok": True, "discount": discount}
 
 
+# Конструктор печати списка заказов (staff.html, кнопка 🖨 в режиме "☑️ Выбрать")
+# — блоки строки на 80мм-ленте, каждый со своим стилем (зеркало прод-фичи,
+# artez_api/main.py). В отличие от receipt_header_text/order_rules это не
+# брендинг компании, а универсальный дефолт макета — хардкодим напрямую,
+# без per-company seed при регистрации.
+_DEFAULT_BULK_PRINT_TEMPLATE = [
+    {"id": "order_num",   "label": "Номер заказа", "enabled": True,  "fontSize": 15, "bold": True,  "italic": False, "underline": False, "fontFamily": "inherit", "marginTop": 0, "marginBottom": 2},
+    {"id": "address",     "label": "Адрес",         "enabled": True,  "fontSize": 15, "bold": True,  "italic": False, "underline": False, "fontFamily": "inherit", "marginTop": 0, "marginBottom": 0, "prefix": "Адрес: "},
+    {"id": "items",       "label": "Позиции",       "enabled": True,  "fontSize": 11, "bold": False, "italic": False, "underline": False, "fontFamily": "inherit", "marginTop": 0, "marginBottom": 0},
+    {"id": "client_name", "label": "ФИО клиента",   "enabled": True,  "fontSize": 14, "bold": True,  "italic": True,  "underline": False, "fontFamily": "inherit", "marginTop": 7, "marginBottom": 0, "prefix": "ФИО: "},
+    {"id": "phone",       "label": "Телефон",       "enabled": True,  "fontSize": 15, "bold": True,  "italic": False, "underline": False, "fontFamily": "inherit", "marginTop": 0, "marginBottom": 0, "prefix": "Тел: "},
+    {"id": "total",       "label": "Итого",         "enabled": True,  "fontSize": 16, "bold": True,  "italic": False, "underline": False, "fontFamily": "inherit", "marginTop": 8, "marginBottom": 0, "prefix": "Итого: "},
+    {"id": "payment",     "label": "Оплачено/К оплате", "enabled": True, "fontSize": 13, "bold": False, "italic": False, "underline": False, "fontFamily": "inherit", "marginTop": 8, "marginBottom": 0},
+    {"id": "separator",   "label": "Разделитель между заказами", "enabled": True, "thickness": 3, "marginTop": 6, "marginBottom": 6},
+]
+
 # ── Настройки сайта ──────────────────────────────────────────
 # Fallback: если в БД пусто — берём env-переменную, затем хардкод
 SITE_SETTINGS_DEFAULTS = {
@@ -8771,6 +8787,8 @@ SITE_SETTINGS_DEFAULTS = {
     # явно ставится "true" в _provision_company — см. комментарий там.
     "site_maintenance_mode": "false",
     "bot_maintenance_mode": "false",
+    # Конструктор печати списка заказов — JSON-массив блоков (см. _DEFAULT_BULK_PRINT_TEMPLATE)
+    "bulk_print_template": _json.dumps(_DEFAULT_BULK_PRINT_TEMPLATE, ensure_ascii=False),
 }
 
 async def _get_cfg(key: str) -> str:
@@ -8901,6 +8919,7 @@ class SiteSettings(BaseModel):
     order_rules:             str | None = None
     site_maintenance_mode:   str | None = None
     bot_maintenance_mode:    str | None = None
+    bulk_print_template:     str | None = None
 
 @app.get("/api/admin/settings/site")
 async def get_admin_site_settings(_=Depends(get_admin)):
@@ -8913,6 +8932,19 @@ async def save_site_settings(body: SiteSettings, _=Depends(get_admin)):
     for key, val in data.items():
         await db.set_config(key, val)
     return {"ok": True}
+
+@app.get("/api/staff/print-template")
+async def get_bulk_print_template(_=Depends(get_current_staff)):
+    """Шаблон печати списка заказов (конструктор в admin.html) — читается
+    staff.html при печати выбранных заказов. Доступен любому авторизованному
+    сотруднику (только чтение), редактируется только из admin.html.
+    _get_cfg уже company-scoped через db.get_config (зеркало прод-фичи)."""
+    raw = await _get_cfg("bulk_print_template")
+    try:
+        blocks = _json.loads(raw) if raw else _DEFAULT_BULK_PRINT_TEMPLATE
+    except Exception:
+        blocks = _DEFAULT_BULK_PRINT_TEMPLATE
+    return {"ok": True, "blocks": blocks}
 
 
 # ── Telegram: шаблоны уведомлений ──────────────────────────────────────
