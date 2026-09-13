@@ -14202,3 +14202,179 @@ async def save_role_permissions(body: dict = Body(...), staff=Depends(get_curren
             _json.dumps(body), company_id
         )
     return {"ok": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  БАЗА ЗНАНИЙ (kb.html) — общая инструкция по admin.html для всех компаний.
+#  Читать может любой залогиненный сотрудник (get_current_staff — принимает и
+#  master-пароль admin.html, и обычный staff-логин), редактирует только
+#  суперадмин из superadmin.html. Скриншоты/видео хранятся тем же приёмом,
+#  что демо-видео/слайды лендинга — через Telegram-канал (см. _get_media_channel),
+#  т.к. у ahost.uz нет "живой" загрузки файлов из работающего приложения.
+# ══════════════════════════════════════════════════════════════════════════
+
+class KbCategoryRequest(BaseModel):
+    slug: str
+    icon: str = "📄"
+    title_ru: str
+    title_uz: str
+    sort_order: int = 0
+
+class KbCategoryUpdateRequest(BaseModel):
+    slug: str | None = None
+    icon: str | None = None
+    title_ru: str | None = None
+    title_uz: str | None = None
+    sort_order: int | None = None
+
+class KbArticleRequest(BaseModel):
+    category_id: int
+    slug: str
+    title_ru: str
+    title_uz: str
+    body_ru: str = "[]"
+    body_uz: str = "[]"
+    sort_order: int = 0
+
+class KbArticleUpdateRequest(BaseModel):
+    category_id: int | None = None
+    slug: str | None = None
+    title_ru: str | None = None
+    title_uz: str | None = None
+    body_ru: str | None = None
+    body_uz: str | None = None
+    sort_order: int | None = None
+
+
+@app.get("/api/kb/categories")
+async def kb_list_categories(_=Depends(get_current_staff)):
+    cats = await db.get_kb_categories()
+    return {"ok": True, "categories": cats}
+
+
+@app.get("/api/kb/articles/{slug}")
+async def kb_get_article(slug: str, _=Depends(get_current_staff)):
+    article = await db.get_kb_article_by_slug(slug)
+    if not article:
+        raise HTTPException(status_code=404, detail="Статья не найдена")
+    return {"ok": True, "article": article}
+
+
+@app.get("/api/kb/media/{file_id}")
+async def kb_get_media(file_id: str, _=Depends(get_current_staff)):
+    """Прокси картинки/видео базы знаний из Telegram по file_id — база знаний
+    доступна только залогиненным, поэтому раздача тоже под staff-авторизацией."""
+    if not BOT_TOKEN:
+        raise HTTPException(status_code=503, detail="Бот не настроен")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+                              params={"file_id": file_id}, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+            if not data.get("ok"):
+                raise HTTPException(status_code=404, detail="Файл не найден в Telegram")
+            file_path = data["result"]["file_path"]
+            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+            async with s.get(file_url, timeout=aiohttp.ClientTimeout(total=60)) as fr:
+                content = await fr.read()
+        from fastapi.responses import StreamingResponse
+        ctype = _sniff_media_type(content, file_path)
+        return StreamingResponse(iter([content]), media_type=ctype,
+                                  headers={"Content-Disposition": "inline"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/superadmin/kb/upload-media")
+async def kb_upload_media(file: UploadFile = File(...), _=Depends(get_superadmin)):
+    """Загружает картинку/видео в Telegram-канал медиа-хранилища, возвращает file_id
+    для вставки в блок статьи (см. KbArticleRequest.body_ru/body_uz)."""
+    ctype = file.content_type or ""
+    if ctype.startswith("image/"):
+        kind = "image"
+    elif ctype.startswith("video/"):
+        kind = "video"
+    else:
+        raise HTTPException(status_code=400, detail="Файл должен быть изображением или видео")
+    media_ch = await _get_media_channel()
+    if not BOT_TOKEN or not media_ch:
+        raise HTTPException(status_code=503, detail="Медиа-хранилище не настроено")
+    file_bytes = await file.read()
+    if len(file_bytes) > MAX_SITE_VIDEO_BYTES:
+        raise HTTPException(status_code=400, detail=f"Файл слишком большой (макс. {MAX_SITE_VIDEO_BYTES//1_000_000} МБ)")
+    form = aiohttp.FormData()
+    form.add_field("chat_id", str(media_ch))
+    field_name = "photo" if kind == "image" else "video"
+    form.add_field(field_name, file_bytes, filename=file.filename or f"kb-{kind}", content_type=ctype)
+    form.add_field("caption", "KB media")
+    async with aiohttp.ClientSession() as s:
+        async with s.post(f"https://api.telegram.org/bot{BOT_TOKEN}/send{field_name.capitalize()}", data=form,
+                           timeout=aiohttp.ClientTimeout(total=60)) as r:
+            result = await r.json()
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=f"Telegram: {result.get('description','upload failed')}")
+    if kind == "image":
+        file_id = result["result"]["photo"][-1]["file_id"]
+    else:
+        file_id = result["result"]["video"]["file_id"]
+    return {"ok": True, "file_id": file_id, "kind": kind}
+
+
+@app.get("/api/superadmin/kb/categories")
+async def sa_kb_list_categories(_=Depends(get_superadmin)):
+    cats = await db.get_kb_categories()
+    return {"ok": True, "categories": cats}
+
+
+@app.post("/api/superadmin/kb/categories")
+async def sa_kb_create_category(req: KbCategoryRequest, _=Depends(get_superadmin)):
+    cat = await db.create_kb_category(req.slug.strip().lower(), req.icon.strip() or "📄",
+                                       req.title_ru.strip(), req.title_uz.strip(), req.sort_order)
+    if not cat:
+        raise HTTPException(status_code=409, detail="Такой slug уже занят")
+    return {"ok": True, "category": cat}
+
+
+@app.put("/api/superadmin/kb/categories/{category_id}")
+async def sa_kb_update_category(category_id: int, req: KbCategoryUpdateRequest, _=Depends(get_superadmin)):
+    fields = {k: v for k, v in req.model_dump(exclude_unset=True).items() if v is not None}
+    ok = await db.update_kb_category(category_id, fields)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Категория не найдена (или slug занят)")
+    return {"ok": True}
+
+
+@app.delete("/api/superadmin/kb/categories/{category_id}")
+async def sa_kb_delete_category(category_id: int, _=Depends(get_superadmin)):
+    ok = await db.delete_kb_category(category_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Категория не найдена")
+    return {"ok": True}
+
+
+@app.post("/api/superadmin/kb/articles")
+async def sa_kb_create_article(req: KbArticleRequest, _=Depends(get_superadmin)):
+    art = await db.create_kb_article(req.category_id, req.slug.strip().lower(), req.title_ru.strip(),
+                                      req.title_uz.strip(), req.body_ru, req.body_uz, req.sort_order)
+    if not art:
+        raise HTTPException(status_code=409, detail="Такой slug уже занят")
+    return {"ok": True, "article": art}
+
+
+@app.put("/api/superadmin/kb/articles/{article_id}")
+async def sa_kb_update_article(article_id: int, req: KbArticleUpdateRequest, _=Depends(get_superadmin)):
+    fields = {k: v for k, v in req.model_dump(exclude_unset=True).items() if v is not None}
+    ok = await db.update_kb_article(article_id, fields)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Статья не найдена (или slug занят)")
+    return {"ok": True}
+
+
+@app.delete("/api/superadmin/kb/articles/{article_id}")
+async def sa_kb_delete_article(article_id: int, _=Depends(get_superadmin)):
+    ok = await db.delete_kb_article(article_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Статья не найдена")
+    return {"ok": True}

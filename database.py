@@ -720,6 +720,29 @@ async def create_tables():
         "ALTER TABLE sms_codes DROP CONSTRAINT IF EXISTS sms_codes_purpose_check",
         "ALTER TABLE sms_codes ADD CONSTRAINT sms_codes_purpose_check "
         "CHECK (purpose IN ('register','login','reset','cleano_register','reset_attempt'))",
+        # База знаний (kb.html) — общая для всех компаний документация по admin.html,
+        # редактируется в superadmin.html. body_ru/body_uz — JSON-массив блоков
+        # [{type:'heading'|'text'|'image'|'video', text?, file_id?}], тот же приём,
+        # что у блоков конструктора печати заказов (bulk_print_template).
+        """CREATE TABLE IF NOT EXISTS kb_categories (
+            id          SERIAL PRIMARY KEY,
+            slug        VARCHAR(60) UNIQUE NOT NULL,
+            icon        VARCHAR(10) DEFAULT '📄',
+            title_ru    VARCHAR(200) NOT NULL,
+            title_uz    VARCHAR(200) NOT NULL,
+            sort_order  INT DEFAULT 0
+        )""",
+        """CREATE TABLE IF NOT EXISTS kb_articles (
+            id           SERIAL PRIMARY KEY,
+            category_id  INT NOT NULL REFERENCES kb_categories(id) ON DELETE CASCADE,
+            slug         VARCHAR(80) UNIQUE NOT NULL,
+            title_ru     VARCHAR(300) NOT NULL,
+            title_uz     VARCHAR(300) NOT NULL,
+            body_ru      TEXT DEFAULT '[]',
+            body_uz      TEXT DEFAULT '[]',
+            sort_order   INT DEFAULT 0,
+            updated_at   TIMESTAMPTZ DEFAULT NOW()
+        )""",
     ]
     async with pool.acquire() as c:
         for sql in other_migrations:
@@ -11056,3 +11079,119 @@ async def add_saas_payment(company_id: int, subscription_id, amount: int,
                     amount, subscription_id
                 )
             return row
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  БАЗА ЗНАНИЙ (kb.html) — общая документация по admin.html для всех компаний.
+#  Редактируется только в superadmin.html, читается любым залогиненным
+#  сотрудником через get_current_staff (см. main.py /api/kb/*).
+# ══════════════════════════════════════════════════════════════════════════
+
+async def get_kb_categories():
+    """Категории с вложенными статьями (только id/slug/title — для навигации)."""
+    if not pool: return []
+    async with pool.acquire() as conn:
+        cats = await conn.fetch(
+            "SELECT id, slug, icon, title_ru, title_uz, sort_order FROM kb_categories ORDER BY sort_order, id")
+        arts = await conn.fetch(
+            "SELECT id, category_id, slug, title_ru, title_uz, sort_order FROM kb_articles ORDER BY sort_order, id")
+    result = []
+    for c in cats:
+        c = dict(c)
+        c["articles"] = [dict(a) for a in arts if a["category_id"] == c["id"]]
+        result.append(c)
+    return result
+
+
+async def get_kb_article_by_slug(slug: str):
+    if not pool: return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM kb_articles WHERE slug=$1", slug)
+        return dict(row) if row else None
+
+
+async def get_kb_article_by_id(article_id: int):
+    if not pool: return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM kb_articles WHERE id=$1", article_id)
+        return dict(row) if row else None
+
+
+async def create_kb_category(slug: str, icon: str, title_ru: str, title_uz: str, sort_order: int = 0):
+    if not pool: return None
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """INSERT INTO kb_categories (slug, icon, title_ru, title_uz, sort_order)
+                   VALUES ($1,$2,$3,$4,$5) RETURNING *""",
+                slug, icon, title_ru, title_uz, sort_order)
+        except asyncpg.UniqueViolationError:
+            return None
+        return dict(row)
+
+
+async def update_kb_category(category_id: int, fields: dict) -> bool:
+    if not pool or not fields: return False
+    allowed = {"slug", "icon", "title_ru", "title_uz", "sort_order"}
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if not fields: return False
+    params = [category_id]
+    set_parts = []
+    for k, v in fields.items():
+        params.append(v)
+        set_parts.append(f"{k}=${len(params)}")
+    async with pool.acquire() as conn:
+        try:
+            result = await conn.execute(
+                f"UPDATE kb_categories SET {', '.join(set_parts)} WHERE id=$1", *params)
+        except asyncpg.UniqueViolationError:
+            return False
+        return result != "UPDATE 0"
+
+
+async def delete_kb_category(category_id: int) -> bool:
+    if not pool: return False
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM kb_categories WHERE id=$1", category_id)
+        return result != "DELETE 0"
+
+
+async def create_kb_article(category_id: int, slug: str, title_ru: str, title_uz: str,
+                             body_ru: str = "[]", body_uz: str = "[]", sort_order: int = 0):
+    if not pool: return None
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """INSERT INTO kb_articles (category_id, slug, title_ru, title_uz, body_ru, body_uz, sort_order)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *""",
+                category_id, slug, title_ru, title_uz, body_ru, body_uz, sort_order)
+        except asyncpg.UniqueViolationError:
+            return None
+        return dict(row)
+
+
+async def update_kb_article(article_id: int, fields: dict) -> bool:
+    if not pool or not fields: return False
+    allowed = {"category_id", "slug", "title_ru", "title_uz", "body_ru", "body_uz", "sort_order"}
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if not fields: return False
+    fields["updated_at"] = datetime.now(timezone.utc)
+    params = [article_id]
+    set_parts = []
+    for k, v in fields.items():
+        params.append(v)
+        set_parts.append(f"{k}=${len(params)}")
+    async with pool.acquire() as conn:
+        try:
+            result = await conn.execute(
+                f"UPDATE kb_articles SET {', '.join(set_parts)} WHERE id=$1", *params)
+        except asyncpg.UniqueViolationError:
+            return False
+        return result != "UPDATE 0"
+
+
+async def delete_kb_article(article_id: int) -> bool:
+    if not pool: return False
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM kb_articles WHERE id=$1", article_id)
+        return result != "DELETE 0"
