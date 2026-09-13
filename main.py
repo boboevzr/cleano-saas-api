@@ -14334,6 +14334,17 @@ async def sa_kb_list_categories(_=Depends(get_superadmin)):
     return {"ok": True, "categories": cats}
 
 
+@app.get("/api/superadmin/kb/articles/{article_id}")
+async def sa_kb_get_article(article_id: int, _=Depends(get_superadmin)):
+    """Полное тело статьи (body_ru/body_uz) для редактора — superadmin-токен
+    (type=superadmin) не проходит get_current_staff, поэтому публичный
+    /api/kb/articles/{slug} суперадмину не подходит, нужен свой эндпоинт."""
+    article = await db.get_kb_article_by_id(article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Статья не найдена")
+    return {"ok": True, "article": article}
+
+
 @app.post("/api/superadmin/kb/categories")
 async def sa_kb_create_category(req: KbCategoryRequest, _=Depends(get_superadmin)):
     cat = await db.create_kb_category(req.slug.strip().lower(), req.icon.strip() or "📄",
