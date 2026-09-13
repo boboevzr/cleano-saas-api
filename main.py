@@ -11380,7 +11380,9 @@ async def saas_create_company(req: CompanyCreateRequest, _=Depends(get_superadmi
             await db.create_saas_subscription(company["id"], plan["id"], start, end,
                                                notes="Создано суперадмином — полный доступ", status="active")
         else:
-            end = start + timedelta(days=14)
+            trial_days = await _get_default_trial_days()
+            end = start + timedelta(days=trial_days)
+            await db.update_company(company["id"], {"trial_days": trial_days})
             await db.create_saas_subscription(company["id"], plan["id"], start, end,
                                                notes="Создано суперадмином — демо-доступ", status="trial")
 
@@ -11453,18 +11455,19 @@ async def public_register_company(req: PublicRegisterRequest):
     # больше нельзя переиспользовать для другой регистрации (в течение 30-минутного окна).
     await db.consume_cleano_phone_verification(normalized_phone)
 
+    trial_days = await _get_default_trial_days()
     await db.update_company(company["id"], {
         "contact_name":  req.contact_name.strip() or None,
         "contact_phone": req.contact_phone.strip(),
         "contact_email": (req.contact_email or "").strip() or None,
         "contact_tg_id": verification.get("tg_id"),
-        "trial_days":    14,
+        "trial_days":    trial_days,
     })
     trial_plan = await db.get_saas_plan_by_slug("starter")
     if trial_plan:
         from datetime import date, timedelta
         await db.create_saas_subscription(
-            company["id"], trial_plan["id"], date.today(), date.today() + timedelta(days=14),
+            company["id"], trial_plan["id"], date.today(), date.today() + timedelta(days=trial_days),
             notes="Автоматический триал — регистрация с cleano.uz", status="trial")
 
     # Мастер-пароль дублируем в Telegram-бот (верификация только через него) — на случай,
@@ -11730,6 +11733,7 @@ CLEANO_CONFIG_KEYS = [
     "cleano_phone", "cleano_telegram", "cleano_instagram", "cleano_facebook", "cleano_whatsapp",
     "cleano_office_lat", "cleano_office_lng", "cleano_office_address", "cleano_bot_username",
     "cleano_about_ru", "cleano_about_uz",
+    "default_trial_days",
     "subscription_reminder_days_before", "subscription_reminder_days_after",
     "subscription_reminder_sms_enabled", "subscription_reminder_tg_enabled",
     "subscription_reminder_text_ru", "subscription_reminder_text_uz",
@@ -11754,6 +11758,7 @@ class SaasGlobalSettingsRequest(BaseModel):
     cleano_bot_token:      str | None = None
     cleano_about_ru:       str | None = None
     cleano_about_uz:       str | None = None
+    default_trial_days:   str | None = None
     subscription_reminder_days_before: str | None = None
     subscription_reminder_days_after:  str | None = None
     subscription_reminder_sms_enabled: str | None = None
@@ -11766,6 +11771,16 @@ class SaasGlobalSettingsRequest(BaseModel):
     platform_eskiz_email:    str | None = None
     platform_eskiz_password: str | None = None
     platform_eskiz_from:     str | None = None
+
+async def _get_default_trial_days() -> int:
+    """Длина бесплатного триала для НОВЫХ регистраций — редактируется в
+    superadmin.html → ⚙️ Глобальные настройки. Не трогает уже созданные компании
+    (у каждой свой company.trial_days/end_date, снятые на момент их регистрации)."""
+    raw = await db.get_config("default_trial_days")
+    try:
+        return int(raw) if raw else 14
+    except (TypeError, ValueError):
+        return 14
 
 @app.get("/api/saas/global-settings")
 async def saas_get_global_settings(_=Depends(get_superadmin)):
