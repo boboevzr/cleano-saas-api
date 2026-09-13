@@ -13801,9 +13801,13 @@ async def branches_update(branch_id: int, req: BranchUpdateRequest, staff=Depend
     if staff.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Только admin")
     company_id = staff.get("company_id") or 1
-    updates = {k: v for k, v in req.model_dump().items() if v is not None}
-    if "phones" in req.model_dump() and req.phones is not None:
-        updates["phones"] = req.phones  # включаем пустой список тоже
+    # exclude_unset — различаем "поле не передано вовсе" (не трогаем старое значение,
+    # это нужно для частичных обновлений вроде {"phones": [...]} из мастера первичной
+    # настройки) от "поле передано как null" (значит его явно хотят ОЧИСТИТЬ — например
+    # удалить координаты локации на форме филиала, которая шлёт body целиком). Раньше
+    # null отфильтровывался наравне с "не передано", поэтому очистка координат никогда
+    # не сохранялась — оставалось старое значение, пока не выбрать новую точку на карте.
+    updates = req.model_dump(exclude_unset=True)
     ok = await db.update_branch(branch_id, company_id, updates)
     if not ok:
         raise HTTPException(status_code=404, detail="Филиал не найден")
