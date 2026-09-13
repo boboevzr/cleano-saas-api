@@ -12474,6 +12474,20 @@ async def order_bot_webhook(secret: str, request: Request):
 async def cleano_phone_verify_status(phone: str):
     phone = normalize_phone(phone)
     v = await db.get_cleano_phone_verification(phone)
+    if not v:
+        # Разовое подтверждение (30 минут) могло истечь или быть "съедено"
+        # предыдущей регистрацией этим же номером (consume_cleano_phone_verification).
+        # Но реальное владение номером уже доказано РАНЬШЕ — через отправку контакта
+        # боту (cleano_tg_links, бессрочная привязка phone→tg_id). Бот при этом уже
+        # не предлагает кнопку "Поделиться номером" повторно (см. _cleano_main_menu_kb —
+        # она пропадает, как только own_phone найден), так что без этого фолбэка
+        # пользователь застревал бы: бот ведёт на форму без кнопки для повторной
+        # верификации, а форма просит подтвердить через бота. Молча освежаем разовую
+        # запись из уже доказанной привязки — новый шаринг контакта не нужен.
+        tg_id = await db.get_cleano_tg_id_by_phone(phone)
+        if tg_id:
+            await db.mark_cleano_phone_verified(phone, "telegram", tg_id)
+            v = await db.get_cleano_phone_verification(phone)
     return {"ok": True, "verified": v is not None, "method": v["method"] if v else None}
 
 
