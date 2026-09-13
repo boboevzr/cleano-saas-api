@@ -14261,9 +14261,15 @@ async def kb_get_article(slug: str, _=Depends(get_current_staff)):
 
 
 @app.get("/api/kb/media/{file_id}")
-async def kb_get_media(file_id: str, _=Depends(get_current_staff)):
+async def kb_get_media(file_id: str, t: str = None, authorization: str = Header(None)):
     """Прокси картинки/видео базы знаний из Telegram по file_id — база знаний
-    доступна только залогиненным, поэтому раздача тоже под staff-авторизацией."""
+    доступна только залогиненным, поэтому раздача тоже под staff-авторизацией.
+    Принимает токен и через заголовок, и через ?t= — <img src>/<video src> не
+    умеют слать Authorization, тот же приём что у /api/media/{id} в проде."""
+    token = t or (authorization[7:] if authorization and authorization.startswith("Bearer ") else None)
+    if not token:
+        raise HTTPException(status_code=401)
+    await get_current_staff(authorization=f"Bearer {token}")
     if not BOT_TOKEN:
         raise HTTPException(status_code=503, detail="Бот не настроен")
     try:
