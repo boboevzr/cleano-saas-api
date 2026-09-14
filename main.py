@@ -14102,7 +14102,7 @@ async def kb_get_media(file_id: str, t: str = None, authorization: str = Header(
         from fastapi.responses import StreamingResponse
         ctype = _sniff_media_type(content, file_path)
         return StreamingResponse(iter([content]), media_type=ctype,
-                                  headers={"Content-Disposition": "inline"})
+                                  headers={"Content-Disposition": "inline", "X-Content-Type-Options": "nosniff"})
     except HTTPException:
         raise
     except Exception as e:
@@ -14121,10 +14121,32 @@ async def public_onboarding():
     return {"ok": True, "article": article}
 
 
+async def _onboarding_file_ids() -> set[str]:
+    """file_id, реально встречающиеся в блоках статьи getting-started —
+    used как allowlist, чтобы публичный эндпоинт ниже не превращался в
+    открытый прокси для ЛЮБОГО file_id всего медиа-канала проекта
+    (там же лежат чеки оплат, фото замеров и т.д. с других, закрытых
+    эндпоинтов — не всё, что лежит в канале, должно быть публичным)."""
+    article = await db.get_kb_article_by_slug("getting-started")
+    if not article:
+        return set()
+    ids = set()
+    for body_key in ("body_ru", "body_uz"):
+        try:
+            for block in _json.loads(article.get(body_key) or "[]"):
+                if block.get("type") in ("image", "video") and block.get("file_id"):
+                    ids.add(block["file_id"])
+        except Exception:
+            pass
+    return ids
+
+
 @app.get("/api/public/onboarding/media/{file_id}")
 async def public_onboarding_media(file_id: str):
     if not BOT_TOKEN:
         raise HTTPException(status_code=503, detail="Бот не настроен")
+    if file_id not in await _onboarding_file_ids():
+        raise HTTPException(status_code=404, detail="Файл не найден")
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
@@ -14139,7 +14161,7 @@ async def public_onboarding_media(file_id: str):
         from fastapi.responses import StreamingResponse
         ctype = _sniff_media_type(content, file_path)
         return StreamingResponse(iter([content]), media_type=ctype,
-                                  headers={"Content-Disposition": "inline"})
+                                  headers={"Content-Disposition": "inline", "X-Content-Type-Options": "nosniff"})
     except HTTPException:
         raise
     except Exception as e:
