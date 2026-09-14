@@ -11297,7 +11297,8 @@ async def public_register_company(req: PublicRegisterRequest):
                 f"🔐 <b>{name}</b>\n\nMaxfiy parol (o'chirishlarni tasdiqlash uchun admin-panelda): "
                 f"<code>{master_row['password']}</code>\n\n"
                 f"🔐 Мастер-пароль (для подтверждения удалений в админ-панели): "
-                f"<code>{master_row['password']}</code>")
+                f"<code>{master_row['password']}</code>\n\n"
+                f"🚀 Qo'llanma / Инструкция: с чего начать — https://cleano.uz/onboarding.html")
 
     return {"ok": True, "slug": slug, "admin_login": "admin", "credentials": credentials}
 
@@ -14085,6 +14086,43 @@ async def kb_get_media(file_id: str, t: str = None, authorization: str = Header(
     if not token:
         raise HTTPException(status_code=401)
     await get_current_staff(authorization=f"Bearer {token}")
+    if not BOT_TOKEN:
+        raise HTTPException(status_code=503, detail="Бот не настроен")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+                              params={"file_id": file_id}, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+            if not data.get("ok"):
+                raise HTTPException(status_code=404, detail="Файл не найден в Telegram")
+            file_path = data["result"]["file_path"]
+            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+            async with s.get(file_url, timeout=aiohttp.ClientTimeout(total=60)) as fr:
+                content = await fr.read()
+        from fastapi.responses import StreamingResponse
+        ctype = _sniff_media_type(content, file_path)
+        return StreamingResponse(iter([content]), media_type=ctype,
+                                  headers={"Content-Disposition": "inline"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/public/onboarding")
+async def public_onboarding():
+    """Публичная (без авторизации) версия статьи 'getting-started' из базы знаний —
+    для страницы onboarding.html и ссылок с cleano.uz/бота, куда staff-токен
+    послать нельзя (человек ещё не залогинен в admin.html). Публичен ТОЛЬКО
+    этот один слаг — остальная база знаний остаётся закрытой get_current_staff."""
+    article = await db.get_kb_article_by_slug("getting-started")
+    if not article:
+        raise HTTPException(status_code=404, detail="Статья не найдена")
+    return {"ok": True, "article": article}
+
+
+@app.get("/api/public/onboarding/media/{file_id}")
+async def public_onboarding_media(file_id: str):
     if not BOT_TOKEN:
         raise HTTPException(status_code=503, detail="Бот не настроен")
     try:
