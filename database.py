@@ -2481,12 +2481,15 @@ async def update_user_profile(user_id: int, first_name: str, address: str = None
         """, user_id, first_name, address)
 
 
-async def get_staff_notify_new_users():
-    """Возвращает tg_id сотрудников с включённым notify_new_users."""
+async def get_staff_notify_new_users(company_id: int):
+    """Возвращает tg_id сотрудников указанной компании с включённым notify_new_users.
+    company_id обязателен — без него утечка между тенантами (см. историю бага:
+    прод-версия этого запроса была без company_id, т.к. в проде один тенант)."""
     if not pool: return []
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT tg_id FROM staff WHERE notify_new_users=TRUE AND tg_id IS NOT NULL AND active=TRUE")
+            "SELECT tg_id FROM staff WHERE company_id=$1 AND notify_new_users=TRUE "
+            "AND tg_id IS NOT NULL AND active=TRUE", company_id)
     return [r["tg_id"] for r in rows]
 
 

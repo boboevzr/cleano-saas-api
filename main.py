@@ -3623,7 +3623,7 @@ async def verify(req: VerifyRequest):
     # Регистрация на сайте раньше не попадала в единую базу контактов — закрываем дыру.
     asyncio.create_task(db.upsert_crm_client(phone=user["phone"], first_name=user.get("first_name") or "",
                                               source="site_register"))
-    asyncio.create_task(_notify_new_site_user(user.get("first_name") or "", user["phone"], "sms"))
+    asyncio.create_task(_notify_new_site_user(user.get("first_name") or "", user["phone"], "sms", cid))
     token = create_token(user["id"], user["phone"], cid)
 
     return {
@@ -4610,7 +4610,7 @@ async def register_via_tg(body: dict):
         )
         asyncio.create_task(_send_tg_safe(tg_id, text))
 
-    asyncio.create_task(_notify_new_site_user(first_name, phone, "tg"))
+    asyncio.create_task(_notify_new_site_user(first_name, phone, "tg", cid))
 
     return {
         "ok": True,
@@ -4636,8 +4636,11 @@ async def _send_tg_safe(tg_id: int, text: str):
         pass
 
 
-async def _notify_new_site_user(first_name: str, phone: str, method: str):
-    """Уведомляет группу и персональных сотрудников о новой регистрации."""
+async def _notify_new_site_user(first_name: str, phone: str, method: str, company_id: int):
+    """Уведомляет группу и персональных сотрудников (тумблер "Уведомления о новых
+    клиентах") о новой регистрации. company_id обязателен — раньше личная рассылка
+    была без него и утекала на сотрудников ДРУГИХ компаний, поэтому её временно
+    отключали (см. историю); теперь get_staff_notify_new_users сама скоуплена."""
     if not BOT_TOKEN:
         return
     from datetime import datetime
@@ -4647,12 +4650,15 @@ async def _notify_new_site_user(first_name: str, phone: str, method: str):
         f"👤 {first_name}, 📞 <code>{phone}</code>, 🔐 {method_icon}, 🌐\n"
         f"📅 {now}"
     )
-    # Только группа — раньше слало ещё персонально каждому сотруднику с тумблером
-    # "Уведомления о новых клиентах", включая владельца бота (утечка в личку).
     targets = []
     group_id = await _get_cfg("new_clients_group_id")
     if group_id:
         targets.append(group_id)
+    try:
+        staff_ids = await db.get_staff_notify_new_users(company_id)
+        targets.extend(str(tid) for tid in staff_ids)
+    except Exception:
+        pass
     async with aiohttp.ClientSession() as s:
         for chat_id in targets:
             try:
@@ -13437,7 +13443,7 @@ async def bot_register_client(phone: str, first_name: str, lang: str, company_id
     await db.set_user_must_change_password(user["id"], True)
     asyncio.create_task(db.update_user_last_login(user["id"]))
     asyncio.create_task(db.upsert_crm_client(phone=phone, first_name=first_name, source="bot_register"))
-    asyncio.create_task(_notify_new_site_user(first_name, phone, "tg"))
+    asyncio.create_task(_notify_new_site_user(first_name, phone, "tg", company_id))
 
     return {"ok": True, "password": password, "user": dict(user)}
 
