@@ -2993,7 +2993,7 @@ async def staff_create_order(req: StaffOrderRequest, staff=Depends(require_perm(
             "pickup_time": req.pickup_time or "",
             "note":        note_full,
             "total_price": None,
-        }, source="staff")
+        }, source="staff", staff_name=staff_label)
         # Авто-регистрация клиента в CRM
         await db.upsert_crm_client(
             phone=req.phone,
@@ -4869,6 +4869,7 @@ async def convert_lead_to_order(lead_id: int, body: dict = Body({}),
     order_num = await db.get_next_order_num()
     lead_note = lead.get("note") or ""
     note_text = f"Конвертирован из лида #{lead_id}" + (f". {lead_note}" if lead_note else "")
+    staff_label = " ".join(filter(None, [staff.get("first_name"), staff.get("last_name")])) or staff.get("login") or "сотрудник"
     await db.save_site_order({
         "order_num":     order_num,
         "first_name":    first,
@@ -4886,7 +4887,7 @@ async def convert_lead_to_order(lead_id: int, body: dict = Body({}),
         "pickup_time":   lead.get("pickup_time", ""),
         "note":          note_text,
         "total_price":   None,
-    }, source="staff")
+    }, source="staff", staff_name=staff_label)
     await db.update_lead_status(lead_id, "converted")
     # Промо-акция: заказ считается "использованием" одноразового окна только если
     # лид пришёл с сайта/бота и привязан к зарегистрированному пользователю.

@@ -2736,13 +2736,19 @@ async def get_next_order_num(prefix: str | None = None) -> str:
         return f"{prefix}-{last_num + 1}"
 
 
-async def save_site_order(data: dict, source: str = "site") -> str:
+async def save_site_order(data: dict, source: str = "site", staff_name: str = "") -> str:
     """Сохраняет заявку без обязательного Telegram ID. source: 'site' | 'staff'"""
     if not pool:
         return data.get("order_num", "")
     if not await is_subscription_active(_cid()):
         raise SubscriptionExpiredError()
-    source_note = {"site": "Заявка создана через сайт", "staff": "Заявка создана сотрудником"}.get(source, "Заявка создана")
+    if source == "staff" and staff_name:
+        source_note = f"Заявка создана сотрудником {staff_name} / {staff_name} xodim tomonidan buyurtma yaratildi"
+    else:
+        source_note = {
+            "site": "Заявка создана через сайт / Buyurtma sayt orqali yaratildi",
+            "staff": "Заявка создана сотрудником / Buyurtma xodim tomonidan yaratildi",
+        }.get(source, "Заявка создана / Buyurtma yaratildi")
     async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO orders (
