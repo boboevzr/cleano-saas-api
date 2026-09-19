@@ -2,13 +2,16 @@
 
 Два потока, перенесённые из старого монолитного artez_bot/bot.py:
 - "быстрый заказ" (QuickForm) — язык → меню → услуга → телефон → имя → лид создан.
-- "полный заказ" (OrderForm) — язык → меню → имя → телефон → филиал → адрес →
-  услуга → тип услуги → дата → время → лид создан. Реальный порядок шагов взят
-  из старого bot.py (class OrderForm, ~L674 и его хендлеры ~L1941-2253) — там
-  этот порядок именно такой (имя и телефон запрашиваются раньше филиала/адреса).
-  Упрощение относительно старого бота: без гео-точки/карты (location/web_app) —
-  адрес только текстом; филиал берётся динамически из db.get_branches(company_id)
-  вместо хардкода "zarafshan"/"navoi".
+- "полный заказ" (OrderForm) — язык → меню → имя → телефон → [запасной номер] →
+  филиал → адрес → [локация вывоза] → адрес доставки другой? → [адрес доставки →
+  локация доставки] → услуга → тип услуги → дата → время → лид создан. Реальный
+  порядок шагов взят из старого bot.py (class OrderForm, ~L674 и его хендлеры
+  ~L1941-2253) — там этот порядок именно такой (имя и телефон запрашиваются
+  раньше филиала/адреса). Филиал берётся динамически из db.get_branches(company_id)
+  вместо хардкода "zarafshan"/"navoi". Гео-точка (location/web_app) и второй
+  адрес доставки перенесены из прод (второй телефон + delivery-адрес фича,
+  см. project_second_phone_delivery_address_2026-09-17) — оба шага необязательны
+  (кнопка "Пропустить").
 
 В обоих случаях — сотрудник обрабатывает лид и конвертирует его в заказ вручную
 через CRM, бот заказ напрямую не создаёт. После создания лида сотрудники получают
@@ -71,6 +74,7 @@ router = Router(name="order_bot")
 class QuickForm(StatesGroup):
     service = State()
     phone   = State()
+    phone2  = State()  # запасной номер, необязательно — перенос из прод, 2026-09-17
     name    = State()
 
 
@@ -85,14 +89,22 @@ class CalcForm(StatesGroup):
 
 
 class OrderForm(StatesGroup):
-    """Полный заказ — реальный порядок шагов из старого bot.py (class OrderForm):
-    имя → телефон → филиал → адрес → услуга → тип услуги → дата → время → лид.
-    (Старый бот дополнительно спрашивал гео-точку между адресом и услугой —
-    здесь опущено, см. docstring модуля.)"""
-    name         = State()
-    phone        = State()
-    branch       = State()
-    address      = State()
+    """Полный заказ — порядок шагов из старого bot.py (class OrderForm), плюс
+    перенесённые из прод фичи "второй телефон" и "адрес доставки другой":
+    имя → телефон → [запасной номер] → филиал → адрес → [локация вывоза] →
+    адрес доставки другой? → [адрес доставки → локация доставки] →
+    услуга → тип услуги → дата → время → лид.
+    Локация — необязательный шаг (кнопки "Отправить геолокацию"/"Пропустить"),
+    пустая location/delivery_location означает "не указана", как и в проде."""
+    name             = State()
+    phone            = State()
+    phone2           = State()
+    branch           = State()
+    address          = State()
+    location         = State()
+    delivery_choice  = State()
+    delivery_address = State()
+    delivery_location = State()
     service      = State()
     service_type = State()
     date         = State()
@@ -227,8 +239,19 @@ T = {
 
         # ── Полный заказ (OrderForm) ──
         "btn_order_full": "📅 Заказать с выездом",
+        "ask_phone2":      "📞 Оставите запасной номер на случай, если не дозвонимся?",
+        "btn_add_phone2":  "➕ Указать",
+        "btn_skip_phone2": "⏭ Пропустить",
+        "ask_phone2_manual": "✏️ Введите запасной номер в формате:\n+998XXXXXXXXX",
         "ask_branch":     "🏢 Выберите филиал:",
         "ask_address":    "📍 Введите адрес (город, улица, дом):",
+        "ask_location":   "📍 Отправьте геолокацию вывоза (необязательно):",
+        "btn_send_loc":   "📍 Отправить геолокацию",
+        "btn_skip_loc":   "⏭ Пропустить",
+        "ask_delivery_choice": "🚚 Адрес доставки будет другим?",
+        "btn_delivery_diff": "📍 Да, другой",
+        "btn_delivery_same": "➡️ Нет, туда же",
+        "ask_delivery_address": "📍 Введите адрес доставки:",
         "ask_service_type": "⏱ Выберите тип услуги:",
         "btn_type_standard": "🕓 Стандарт",
         "btn_type_express":  "⚡ Экспресс",
@@ -396,8 +419,19 @@ T = {
 
         # ── To'liq buyurtma (OrderForm) ──
         "btn_order_full": "📅 Chiqib olib ketish bilan buyurtma",
+        "ask_phone2":      "📞 Aloqa uzilib qolsa deb zaxira raqam qoldirasizmi?",
+        "btn_add_phone2":  "➕ Kiritish",
+        "btn_skip_phone2": "⏭ O'tkazib yuborish",
+        "ask_phone2_manual": "✏️ Zaxira raqamni quyidagi formatda kiriting:\n+998XXXXXXXXX",
         "ask_branch":     "🏢 Filialni tanlang:",
         "ask_address":    "📍 Manzilni kiriting (shahar, ko'cha, uy):",
+        "ask_location":   "📍 Olib ketish uchun geolokatsiya yuboring (ixtiyoriy):",
+        "btn_send_loc":   "📍 Geolokatsiya yuborish",
+        "btn_skip_loc":   "⏭ O'tkazib yuborish",
+        "ask_delivery_choice": "🚚 Yetkazib berish manzili boshqami?",
+        "btn_delivery_diff": "📍 Ha, boshqa",
+        "btn_delivery_same": "➡️ Yo'q, o'sha yerga",
+        "ask_delivery_address": "📍 Yetkazib berish manzilini kiriting:",
         "ask_service_type": "⏱ Xizmat turini tanlang:",
         "btn_type_standard": "🕓 Standart",
         "btn_type_express":  "⚡ Ekspress",
@@ -615,6 +649,35 @@ def phone_kb(lang: str) -> ReplyKeyboardMarkup:
         ]],
         resize_keyboard=True, one_time_keyboard=True,
     )
+
+
+def phone2_choice_kb(lang: str) -> InlineKeyboardMarkup:
+    """«Оставите запасной номер?» ➕ Указать / ⏭ Пропустить (перенос из прод)."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=t(lang, "btn_add_phone2"), callback_data="phone2_add"),
+        InlineKeyboardButton(text=t(lang, "btn_skip_phone2"), callback_data="phone2_skip"),
+    ]])
+
+
+def location_kb(lang: str) -> ReplyKeyboardMarkup:
+    """GPS (нативная кнопка Telegram) / пропустить — перенос из прод, без веб-карты
+    (там завязано на отдельно захостенный location_picker.html, здесь не заводим)."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[
+            KeyboardButton(text=t(lang, "btn_send_loc"), request_location=True),
+        ], [
+            KeyboardButton(text=t(lang, "btn_skip_loc")),
+        ]],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+
+
+def delivery_choice_kb(lang: str) -> InlineKeyboardMarkup:
+    """«Адрес доставки будет другим?» 📍 Да / ➡️ Нет (перенос из прод)."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=t(lang, "btn_delivery_diff"), callback_data="delivery_addr_diff"),
+        InlineKeyboardButton(text=t(lang, "btn_delivery_same"), callback_data="delivery_addr_same"),
+    ]])
 
 
 # ── Клавиатуры полного заказа (OrderForm) ──
@@ -1259,9 +1322,66 @@ async def _finish_phone_step(message: Message, company_id: int, state: FSMContex
         )
     except Exception as e:
         logging.warning(f"upsert_bot_client (phone) error: {e}")
-    await state.set_state(QuickForm.name)
     await message.answer("✅", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(QuickForm.phone2)
+    await message.answer(t(lang, "ask_phone2"), reply_markup=phone2_choice_kb(lang))
+
+
+async def _advance_after_quick_phone2(message: Message, company_id: int, state: FSMContext) -> None:
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    await state.set_state(QuickForm.name)
     await message.answer(t(lang, "ask_name"), reply_markup=cancel_kb(lang))
+
+
+@router.callback_query(QuickForm.phone2, F.data == "phone2_add")
+async def quick_phone2_add(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await call.message.answer(t(lang, "ask_phone2_manual"), reply_markup=phone_kb(lang))
+
+
+@router.callback_query(QuickForm.phone2, F.data == "phone2_skip")
+async def quick_phone2_skip(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    await state.update_data(phone2="")
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _advance_after_quick_phone2(call.message, company_id, state)
+
+
+@router.message(QuickForm.phone2, F.contact)
+async def quick_phone2_contact(message: Message, company_id: int, state: FSMContext) -> None:
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    norm = normalize_phone_bot(message.contact.phone_number or "")
+    if not norm:
+        await message.answer(t(lang, "phone_invalid"), reply_markup=phone_kb(lang))
+        return
+    await state.update_data(phone2=norm)
+    await message.answer("✅", reply_markup=ReplyKeyboardRemove())
+    await _advance_after_quick_phone2(message, company_id, state)
+
+
+@router.message(QuickForm.phone2, F.text)
+async def quick_phone2_text(message: Message, company_id: int, state: FSMContext) -> None:
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    raw = (message.text or "").strip()
+    norm = normalize_phone_bot(raw)
+    if not norm:
+        await message.answer(t(lang, "phone_invalid"), reply_markup=phone_kb(lang))
+        return
+    await state.update_data(phone2=norm)
+    await message.answer("✅", reply_markup=ReplyKeyboardRemove())
+    await _advance_after_quick_phone2(message, company_id, state)
 
 
 @router.message(QuickForm.phone, F.contact)
@@ -1308,6 +1428,7 @@ async def quick_name(message: Message, company_id: int, state: FSMContext) -> No
         lead = await db.create_lead({
             "client_name":  name,
             "client_phone": data.get("phone", ""),
+            "client_phone2": data.get("phone2", ""),
             "service":      data.get("service", ""),
             "note":         "Быстрая заявка (бот)",
             "status":       "new",
@@ -1371,19 +1492,9 @@ async def _advance_after_phone(message: Message, company_id: int, state: FSMCont
         )
     except Exception as e:
         logging.warning(f"upsert_bot_client (phone) error: {e}")
-    try:
-        branches = await db.get_branches(company_id)
-    except Exception as e:
-        logging.warning(f"get_branches error: {e}")
-        branches = []
     await message.answer("✅", reply_markup=ReplyKeyboardRemove())
-    if branches:
-        await state.set_state(OrderForm.branch)
-        await message.answer(t(lang, "ask_branch"), reply_markup=branch_kb(lang, [dict(b) for b in branches]))
-    else:
-        # У компании ещё не заведены филиалы — пропускаем шаг, branch останется пустым
-        await state.set_state(OrderForm.address)
-        await message.answer(t(lang, "ask_address"), reply_markup=cancel_kb(lang))
+    await state.set_state(OrderForm.phone2)
+    await message.answer(t(lang, "ask_phone2"), reply_markup=phone2_choice_kb(lang))
 
 
 @router.message(OrderForm.phone, F.contact)
@@ -1413,6 +1524,74 @@ async def full_phone_text(message: Message, company_id: int, state: FSMContext) 
     await _advance_after_phone(message, company_id, state, norm)
 
 
+# ── Запасной номер (необязательно) — перенос из прод, 2026-09-17 ──
+async def _advance_after_phone2(message: Message, company_id: int, state: FSMContext) -> None:
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    try:
+        branches = await db.get_branches(company_id)
+    except Exception as e:
+        logging.warning(f"get_branches error: {e}")
+        branches = []
+    if branches:
+        await state.set_state(OrderForm.branch)
+        await message.answer(t(lang, "ask_branch"), reply_markup=branch_kb(lang, [dict(b) for b in branches]))
+    else:
+        # У компании ещё не заведены филиалы — пропускаем шаг, branch останется пустым
+        await state.set_state(OrderForm.address)
+        await message.answer(t(lang, "ask_address"), reply_markup=cancel_kb(lang))
+
+
+@router.callback_query(OrderForm.phone2, F.data == "phone2_add")
+async def full_phone2_add(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await call.message.answer(t(lang, "ask_phone2_manual"), reply_markup=phone_kb(lang))
+
+
+@router.callback_query(OrderForm.phone2, F.data == "phone2_skip")
+async def full_phone2_skip(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    await state.update_data(phone2="")
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _advance_after_phone2(call.message, company_id, state)
+
+
+@router.message(OrderForm.phone2, F.contact)
+async def full_phone2_contact(message: Message, company_id: int, state: FSMContext) -> None:
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    norm = normalize_phone_bot(message.contact.phone_number or "")
+    if not norm:
+        await message.answer(t(lang, "phone_invalid"), reply_markup=phone_kb(lang))
+        return
+    await state.update_data(phone2=norm)
+    await message.answer("✅", reply_markup=ReplyKeyboardRemove())
+    await _advance_after_phone2(message, company_id, state)
+
+
+@router.message(OrderForm.phone2, F.text)
+async def full_phone2_text(message: Message, company_id: int, state: FSMContext) -> None:
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    raw = (message.text or "").strip()
+    norm = normalize_phone_bot(raw)
+    if not norm:
+        await message.answer(t(lang, "phone_invalid"), reply_markup=phone_kb(lang))
+        return
+    await state.update_data(phone2=norm)
+    await message.answer("✅", reply_markup=ReplyKeyboardRemove())
+    await _advance_after_phone2(message, company_id, state)
+
+
 @router.callback_query(OrderForm.branch, F.data.startswith("of_branch_"))
 async def full_branch(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
     await call.answer()
@@ -1433,6 +1612,36 @@ async def full_address(message: Message, company_id: int, state: FSMContext) -> 
         await message.answer(t(lang, "ask_address"), reply_markup=cancel_kb(lang))
         return
     await state.update_data(address=address)
+    await state.set_state(OrderForm.location)
+    await message.answer(t(lang, "ask_location"), reply_markup=location_kb(lang))
+
+
+# ── Локация вывоза (необязательно) — перенос из прод, 2026-09-17 ──
+async def _advance_after_location(message: Message, company_id: int, state: FSMContext) -> None:
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    await state.set_state(OrderForm.delivery_choice)
+    await message.answer(t(lang, "ask_delivery_choice"), reply_markup=delivery_choice_kb(lang))
+
+
+@router.message(OrderForm.location, F.location)
+async def full_location_geo(message: Message, company_id: int, state: FSMContext) -> None:
+    lat, lon = message.location.latitude, message.location.longitude
+    await state.update_data(location=f"{lat:.5f},{lon:.5f}", location_address="")
+    await message.answer("📍 ✅", reply_markup=ReplyKeyboardRemove())
+    await _advance_after_location(message, company_id, state)
+
+
+@router.message(OrderForm.location, F.text)
+async def full_location_skip(message: Message, company_id: int, state: FSMContext) -> None:
+    await state.update_data(location="", location_address="")
+    await message.answer("⏭", reply_markup=ReplyKeyboardRemove())
+    await _advance_after_location(message, company_id, state)
+
+
+async def _ask_service_step(message: Message, company_id: int, state: FSMContext) -> None:
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
     try:
         services = await db.get_services_for_company(company_id)
     except Exception as e:
@@ -1440,6 +1649,60 @@ async def full_address(message: Message, company_id: int, state: FSMContext) -> 
         services = []
     await state.set_state(OrderForm.service)
     await message.answer(t(lang, "ask_service"), reply_markup=service_kb(lang, services))
+
+
+# ── Адрес доставки, если отличается от адреса вывоза (необязательно) —
+# перенос из прод, см. project_second_phone_delivery_address_2026-09-17. ──
+@router.callback_query(OrderForm.delivery_choice, F.data == "delivery_addr_diff")
+async def full_delivery_choice_diff(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await state.set_state(OrderForm.delivery_address)
+    await call.message.answer(t(lang, "ask_delivery_address"), reply_markup=cancel_kb(lang))
+
+
+@router.callback_query(OrderForm.delivery_choice, F.data == "delivery_addr_same")
+async def full_delivery_choice_same(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    await state.update_data(delivery_address="")
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _ask_service_step(call.message, company_id, state)
+
+
+@router.message(OrderForm.delivery_address)
+async def full_delivery_address(message: Message, company_id: int, state: FSMContext) -> None:
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    address = (message.text or "").strip()
+    if not address:
+        await message.answer(t(lang, "ask_delivery_address"), reply_markup=cancel_kb(lang))
+        return
+    await state.update_data(delivery_address=address)
+    await state.set_state(OrderForm.delivery_location)
+    await message.answer(t(lang, "ask_location"), reply_markup=location_kb(lang))
+
+
+@router.message(OrderForm.delivery_location, F.location)
+async def full_delivery_location_geo(message: Message, company_id: int, state: FSMContext) -> None:
+    lat, lon = message.location.latitude, message.location.longitude
+    await state.update_data(delivery_location=f"{lat:.5f},{lon:.5f}", delivery_location_address="")
+    await message.answer("📍 ✅", reply_markup=ReplyKeyboardRemove())
+    await _ask_service_step(message, company_id, state)
+
+
+@router.message(OrderForm.delivery_location, F.text)
+async def full_delivery_location_skip(message: Message, company_id: int, state: FSMContext) -> None:
+    await state.update_data(delivery_location="", delivery_location_address="")
+    await message.answer("⏭", reply_markup=ReplyKeyboardRemove())
+    await _ask_service_step(message, company_id, state)
 
 
 @router.callback_query(OrderForm.service, F.data.startswith("svc_"))
@@ -1526,9 +1789,15 @@ async def _finish_full_order(message: Message, company_id: int, state: FSMContex
         lead = await db.create_lead({
             "client_name":  data.get("name", ""),
             "client_phone": data.get("phone", ""),
+            "client_phone2": data.get("phone2", ""),
             "service":      data.get("service", ""),
             "branch":       data.get("branch", ""),
             "address":      data.get("address", ""),
+            "location":         data.get("location", ""),
+            "location_address": data.get("location_address", ""),
+            "delivery_address":         data.get("delivery_address", ""),
+            "delivery_location":        data.get("delivery_location", ""),
+            "delivery_location_address": data.get("delivery_location_address", ""),
             "note":         " · ".join(note_parts),
             "status":       "new",
             "source":       "bot",

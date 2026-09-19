@@ -2512,12 +2512,17 @@ async def create_lead(req: LeadCreateRequest, staff=Depends(get_current_staff)):
     lead_source = "agent" if role == "agent" else "staff"
     lead = await db.create_lead({
         "client_name": req.client_name,
-        "client_phone": req.client_phone, "service": req.service,
+        "client_phone": req.client_phone, "client_phone2": req.client_phone2 or "",
+        "service": req.service,
         "branch": req.branch, "city": req.city, "address": req.address,
         "short_address": req.short_address, "note": req.note,
+        "delivery_address": req.delivery_address or "",
+        "delivery_short_address": req.delivery_short_address or "",
         "assigned_to": req.assigned_to, "created_by": creator_id,
         "volunteer_id": agent_id,
         "location": req.location, "location_address": req.location_address,
+        "delivery_location": req.delivery_location or "",
+        "delivery_location_address": req.delivery_location_address or "",
         "source": lead_source,
         "pickup_date": req.pickup_date or "",
         "pickup_time": req.pickup_time or "",
