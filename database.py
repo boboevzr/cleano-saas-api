@@ -8261,6 +8261,17 @@ async def get_bot_client_lang(tg_id: int, company_id: int) -> str | None:
             "SELECT lang FROM clients WHERE tg_id=$1 AND company_id=$2", tg_id, company_id)
         return row["lang"] if row else None
 
+async def get_last_lead_address(tg_id: int, company_id: int) -> str:
+    """Адрес из самого недавнего лида этого клиента бота — подсказка "этот адрес?"
+    при новой заявке. Перенос из прод (get_last_lead_info)."""
+    if not pool: return ""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT address FROM leads WHERE client_tg_id=$1 AND company_id=$2 "
+            "AND address IS NOT NULL AND address <> '' ORDER BY created_at DESC LIMIT 1",
+            tg_id, company_id)
+        return (row["address"] if row else "") or ""
+
 async def set_bot_client_lang(tg_id: int, lang: str, company_id: int) -> None:
     if not pool: return
     async with pool.acquire() as conn:
