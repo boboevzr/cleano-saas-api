@@ -757,6 +757,14 @@ async def create_tables():
         "ALTER TABLE leads  ADD COLUMN IF NOT EXISTS delivery_location         TEXT         DEFAULT NULL",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_location_address TEXT         DEFAULT ''",
         "ALTER TABLE leads  ADD COLUMN IF NOT EXISTS delivery_location_address TEXT         DEFAULT ''",
+        # lead_code клиенту (в боте) показывался с тегом компании ("L-POKIZA-1005"),
+        # хотя в проде это всегда просто "L-0179" — тег был нужен только из-за
+        # ГЛОБАЛЬНОГО UNIQUE на lead_code (см. get_next_lead_num), иначе два
+        # тенанта одновременно сгенерировали бы одинаковый "L-1001". Переводим
+        # уникальность на (company_id, lead_code) — тег в lead_code больше не
+        # нужен, per-company счётчик и так уже был через company_id в WHERE.
+        "ALTER TABLE leads DROP CONSTRAINT IF EXISTS leads_lead_code_key",
+        "CREATE UNIQUE INDEX IF NOT EXISTS leads_company_lead_code_uniq ON leads(company_id, lead_code)",
     ]
     async with pool.acquire() as c:
         for sql in other_migrations:
@@ -4744,7 +4752,14 @@ async def get_next_lead_num(company_id: int) -> tuple[str, str]:
     общим через ВСЕ SaaS-компании разом — у компании B первый лид мог оказаться сразу
     "L-0157". Тот же баг, что был найден и исправлен для order_num 2026-08-21, но для
     лидов перенесён не был. company_id=1 (ARTEZ) — префикс не трогаем, чтобы продолжить
-    уже накопленную нумерацию без разрыва."""
+    уже накопленную нумерацию без разрыва.
+
+    lead_code (короткий код, который видит КЛИЕНТ в сообщении бота) больше не
+    содержит тег компании — в проде это всегда просто "L-0179", тег в SaaS был
+    нужен только из-за глобального UNIQUE на lead_code (теперь UNIQUE(company_id,
+    lead_code), см. миграцию выше) — жалоба пользователя 2026-09-19. lead_num
+    (внутренний, для admin/staff-панели) тег сохраняет — там уникальность и
+    структура запроса ниже (WHERE lead_num LIKE ...) по-прежнему на нём завязаны."""
     if company_id == 1:
         lead_prefix, code_prefix = "LEAD-", "L-"
     else:
@@ -4753,7 +4768,7 @@ async def get_next_lead_num(company_id: int) -> tuple[str, str]:
             async with pool.acquire() as conn:
                 slug = await conn.fetchval("SELECT slug FROM companies WHERE id=$1", company_id)
         tag = re.sub(r'[^A-Z0-9]', '', (slug or '').upper())[:12] or f"C{company_id}"
-        lead_prefix, code_prefix = f"LEAD-{tag}-", f"L-{tag}-"
+        lead_prefix, code_prefix = f"LEAD-{tag}-", "L-"
     if not pool:
         return f"{lead_prefix}1001", f"{code_prefix}1001"
     async with pool.acquire() as conn:
