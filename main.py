@@ -937,11 +937,16 @@ class OrderRequest(BaseModel):
     first_name: str
     last_name: str = ""
     phone: str
+    phone2: str = ""
     branch: str = ""
     city: str = ""
     address: str
     location: str = ""
     location_address: str = ""
+    delivery_address: str = ""
+    delivery_short_address: str = ""
+    delivery_location: str = ""
+    delivery_location_address: str = ""
     service: str = ""
     service_type: str = ""
     pickup_date: str = ""
@@ -960,6 +965,16 @@ class OrderRequest(BaseModel):
             raise ValueError("Неверный формат номера. Используйте +998XXXXXXXXX")
         return v
 
+    @field_validator("phone2")
+    @classmethod
+    def validate_phone2(cls, v):
+        if not v:
+            return v
+        v = normalize_phone(v)
+        if not PHONE_RE.match(v):
+            raise ValueError("Неверный формат запасного номера. Используйте +998XXXXXXXXX")
+        return v
+
     @field_validator("first_name")
     @classmethod
     def validate_name(cls, v):
@@ -976,6 +991,7 @@ class OrderRequest(BaseModel):
 class StaffOrderRequest(BaseModel):
     first_name: str
     phone: str
+    phone2: str = ""
     service: str = ""
     service_type: str = "standard"
     pickup_type: str = "courier"
@@ -985,6 +1001,10 @@ class StaffOrderRequest(BaseModel):
     short_address: str = ""
     location: str = ""
     location_address: str = ""
+    delivery_address: str = ""
+    delivery_short_address: str = ""
+    delivery_location: str = ""
+    delivery_location_address: str = ""
     note: str = ""
     pickup_date: str = ""
     pickup_time: str = ""
@@ -2432,11 +2452,16 @@ async def staff_change_password(staff_id: int, body: dict, me=Depends(get_curren
 class LeadCreateRequest(BaseModel):
     client_name: str | None = None
     client_phone: str
+    client_phone2: str | None = None
     service: str | None = None
     branch: str | None = None
     city: str | None = None
     address: str | None = None
     short_address: str | None = None
+    delivery_address: str | None = None
+    delivery_short_address: str | None = None
+    delivery_location: str | None = None
+    delivery_location_address: str | None = None
     note: str | None = None
     assigned_to: int | None = None
     volunteer_id: int | None = None
@@ -2532,7 +2557,7 @@ async def get_leads(status: str = None, branch: str = None,
 
 @app.patch("/api/staff/leads/{lead_id}")
 async def update_lead(lead_id: int, body: dict, staff=Depends(require_perm("leads"))):
-    allowed = {"client_name","client_phone","branch","address","short_address","note","volunteer_id","location","location_address","pickup_type","delivery_type","pickup_date","pickup_time"}
+    allowed = {"client_name","client_phone","client_phone2","branch","address","short_address","delivery_address","delivery_short_address","delivery_location","delivery_location_address","note","volunteer_id","location","location_address","pickup_type","delivery_type","pickup_date","pickup_time"}
     fields = {k: v for k, v in body.items() if k in allowed}
     lead = await db.update_lead(lead_id, **fields)
     operator_id = None if staff.get("sub") == "admin" else staff.get("id")
@@ -2965,6 +2990,10 @@ async def staff_create_order(req: StaffOrderRequest, staff=Depends(require_perm(
     req.phone = normalize_phone(req.phone)
     if not PHONE_RE.match(req.phone):
         raise HTTPException(status_code=400, detail="Неверный формат номера. Используйте +998XXXXXXXXX")
+    if req.phone2:
+        req.phone2 = normalize_phone(req.phone2)
+        if not PHONE_RE.match(req.phone2):
+            raise HTTPException(status_code=400, detail="Неверный формат запасного номера. Используйте +998XXXXXXXXX")
     try:
         order_num = await db.get_next_order_num()
         first_name = staff.get("first_name") or ""
@@ -2975,24 +3004,29 @@ async def staff_create_order(req: StaffOrderRequest, staff=Depends(require_perm(
             staff_label = f"{staff_label} (@{login})"
         branch = req.branch or staff.get("branch") or ""
         location = req.location or ""
-        note_full = f"📱 Заявка от сотрудника: {staff_label}" + (f"\n{req.note}" if req.note else "")
         await db.save_site_order({
             "order_num":   order_num,
             "first_name":  req.first_name,
             "last_name":   "",
             "phone":       req.phone,
+            "phone2":      req.phone2 or "",
             "branch":      branch,
             "city":        "",
             "address":       req.address or "",
             "short_address": req.short_address or "",
-            "location":      location,
+            "delivery_address":       req.delivery_address or "",
+            "delivery_short_address": req.delivery_short_address or "",
+            "location":         location,
+            "location_address": req.location_address or "",
+            "delivery_location":         req.delivery_location or "",
+            "delivery_location_address": req.delivery_location_address or "",
             "service":      req.service,
             "service_type": req.service_type or "standard",
             "pickup_type":  req.pickup_type or "courier",
             "delivery_type": req.delivery_type or "courier",
             "pickup_date": req.pickup_date or "",
             "pickup_time": req.pickup_time or "",
-            "note":        note_full,
+            "note":        req.note or "",
             "total_price": None,
         }, source="staff", staff_name=staff_label)
         # Авто-регистрация клиента в CRM
@@ -4864,7 +4898,10 @@ async def convert_lead_to_order(lead_id: int, body: dict = Body({}),
     lead = await db.get_lead_by_id(lead_id)
     if not lead:
         raise HTTPException(status_code=404, detail="Лид не найден")
-    name_parts = (lead.get("name") or "").split(maxsplit=1)
+    # Было lead.get("name")/lead.get("phone") — таких колонок у лида нет
+    # (реальные имена client_name/client_phone), из-за чего имя и телефон
+    # клиента терялись при каждой конвертации лида в заказ.
+    name_parts = (lead.get("client_name") or "").split(maxsplit=1)
     first = name_parts[0] if name_parts else ""
     last  = name_parts[1] if len(name_parts) > 1 else ""
     order_num = await db.get_next_order_num()
@@ -4875,12 +4912,18 @@ async def convert_lead_to_order(lead_id: int, body: dict = Body({}),
         "order_num":     order_num,
         "first_name":    first,
         "last_name":     last,
-        "phone":         lead.get("phone", ""),
+        "phone":         lead.get("client_phone", ""),
+        "phone2":        lead.get("client_phone2", ""),
         "branch":        lead.get("branch") or body.get("branch", ""),
         "city":          "",
         "address":       lead.get("address", ""),
         "short_address": lead.get("short_address", ""),
-        "location":      lead.get("location", ""),
+        "delivery_address":       lead.get("delivery_address", ""),
+        "delivery_short_address": lead.get("delivery_short_address", ""),
+        "location":         lead.get("location", ""),
+        "location_address": lead.get("location_address", ""),
+        "delivery_location":         lead.get("delivery_location", ""),
+        "delivery_location_address": lead.get("delivery_location_address", ""),
         "service":       "",
         "pickup_type":   lead.get("pickup_type", "courier"),
         "delivery_type": lead.get("delivery_type", "courier"),
@@ -8987,17 +9030,22 @@ async def create_order_from_site(order: OrderRequest, user=Depends(get_optional_
     lead = await db.create_lead({
         "client_name":   full_name,
         "client_phone":  order.phone,
+        "client_phone2": order.phone2 or "",
         "service":       order.service,
         "branch":        order.branch,
         "city":          order.city,
         "address":       order.address,
         "short_address": order.address,
+        "delivery_address":       order.delivery_address or "",
+        "delivery_short_address": order.delivery_short_address or "",
         "note":          note,
         "status":        "new",
         "created_by":    None,
         "volunteer_id":  volunteer_id,
         "location":      order.location,
         "location_address": order.location_address,
+        "delivery_location":         order.delivery_location or "",
+        "delivery_location_address": order.delivery_location_address or "",
         "source":        lead_source,
         "client_tg_id":  order.client_tg_id,
         "pickup_date":   order.pickup_date or "",
