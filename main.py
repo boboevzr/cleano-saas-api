@@ -2972,7 +2972,8 @@ async def staff_orders(status: str = None, branch: str = None, limit: int = 50, 
         visible |= _STAGE_STATUSES.get(stage, set())
     result, total = await db.get_admin_orders(
         status=status, statuses=list(visible) if stages else None,
-        branch=branch, limit=limit, offset=offset, search=search)
+        branch=branch, limit=limit, offset=offset, search=search,
+        search_phone=not staff.get("hide_client_phone"))
     if staff.get("hide_client_phone"):
         for o in result:
             o["client_phone"] = ""
@@ -2982,7 +2983,8 @@ async def staff_orders(status: str = None, branch: str = None, limit: int = 50, 
 async def staff_own_orders(status: str = None, limit: int = 50, offset: int = 0,
                             search: str = None, staff=Depends(get_current_staff)):
     result, total = await db.get_admin_orders(
-        status=status, branch=staff.get("branch"), limit=limit, offset=offset, search=search)
+        status=status, branch=staff.get("branch"), limit=limit, offset=offset, search=search,
+        search_phone=not staff.get("hide_client_phone"))
     if staff.get("hide_client_phone"):
         for o in result:
             o["client_phone"] = ""

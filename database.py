@@ -3378,13 +3378,17 @@ async def get_order_items_billing(order_id: int) -> dict:
 
 
 async def get_admin_orders(status: str = None, statuses: list = None, branch: str = None,
-                            limit: int = 50, offset: int = 0, search: str = None):
+                            limit: int = 50, offset: int = 0, search: str = None,
+                            search_phone: bool = True):
     """Список заказов с постраничностью, всегда scoped на company_id. statuses (набор,
     из order_stages сотрудника) и status (выбранная вкладка) пересекаются, если заданы
     оба. search — по номеру заявки/телефону/ФИО/адресу, в SQL (не на клиенте) — перенос
     фикса из прод (см. ARTEZ PROJECT/artez_api/database.py, жалоба пользователя
     2026-09-19: заказ со статусом "Долги" не находился поиском на вкладке "Все", т.к.
     поиск фильтровал только уже загруженную страницу, а "Долги" грузится без пагинации).
+    search_phone=False — не искать по client_phone: для сотрудников с hide_client_phone,
+    иначе поиск по номеру работал бы оракулом (подтвердил бы, что номер есть в базе, и
+    заодно показал бы ФИО/адрес клиента), хотя сам номер в ответе замаскирован.
     Возвращает (orders, total_count)."""
     if not pool:
         return [], 0
@@ -3407,9 +3411,10 @@ async def get_admin_orders(status: str = None, statuses: list = None, branch: st
             params.append(branch)
         if search:
             idx = len(params) + 1
+            phone_clause = f"OR o.client_phone ILIKE ${idx}" if search_phone else ""
             conditions.append(f"""(
                 o.order_num ILIKE ${idx}
-                OR o.client_phone ILIKE ${idx}
+                {phone_clause}
                 OR (COALESCE(o.client_first_name,'') || ' ' || COALESCE(o.client_last_name,'')) ILIKE ${idx}
                 OR (COALESCE(o.client_last_name,'') || ' ' || COALESCE(o.client_first_name,'')) ILIKE ${idx}
                 OR COALESCE(o.short_address,'') ILIKE ${idx}
