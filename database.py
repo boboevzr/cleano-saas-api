@@ -5411,6 +5411,56 @@ async def get_crm_clients_count() -> dict:
         )
         return {r["status"]: r["cnt"] for r in rows}
 
+async def get_crm_clients_search_count(search: str = "") -> int:
+    """Кол-во клиентов, подходящих под тот же поиск, что и get_crm_clients_list —
+    для пагинации (total), а не разбивка по статусам, как get_crm_clients_count."""
+    if not pool: return 0
+    cid = _cid()
+    async with pool.acquire() as conn:
+        if search:
+            return await conn.fetchval("""
+                SELECT COUNT(*) FROM crm_clients
+                WHERE (phone ILIKE $1 OR first_name ILIKE $1 OR last_name ILIKE $1
+                   OR short_address ILIKE $1 OR address ILIKE $1) AND company_id=$2
+            """, f"%{search}%", cid)
+        return await conn.fetchval("SELECT COUNT(*) FROM crm_clients WHERE company_id=$1", cid)
+
+async def get_clients_map_points(date_from: str = None, date_to: str = None) -> list:
+    """По одной точке на клиента (своей компании) — координаты последнего заказа
+    с указанной точкой (у самого клиента координат не хранится, только текстовый
+    адрес). date_from/date_to (YYYY-MM-DD, включительно) фильтруют, СРЕДИ КАКИХ
+    заказов искать "последний" — фильтр внутри WHERE той же выборки, ДО DISTINCT
+    ON, иначе получится последний заказ вообще, а не последний внутри периода."""
+    if not pool: return []
+    cid = _cid()
+    # asyncpg с явным ::date в SQL требует datetime.date, а не строку — передача
+    # "YYYY-MM-DD" как str падает ("'str' object has no attribute 'toordinal'").
+    def _parse_date(s):
+        try: return datetime.strptime(s, "%Y-%m-%d").date()
+        except (ValueError, TypeError): return None
+    date_from = _parse_date(date_from) if date_from else None
+    date_to = _parse_date(date_to) if date_to else None
+    where = ["o.location IS NOT NULL", "o.location <> ''", "o.company_id=$1"]
+    params = [cid]
+    if date_from:
+        params.append(date_from)
+        where.append(f"o.created_at >= ${len(params)}::date")
+    if date_to:
+        params.append(date_to)
+        where.append(f"o.created_at < (${len(params)}::date + INTERVAL '1 day')")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT DISTINCT ON (o.client_phone)
+                   c.id AS client_id, o.client_phone AS phone,
+                   c.first_name, c.last_name, c.status,
+                   o.location, o.location_address
+            FROM orders o
+            JOIN crm_clients c ON c.phone = o.client_phone AND c.company_id = o.company_id
+            WHERE {" AND ".join(where)}
+            ORDER BY o.client_phone, o.created_at DESC
+        """, *params)
+        return [dict(r) for r in rows]
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ACTIVE CONTACTS (единая база "актуальных" номеров — crm_clients + дозвонившиеся

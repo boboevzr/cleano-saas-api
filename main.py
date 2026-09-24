@@ -3152,7 +3152,15 @@ async def clients_list(search: str = "", limit: int = 50, offset: int = 0,
                        _=Depends(_get_admin_or_staff_clients)):
     rows = await db.get_crm_clients_list(search=search, limit=limit, offset=offset)
     counts = await db.get_crm_clients_count()
-    return {"ok": True, "clients": rows, "counts": counts}
+    total = await db.get_crm_clients_search_count(search)
+    return {"ok": True, "clients": rows, "counts": counts, "total": total}
+
+
+@app.get("/api/clients/map-points")
+async def clients_map_points_ep(date_from: str = None, date_to: str = None,
+                                 _=Depends(_get_admin_or_staff_clients)):
+    points = await db.get_clients_map_points(date_from, date_to)
+    return {"ok": True, "points": points}
 
 
 @app.get("/api/clients/by-phone/{phone}")
