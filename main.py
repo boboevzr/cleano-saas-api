@@ -3163,6 +3163,251 @@ async def clients_map_points_ep(date_from: str = None, date_to: str = None,
     return {"ok": True, "points": points}
 
 
+# ── Логистика / Регионы обслуживания (перенос из ARTEZ, company-scoped —
+# company_id читается внутри db-функций через _cid(), явно нигде не передаётся) ──
+
+@app.get("/api/admin/service-regions/tree")
+async def service_regions_tree(staff=Depends(get_current_staff)):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    tree = await db.get_service_regions_tree()
+    return {"ok": True, "regions": tree}
+
+@app.post("/api/admin/service-regions")
+async def create_service_region_ep(
+    parent_id:        int  = Body(None,  embed=True),
+    level:             int  = Body(...,   embed=True),
+    node_type:         str  = Body(None,  embed=True),
+    branch:            str  = Body(None,  embed=True),
+    name_ru:           str  = Body(...,   embed=True),
+    name_uz:           str  = Body(None,  embed=True),
+    name_ru_full:      str  = Body(None,  embed=True),
+    name_uz_full:      str  = Body(None,  embed=True),
+    lat:               str  = Body(None,  embed=True),
+    location_address:  str  = Body(None,  embed=True),
+    sort_order:        int  = Body(0,     embed=True),
+    note:              str  = Body(None,  embed=True),
+    not_exists:        bool = Body(False, embed=True),
+    polygon:           list = Body(None,  embed=True),
+    poi_type:          str  = Body(None,  embed=True),
+    staff=Depends(get_current_staff),
+):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    region = await db.create_service_region(
+        parent_id, level, node_type, branch, name_ru, name_uz,
+        lat, location_address, sort_order, note, name_ru_full, name_uz_full, not_exists, polygon, poi_type)
+    return {"ok": True, "region": region}
+
+@app.put("/api/admin/service-regions/{region_id}")
+async def update_service_region_ep(
+    region_id:         int,
+    parent_id:         int  = Body(None,  embed=True),
+    level:             int  = Body(None,  embed=True),
+    node_type:         str  = Body(None,  embed=True),
+    branch:            str  = Body(None,  embed=True),
+    name_ru:           str  = Body(None,  embed=True),
+    name_uz:           str  = Body(None,  embed=True),
+    name_ru_full:      str  = Body(None,  embed=True),
+    name_uz_full:      str  = Body(None,  embed=True),
+    lat:               str  = Body(None,  embed=True),
+    location_address:  str  = Body(None,  embed=True),
+    polygon:           list = Body(None,  embed=True),
+    sort_order:        int  = Body(None,  embed=True),
+    active:            bool = Body(None,  embed=True),
+    note:              str  = Body(None,  embed=True),
+    not_exists:        bool = Body(None,  embed=True),
+    poi_type:          str  = Body(None,  embed=True),
+    staff=Depends(get_current_staff),
+):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    fields = {k: v for k, v in {
+        "parent_id": parent_id, "level": level, "node_type": node_type,
+        "branch": branch, "name_ru": name_ru, "name_uz": name_uz,
+        "name_ru_full": name_ru_full, "name_uz_full": name_uz_full,
+        "lat": lat, "location_address": location_address,
+        "polygon": polygon, "sort_order": sort_order, "active": active,
+        "note": note, "not_exists": not_exists, "poi_type": poi_type,
+    }.items() if v is not None}
+    region = await db.update_service_region(region_id, **fields)
+    if not region:
+        raise HTTPException(status_code=404, detail="Регион не найден")
+    return {"ok": True, "region": region}
+
+@app.delete("/api/admin/service-regions/{region_id}")
+async def delete_service_region_ep(region_id: int, staff=Depends(get_current_staff)):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    result = await db.delete_service_region(region_id)
+    if not result.get("ok"):
+        err = result.get("error", "unknown")
+        if err == "has_children":
+            raise HTTPException(status_code=400, detail="Сначала удалите дочерние элементы")
+        raise HTTPException(status_code=400, detail=err)
+    return {"ok": True}
+
+@app.post("/api/admin/service-regions/backup")
+async def create_service_regions_backup_ep(label: str = Body(None, embed=True), staff=Depends(get_current_staff)):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    backup = await db.create_service_regions_backup(label, staff.get("id"))
+    return {"ok": True, "backup": backup}
+
+@app.get("/api/admin/service-regions/backups")
+async def list_service_regions_backups_ep(staff=Depends(get_current_staff)):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    backups = await db.list_service_regions_backups()
+    return {"ok": True, "backups": backups}
+
+@app.get("/api/admin/service-regions/backups/{backup_id}")
+async def get_service_regions_backup_ep(backup_id: int, staff=Depends(get_current_staff)):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    backup = await db.get_service_regions_backup(backup_id)
+    if not backup:
+        raise HTTPException(status_code=404, detail="Архив не найден")
+    return {"ok": True, "backup": backup}
+
+@app.post("/api/admin/service-regions/backups/{backup_id}/restore")
+async def restore_service_regions_backup_ep(backup_id: int, staff=Depends(get_current_staff)):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    result = await db.restore_service_regions_backup(backup_id)
+    if not result.get("ok"):
+        err = result.get("error", "unknown")
+        if err == "not_found":
+            raise HTTPException(status_code=404, detail="Архив не найден")
+        raise HTTPException(status_code=400, detail=err)
+    return result
+
+@app.get("/api/regions/search")
+async def regions_search_ep(q: str = "", limit: int = 15, staff=Depends(get_current_staff)):
+    if not q:
+        return {"ok": True, "results": []}
+    results = await db.search_service_regions(q, limit)
+    return {"ok": True, "results": results}
+
+@app.get("/api/regions/children")
+async def regions_children_ep(parent_id: int = None, staff=Depends(get_current_staff)):
+    children = await db.get_service_region_children(parent_id)
+    return {"ok": True, "children": children}
+
+# ── places: универсальный слой типизированных точек (общежития/кафе/гостиницы
+# и т.п.) — не часть адресного дерева service_regions, только ссылается на него
+# через region_id. company_id (не project, как в ARTEZ) изолирует между компаниями.
+@app.get("/api/admin/places")
+async def list_places_ep(region_id: int, staff=Depends(get_current_staff)):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    places = await db.list_places_by_region(region_id)
+    return {"ok": True, "places": places}
+
+@app.post("/api/admin/places")
+async def create_place_ep(
+    region_id:        int  = Body(...,    embed=True),
+    category_ru:      str  = Body(None,   embed=True),
+    category_uz:      str  = Body(None,   embed=True),
+    name_ru:          str  = Body(...,    embed=True),
+    name_uz:          str  = Body(None,   embed=True),
+    lat:              str  = Body(None,   embed=True),
+    location_address: str  = Body(None,   embed=True),
+    note:             str  = Body(None,   embed=True),
+    staff=Depends(get_current_staff),
+):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    place = await db.create_place(region_id, category_ru, category_uz, name_ru, name_uz, lat, location_address, note)
+    return {"ok": True, "place": place}
+
+@app.put("/api/admin/places/{place_id}")
+async def update_place_ep(
+    place_id:         int,
+    region_id:        int  = Body(None, embed=True),
+    category_ru:      str  = Body(None, embed=True),
+    category_uz:      str  = Body(None, embed=True),
+    name_ru:          str  = Body(None, embed=True),
+    name_uz:          str  = Body(None, embed=True),
+    lat:              str  = Body(None, embed=True),
+    location_address: str  = Body(None, embed=True),
+    note:             str  = Body(None, embed=True),
+    active:           bool = Body(None, embed=True),
+    staff=Depends(get_current_staff),
+):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    fields = {k: v for k, v in {
+        "region_id": region_id, "category_ru": category_ru, "category_uz": category_uz,
+        "name_ru": name_ru, "name_uz": name_uz,
+        "lat": lat, "location_address": location_address, "note": note, "active": active,
+    }.items() if v is not None}
+    place = await db.update_place(place_id, **fields)
+    if not place:
+        raise HTTPException(status_code=404, detail="Точка не найдена")
+    return {"ok": True, "place": place}
+
+@app.delete("/api/admin/places/{place_id}")
+async def delete_place_ep(place_id: int, staff=Depends(get_current_staff)):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    ok = await db.delete_place(place_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Точка не найдена")
+    return {"ok": True}
+
+# ── Справочник категорий точек — редактируемый самой компанией (см. places выше).
+@app.get("/api/admin/place-categories")
+async def list_place_categories_ep(staff=Depends(get_current_staff)):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    cats = await db.list_place_categories()
+    return {"ok": True, "categories": cats}
+
+@app.post("/api/admin/place-categories")
+async def create_place_category_ep(
+    name_ru:    str = Body(...,    embed=True),
+    name_uz:    str = Body(None,   embed=True),
+    icon:       str = Body(None,   embed=True),
+    sort_order: int = Body(0,      embed=True),
+    staff=Depends(get_current_staff),
+):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    cat = await db.create_place_category(name_ru, name_uz, icon, sort_order)
+    return {"ok": True, "category": cat}
+
+@app.put("/api/admin/place-categories/{cat_id}")
+async def update_place_category_ep(
+    cat_id:     int,
+    name_ru:    str  = Body(None, embed=True),
+    name_uz:    str  = Body(None, embed=True),
+    icon:       str  = Body(None, embed=True),
+    sort_order: int  = Body(None, embed=True),
+    active:     bool = Body(None, embed=True),
+    staff=Depends(get_current_staff),
+):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    fields = {k: v for k, v in {
+        "name_ru": name_ru, "name_uz": name_uz, "icon": icon,
+        "sort_order": sort_order, "active": active,
+    }.items() if v is not None}
+    cat = await db.update_place_category(cat_id, **fields)
+    if not cat:
+        raise HTTPException(status_code=404, detail="Категория не найдена")
+    return {"ok": True, "category": cat}
+
+@app.delete("/api/admin/place-categories/{cat_id}")
+async def delete_place_category_ep(cat_id: int, staff=Depends(get_current_staff)):
+    if staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Только для admin")
+    ok = await db.delete_place_category(cat_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Категория не найдена")
+    return {"ok": True}
+
+
 @app.get("/api/clients/by-phone/{phone}")
 async def client_by_phone(phone: str, _=Depends(_get_admin_or_staff_clients)):
     phone = normalize_phone(phone)

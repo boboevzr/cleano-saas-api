@@ -110,6 +110,490 @@ async def init_db():
     logging.info("✅ API: Database connected")
 
 
+# Стартовый список категорий точек (places) — засевается каждой компании
+# отдельно (см. _seed_default_place_categories), т.к. справочник у каждой
+# свой. Перенесено из ARTEZ 1:1 (там список общий на весь бизнес).
+_DEFAULT_PLACE_CATEGORIES = [
+    ('Кафе', 'Kafe', '☕'), ('Ресторан', 'Restoran', '🍽️'),
+    ('Фастфуд', 'Fast-fud', '🍔'), ('Пекарня', 'Nonvoyxona', '🥐'),
+    ('Кондитерская', 'Qandolatxona', '🍰'), ('Чайхана', 'Choyxona', '🫖'),
+    ('Общежитие', 'Yotoqxona', '🛏️'), ('Гостиница', 'Mehmonxona', '🏨'),
+    ('Хостел', 'Xostel', '🛌'), ('Магазин', "Do'kon", '🏪'),
+    ('Супермаркет', 'Supermarket', '🛒'), ('Рынок', 'Bozor', '🧺'),
+    ('Аптека', 'Dorixona', '💊'), ('Книжный магазин', "Kitob do'koni", '📚'),
+    ('Цветочный магазин', "Gul do'koni", '💐'), ('Ювелирный магазин', "Zargarlik do'koni", '💍'),
+    ('Магазин одежды', "Kiyim do'koni", '👕'), ('Обувной магазин', "Poyabzal do'koni", '👟'),
+    ('Стройматериалы', 'Qurilish materiallari', '🧱'), ('Автозапчасти', 'Avto ehtiyot qismlar', '🔧'),
+    ('Мебельный магазин', "Mebel do'koni", '🛋️'), ('Клиника', 'Klinika', '🏥'),
+    ('Стоматология', 'Stomatologiya', '🦷'), ('Поликлиника', 'Poliklinika', '⚕️'),
+    ('Ветеринарная клиника', 'Veterinariya klinikasi', '🐾'), ('Школа', 'Maktab', '🏫'),
+    ('Детский сад', "Bog'cha", '🧸'), ('Детский центр', 'Bolalar markazi', '🎈'),
+    ('Университет', 'Universitet', '🎓'), ('Курсы', 'Kurslar', '📖'),
+    ('Парикмахерская', 'Sartaroshxona', '💇'), ('Салон красоты', "Go'zallik saloni", '💅'),
+    ('Спа', 'Spa markazi', '🧖'), ('Барбершоп', 'Barbershop', '💈'),
+    ('Автосервис', 'Avtoservis', '🔧'), ('Автомойка', 'Avtomoyka', '🚗'),
+    ('АЗС', "Yoqilg'i shahobchasi", '⛽'), ('Шиномонтаж', 'Shinamontaj', '🛞'),
+    ('Банк', 'Bank', '🏦'), ('Почта', 'Pochta', '📮'),
+    ('Нотариус', 'Notarius', '📝'), ('Центр гос. услуг', 'Xizmatlar markazi', '🏢'),
+    ('Спортзал', 'Sport zali', '🏋️'), ('Бассейн', 'Basseyn', '🏊'),
+    ('Кинотеатр', 'Kinoteatr', '🎬'), ('Парк', "Bog'", '🌳'),
+    ('Мечеть', 'Masjid', '🕌'), ('Церковь', 'Cherkov', '⛪'),
+    ('Офис', 'Ofis', '🏢'), ('Склад', 'Ombor', '📦'),
+    ('Мастерская', 'Usta xonasi', '🛠️'),
+]
+
+async def _seed_default_place_categories(company_id: int, conn=None) -> None:
+    """Заводит стартовый список категорий точек для компании, если у неё
+    их ещё нет (не трогает, если админ компании уже успел их отредактировать/
+    удалить — проверка по количеству строк, не по содержимому)."""
+    if not pool: return
+    async def _do(c):
+        cnt = await c.fetchval("SELECT COUNT(*) FROM place_categories WHERE company_id=$1", company_id)
+        if cnt: return
+        await c.executemany(
+            "INSERT INTO place_categories (company_id, name_ru, name_uz, icon, sort_order) VALUES ($1,$2,$3,$4,$5)",
+            [(company_id, ru, uz, icon, i + 1) for i, (ru, uz, icon) in enumerate(_DEFAULT_PLACE_CATEGORIES)]
+        )
+    if conn is not None:
+        await _do(conn)
+    else:
+        async with pool.acquire() as c:
+            await _do(c)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ЛОГИСТИКА: РЕГИОНЫ ОБСЛУЖИВАНИЯ + PLACES + КАТЕГОРИИ ТОЧЕК
+# Перенесено из ARTEZ (single-tenant — там одно дерево на весь бизнес).
+# Здесь каждая функция company-scoped через cid = _cid() — своё дерево адресов,
+# свои places, свой справочник категорий у каждой компании. Любая функция,
+# принимающая id конкретной строки (update/delete), обязательно проверяет
+# company_id в WHERE — иначе компания A могла бы поменять/удалить строку
+# компании B, подобрав/угадав id (IDOR, не существовавший в single-tenant ARTEZ,
+# где id всегда принадлежал единственному бизнесу).
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def get_service_regions_tree(active_only: bool = True) -> list:
+    """Возвращает дерево: уровень1 -> children (уровень2) -> children (уровень3)."""
+    if not pool: return []
+    cid = _cid()
+    where = "WHERE company_id=$1" + (" AND active=TRUE" if active_only else "")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"SELECT * FROM service_regions {where} ORDER BY sort_order, id", cid)
+    nodes = [dict(r) for r in rows]
+    by_id = {n['id']: n for n in nodes}
+    for n in nodes:
+        n['children'] = []
+        # asyncpg отдаёт jsonb как текст — распаковываем polygon в массив точек,
+        # чтобы фронт получал обычный JS-массив, а не JSON-строку внутри JSON.
+        if isinstance(n.get('polygon'), str):
+            n['polygon'] = json.loads(n['polygon'])
+    roots = []
+    for n in nodes:
+        if n['parent_id'] and n['parent_id'] in by_id:
+            by_id[n['parent_id']]['children'].append(n)
+        elif not n['parent_id']:
+            roots.append(n)
+    return roots
+
+# ── places: универсальный слой типизированных точек (общежития/кафе/гостиницы
+# и т.п.), физически внутри узла адресного дерева, но не являющихся "домом". ──
+
+def _place_as_node(p: dict) -> dict:
+    """Представляет запись places как узел-лист адресного дерева для мест, где
+    ожидается service_regions-совместимая форма (staff-пикер, поиск). id делаем
+    ОТРИЦАТЕЛЬНЫМ (-place.id) — id мест и id узлов дерева это две разные
+    последовательности SERIAL, без этого трюка они бы коллидировали в одном
+    списке детей. leads/orders.region_id при выборе места пишет p['region_id']
+    (родительский узел дерева), а не -p['id'] — FK ссылается только на дерево."""
+    return {
+        "id": -p["id"],
+        "place_id": p["id"],
+        "parent_id": p.get("region_id"),
+        "region_id": p.get("region_id"),
+        "level": 4,
+        "node_type": None,
+        "is_place": True,
+        "category_ru": p.get("category_ru"),
+        "category_uz": p.get("category_uz"),
+        "name_ru": p["name_ru"],
+        "name_uz": p.get("name_uz") or p["name_ru"],
+        "name_ru_full": p["name_ru"],
+        "name_uz_full": p.get("name_uz") or p["name_ru"],
+        "lat": p.get("lat"),
+        "location_address": p.get("location_address"),
+        "note": p.get("note"),
+        "not_exists": False,
+        "active": p.get("active", True),
+        "poi_type": None,
+        "sort_order": 999999,  # места — в конце списка домов
+    }
+
+async def create_place(region_id, category_ru, category_uz, name_ru: str, name_uz=None,
+                        lat=None, location_address=None, note=None) -> dict:
+    if not pool: return {}
+    cid = _cid()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO places (company_id, region_id, category_ru, category_uz, name_ru, name_uz, lat, location_address, note)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *
+        """, cid, region_id, category_ru, category_uz, name_ru, name_uz or name_ru, lat, location_address, note)
+        return dict(row) if row else {}
+
+async def update_place(place_id: int, **kwargs) -> dict | None:
+    if not pool: return None
+    cid = _cid()
+    allowed = {"region_id", "category_ru", "category_uz", "name_ru", "name_uz", "lat", "location_address", "note", "active"}
+    fields = {k: v for k, v in kwargs.items() if k in allowed}
+    if not fields: return None
+    set_parts = ", ".join(f"{k}=${i+3}" for i, k in enumerate(fields))
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"UPDATE places SET {set_parts} WHERE id=$1 AND company_id=$2 RETURNING *",
+            place_id, cid, *list(fields.values()))
+        return dict(row) if row else None
+
+async def delete_place(place_id: int) -> bool:
+    if not pool: return False
+    cid = _cid()
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM places WHERE id=$1 AND company_id=$2", place_id, cid)
+        return result == "DELETE 1"
+
+# ── Справочник категорий точек — редактируется самой компанией, засеян
+# автоматически при создании компании (_seed_default_place_categories выше). ──
+async def list_place_categories(active_only: bool = False) -> list:
+    if not pool: return []
+    cid = _cid()
+    where = "WHERE company_id=$1" + (" AND active=TRUE" if active_only else "")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"SELECT * FROM place_categories {where} ORDER BY sort_order, id", cid)
+        return [dict(r) for r in rows]
+
+async def create_place_category(name_ru: str, name_uz=None, icon=None, sort_order: int = 0) -> dict:
+    if not pool: return {}
+    cid = _cid()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO place_categories (company_id, name_ru, name_uz, icon, sort_order)
+            VALUES ($1,$2,$3,$4,$5) RETURNING *
+        """, cid, name_ru, name_uz or name_ru, icon, sort_order)
+        return dict(row) if row else {}
+
+async def update_place_category(cat_id: int, **kwargs) -> dict | None:
+    if not pool: return None
+    cid = _cid()
+    allowed = {"name_ru", "name_uz", "icon", "sort_order", "active"}
+    fields = {k: v for k, v in kwargs.items() if k in allowed}
+    if not fields: return None
+    set_parts = ", ".join(f"{k}=${i+3}" for i, k in enumerate(fields))
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"UPDATE place_categories SET {set_parts} WHERE id=$1 AND company_id=$2 RETURNING *",
+            cat_id, cid, *list(fields.values()))
+        return dict(row) if row else None
+
+async def delete_place_category(cat_id: int) -> bool:
+    if not pool: return False
+    cid = _cid()
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM place_categories WHERE id=$1 AND company_id=$2", cat_id, cid)
+        return result == "DELETE 1"
+
+async def list_places_by_region(region_id: int) -> list:
+    """Прямой (не в service_regions-совместимой форме) список точек узла — для админки."""
+    if not pool: return []
+    cid = _cid()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM places WHERE region_id=$1 AND company_id=$2 ORDER BY active DESC, name_ru",
+            region_id, cid)
+        return [dict(r) for r in rows]
+
+async def get_places_children(parent_id: int) -> list:
+    """Точки узла в service_regions-совместимой форме — подмешиваются в get_service_region_children."""
+    if not pool or parent_id is None: return []
+    rows = await list_places_by_region(parent_id)
+    return [_place_as_node(p) for p in rows if p.get("active", True)]
+
+async def _region_ancestors_chain(conn, region_id):
+    """Полная цепочка от корня дерева до region_id включительно, по уровням."""
+    if region_id is None: return []
+    cid = _cid()
+    rows = await conn.fetch("""
+        WITH RECURSIVE anc AS (
+            SELECT id, parent_id, name_ru, name_ru_full, node_type, level
+            FROM service_regions WHERE id=$1 AND company_id=$2
+            UNION ALL
+            SELECT sr.id, sr.parent_id, sr.name_ru, sr.name_ru_full, sr.node_type, sr.level
+            FROM service_regions sr JOIN anc a ON sr.id = a.parent_id
+            WHERE sr.company_id=$2
+        )
+        SELECT * FROM anc ORDER BY level
+    """, region_id, cid)
+    return [dict(r) for r in rows]
+
+async def search_places(query: str, limit: int = 8) -> list:
+    """Поиск по названию точки с хлебной крошкой её родителя в адресном дереве."""
+    if not pool: return []
+    cid = _cid()
+    like = f"%{query}%"
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT * FROM places WHERE company_id=$1 AND active=TRUE AND (name_ru ILIKE $2 OR name_uz ILIKE $2)
+            ORDER BY name_ru LIMIT $3
+        """, cid, like, limit)
+        results = []
+        for r in rows:
+            p = dict(r)
+            chain = await _region_ancestors_chain(conn, p.get("region_id"))
+            crumb = " → ".join((c.get("name_ru_full") or c["name_ru"]) for c in chain)
+            node = _place_as_node(p)
+            node["breadcrumb"] = f"{crumb} → {p['name_ru']}" if crumb else p["name_ru"]
+            node["short_fill"] = p["name_ru"]
+            results.append(node)
+        return results
+
+async def get_service_region_children(parent_id: int = None) -> list:
+    """Плоский список прямых детей узла (или корней уровня 1, если parent_id не задан) —
+    для узлов дерева дополнительно подмешиваются точки (places) этого узла."""
+    if not pool: return []
+    cid = _cid()
+    async with pool.acquire() as conn:
+        if parent_id is None:
+            rows = await conn.fetch(
+                "SELECT * FROM service_regions WHERE company_id=$1 AND parent_id IS NULL AND active=TRUE AND not_exists IS NOT TRUE ORDER BY sort_order, id",
+                cid)
+            return [dict(r) for r in rows]
+        rows = await conn.fetch(
+            "SELECT * FROM service_regions WHERE company_id=$1 AND parent_id=$2 AND active=TRUE AND not_exists IS NOT TRUE ORDER BY sort_order, id",
+            cid, parent_id)
+    result = [dict(r) for r in rows]
+    result += await get_places_children(parent_id)
+    return result
+
+def _split_compound_region_query(q: str):
+    """"11-27" / "11, 27" / "11 27" -> ("11", "27") — короткая запись объект+дом,
+    как в short_fill. Возвращает (None, None), если запрос не похож на пару."""
+    q = q.strip()
+    for sep in ('-', ',', ' '):
+        if sep in q:
+            a, b = q.split(sep, 1)
+            a, b = a.strip(), b.strip()
+            if a and b:
+                return a, b
+    return None, None
+
+async def search_service_regions(query: str, limit: int = 15) -> list:
+    """Поиск по name_ru/name_uz на всех уровнях с хлебной крошкой пути и координатами.
+    Дополнительно понимает составной запрос "11-27" (объект-дом) — ищет дом по
+    housePart среди детей объекта, чьё название совпадает с objPart."""
+    if not pool: return []
+    cid = _cid()
+    like = f"%{query}%"
+    prefix = f"{query}%"
+    obj_part, house_part = _split_compound_region_query(query)
+    obj_prefix = f"{obj_part}%" if obj_part else None
+    house_prefix = f"{house_part}%" if house_part else None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT r.*, p1.name_ru AS p1_name_ru, p1.name_ru_full AS p1_name_ru_full,
+                   p2.name_ru AS p2_name_ru, p2.name_ru_full AS p2_name_ru_full, p2.node_type AS p2_node_type,
+                   p3.name_ru AS p3_name_ru, p3.name_ru_full AS p3_name_ru_full, p3.node_type AS p3_node_type
+            FROM service_regions r
+            LEFT JOIN service_regions p3 ON p3.id = r.parent_id
+            LEFT JOIN service_regions p2 ON p2.id = p3.parent_id
+            LEFT JOIN service_regions p1 ON p1.id = p2.parent_id
+            WHERE r.company_id=$6 AND r.active=TRUE AND r.not_exists IS NOT TRUE AND (
+                r.name_ru ILIKE $1 OR r.name_uz ILIKE $1
+                OR ($4::text IS NOT NULL AND r.level = 4 AND (r.name_ru ILIKE $4 OR r.name_uz ILIKE $4)
+                    AND (p3.name_ru ILIKE $5 OR p3.name_uz ILIKE $5))
+            )
+            ORDER BY
+                CASE
+                    WHEN $4::text IS NOT NULL AND r.level = 4 AND (r.name_ru ILIKE $4 OR r.name_uz ILIKE $4)
+                         AND (p3.name_ru ILIKE $5 OR p3.name_uz ILIKE $5) THEN -1
+                    WHEN r.name_ru ILIKE $2 OR r.name_uz ILIKE $2 THEN 0
+                    ELSE 1
+                END,
+                r.name_ru
+            LIMIT $3
+        """, like, prefix, limit, house_prefix, obj_prefix, cid)
+    results = []
+    for r in rows:
+        d = dict(r)
+        p1_name_short = d.pop('p1_name_ru', None)
+        p1_name_full  = d.pop('p1_name_ru_full', None)
+        p2_name_short = d.pop('p2_name_ru', None)
+        p2_name_full  = d.pop('p2_name_ru_full', None)
+        p2_node_type  = d.pop('p2_node_type', None)
+        p3_name_short = d.pop('p3_name_ru', None)
+        p3_name_full  = d.pop('p3_name_ru_full', None)
+        p3_node_type  = d.pop('p3_node_type', None)
+        r_disp_name = d.get('name_ru_full') or d['name_ru']
+        breadcrumb_parts = (p1_name_full or p1_name_short, p2_name_full or p2_name_short,
+                            p3_name_full or p3_name_short, r_disp_name)
+        d['breadcrumb'] = " → ".join(p for p in breadcrumb_parts if p)
+        object_name, house_name, node_type = None, None, None
+        if d['level'] == 4:
+            object_name, house_name, node_type = p3_name_short, d['name_ru'], p2_node_type
+        elif d['level'] == 3:
+            object_name, node_type = d['name_ru'], p3_node_type
+        if object_name and node_type == 'microdistrict':
+            d['short_fill'] = f"{object_name}-{house_name}-" if house_name else f"{object_name}-"
+        elif object_name:
+            d['short_fill'] = f"{object_name}, {house_name}" if house_name else f"{object_name}, "
+        else:
+            d['short_fill'] = None
+        results.append(d)
+    place_results = await search_places(query, limit=max(3, limit // 3))
+    return (results + place_results)[:limit]
+
+async def create_service_region(parent_id, level: int, node_type, branch, name_ru: str,
+                                 name_uz=None, lat=None, location_address=None,
+                                 sort_order: int = 0, note=None,
+                                 name_ru_full=None, name_uz_full=None,
+                                 not_exists: bool = False, polygon=None, poi_type=None) -> dict:
+    if not pool: return {}
+    cid = _cid()
+    if polygon is not None and not isinstance(polygon, str):
+        polygon = json.dumps(polygon)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO service_regions
+                (company_id, parent_id, level, node_type, branch, name_ru, name_uz, lat, location_address, sort_order, note,
+                 name_ru_full, name_uz_full, not_exists, polygon, poi_type)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16) RETURNING *
+        """, cid, parent_id, level, node_type, branch, name_ru, name_uz, lat, location_address, sort_order, note,
+            name_ru_full, name_uz_full, not_exists, polygon, poi_type)
+        return dict(row) if row else {}
+
+async def update_service_region(region_id: int, **kwargs) -> dict | None:
+    if not pool: return None
+    cid = _cid()
+    allowed = {"parent_id", "level", "node_type", "branch", "name_ru", "name_uz",
+               "name_ru_full", "name_uz_full", "not_exists", "poi_type",
+               "lat", "location_address", "polygon", "sort_order", "active", "note"}
+    fields = {k: v for k, v in kwargs.items() if k in allowed}
+    if not fields: return None
+    # polygon — JSONB; asyncpg не сериализует Python-объекты в jsonb сам по себе,
+    # нужен явный json.dumps + приведение типа в SQL.
+    if "polygon" in fields and fields["polygon"] is not None and not isinstance(fields["polygon"], str):
+        fields["polygon"] = json.dumps(fields["polygon"])
+    set_parts = ", ".join(
+        f"{k}=${i+3}" + ("::jsonb" if k == "polygon" else "")
+        for i, k in enumerate(fields)
+    )
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"UPDATE service_regions SET {set_parts} WHERE id=$1 AND company_id=$2 RETURNING *",
+            region_id, cid, *list(fields.values()))
+        return dict(row) if row else None
+
+async def delete_service_region(region_id: int) -> dict:
+    if not pool: return {"ok": False, "error": "no pool"}
+    cid = _cid()
+    async with pool.acquire() as conn:
+        has_children = await conn.fetchval(
+            "SELECT COUNT(*) FROM service_regions WHERE parent_id=$1 AND company_id=$2", region_id, cid)
+        if has_children:
+            return {"ok": False, "error": "has_children"}
+        result = await conn.execute("DELETE FROM service_regions WHERE id=$1 AND company_id=$2", region_id, cid)
+        if result != "DELETE 1":
+            return {"ok": False, "error": "not_found"}
+        return {"ok": True}
+
+# ── Архивация регионов (защита от потери данных при импорте/экспорте Excel) ──
+
+async def create_service_regions_backup(label: str = None, created_by: int = None) -> dict:
+    """Снимок ВСЕЙ таблицы service_regions СВОЕЙ компании как есть на текущий момент."""
+    if not pool: return {}
+    cid = _cid()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM service_regions WHERE company_id=$1 ORDER BY id", cid)
+        records = [dict(r) for r in rows]
+        data_json = json.dumps(records, default=str, ensure_ascii=False)
+        row = await conn.fetchrow("""
+            INSERT INTO service_regions_backups (company_id, label, created_by, record_count, data)
+            VALUES ($1, $2, $3, $4, $5::jsonb)
+            RETURNING id, label, created_by, record_count, created_at
+        """, cid, label, created_by, len(records), data_json)
+        return dict(row) if row else {}
+
+async def list_service_regions_backups(limit: int = 30) -> list:
+    if not pool: return []
+    cid = _cid()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, label, created_by, record_count, created_at
+            FROM service_regions_backups WHERE company_id=$1 ORDER BY id DESC LIMIT $2
+        """, cid, limit)
+        return [dict(r) for r in rows]
+
+async def get_service_regions_backup(backup_id: int) -> dict | None:
+    if not pool: return None
+    cid = _cid()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM service_regions_backups WHERE id=$1 AND company_id=$2", backup_id, cid)
+        if not row: return None
+        d = dict(row)
+        if isinstance(d.get("data"), str):
+            d["data"] = json.loads(d["data"])
+        return d
+
+async def restore_service_regions_backup(backup_id: int) -> dict:
+    """Восстанавливает записи из архива СВОЕЙ компании через UPSERT по id — НЕ
+    удаляет записи, созданные после архива, только возвращает прежние значения
+    полей для тех записей, что были в архиве.
+
+    Мультитенантная особенность (которой не было в single-tenant ARTEZ): id
+    в service_regions — ОДНА глобальная последовательность на все компании, а
+    сам архив принадлежит ровно одной. Если id из архива к текущему моменту
+    "занят" строкой ДРУГОЙ компании (в проде такое не должно происходить, но
+    это единственная реальная защита от порчи чужих данных) — WHERE в ON
+    CONFLICT DO UPDATE не даст апдейту сработать на чужой строке, апдейт для
+    неё просто NO-OP, а не перезапись; такие записи считаются в skipped."""
+    if not pool: return {"ok": False, "error": "no_pool"}
+    cid = _cid()
+    async with pool.acquire() as conn:
+        backup_row = await conn.fetchrow("SELECT data FROM service_regions_backups WHERE id=$1 AND company_id=$2", backup_id, cid)
+        if not backup_row:
+            return {"ok": False, "error": "not_found"}
+        records = backup_row["data"]
+        if isinstance(records, str):
+            records = json.loads(records)
+        restored = 0
+        skipped = 0
+        async with conn.transaction():
+            for r in records:
+                result = await conn.execute("""
+                    INSERT INTO service_regions
+                        (id, company_id, parent_id, level, node_type, branch, name_ru, name_uz, lat, location_address,
+                         polygon, sort_order, active, note, name_ru_full, name_uz_full, not_exists)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17)
+                    ON CONFLICT (id) DO UPDATE SET
+                        parent_id=EXCLUDED.parent_id, level=EXCLUDED.level, node_type=EXCLUDED.node_type,
+                        branch=EXCLUDED.branch, name_ru=EXCLUDED.name_ru, name_uz=EXCLUDED.name_uz,
+                        lat=EXCLUDED.lat, location_address=EXCLUDED.location_address,
+                        polygon=EXCLUDED.polygon, sort_order=EXCLUDED.sort_order, active=EXCLUDED.active,
+                        note=EXCLUDED.note, name_ru_full=EXCLUDED.name_ru_full, name_uz_full=EXCLUDED.name_uz_full,
+                        not_exists=EXCLUDED.not_exists
+                    WHERE service_regions.company_id = EXCLUDED.company_id
+                """, r.get("id"), cid, r.get("parent_id"), r.get("level"), r.get("node_type"), r.get("branch"),
+                    r.get("name_ru"), r.get("name_uz"), r.get("lat"), r.get("location_address"),
+                    r.get("polygon"),  # уже валидный JSON-текст (как отдала asyncpg при бэкапе) — не re-энкодить
+                    r.get("sort_order"), r.get("active"), r.get("note"),
+                    r.get("name_ru_full"), r.get("name_uz_full"), r.get("not_exists"))
+                if int(result.split()[-1] or 0):
+                    restored += 1
+                else:
+                    skipped += 1
+            # Последовательность id общая на все компании — sync по глобальному
+            # MAX(id), не по компании (иначе будущие INSERT DEFAULT сколлизят).
+            await conn.execute(
+                "SELECT setval(pg_get_serial_sequence('service_regions','id'), (SELECT MAX(id) FROM service_regions))")
+        return {"ok": True, "restored": restored, "skipped": skipped}
+
+
 async def create_tables():
     # ── Шаг 0: SaaS — компании и филиалы ────────────────────────────────
     async with pool.acquire() as c:
@@ -765,6 +1249,85 @@ async def create_tables():
         # нужен, per-company счётчик и так уже был через company_id в WHERE.
         "ALTER TABLE leads DROP CONSTRAINT IF EXISTS leads_lead_code_key",
         "CREATE UNIQUE INDEX IF NOT EXISTS leads_company_lead_code_uniq ON leads(company_id, lead_code)",
+        # Логистика: регионы обслуживания (перенос из ARTEZ, адаптировано под
+        # мультитенантность — у КАЖДОЙ компании своё дерево адресов, а не общее
+        # на всех, как в single-tenant ARTEZ). 4 уровня: населённый пункт → тип
+        # застройки → объект → дом/точка. poi_type — категория для домов-не-домов
+        # (магазин/аптека/школа и т.д.), места за пределами дерева — см. places ниже.
+        """CREATE TABLE IF NOT EXISTS service_regions (
+            id                SERIAL PRIMARY KEY,
+            company_id        INTEGER REFERENCES companies(id) DEFAULT 1,
+            parent_id         INTEGER REFERENCES service_regions(id) ON DELETE CASCADE,
+            level             SMALLINT NOT NULL,
+            node_type         VARCHAR(20),
+            branch            VARCHAR(50),
+            name_ru           VARCHAR(200) NOT NULL,
+            name_uz           VARCHAR(200),
+            name_ru_full      TEXT,
+            name_uz_full      TEXT,
+            lat               TEXT,
+            location_address  TEXT,
+            polygon           JSONB,
+            note              TEXT,
+            not_exists        BOOLEAN DEFAULT FALSE,
+            poi_type          TEXT,
+            sort_order        INT DEFAULT 0,
+            active            BOOLEAN DEFAULT TRUE,
+            created_at        TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_service_regions_parent ON service_regions(parent_id)",
+        "CREATE INDEX IF NOT EXISTS idx_service_regions_company ON service_regions(company_id)",
+        """CREATE TABLE IF NOT EXISTS service_regions_backups (
+            id            SERIAL PRIMARY KEY,
+            company_id    INTEGER REFERENCES companies(id) DEFAULT 1,
+            label         TEXT,
+            created_by    INTEGER,
+            record_count  INT,
+            data          JSONB NOT NULL,
+            created_at    TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_service_regions_backups_company ON service_regions_backups(company_id)",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS region_id INTEGER REFERENCES service_regions(id)",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS house_number VARCHAR(20)",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS apartment_number VARCHAR(10)",
+        "ALTER TABLE leads  ADD COLUMN IF NOT EXISTS region_id INTEGER REFERENCES service_regions(id)",
+        "ALTER TABLE leads  ADD COLUMN IF NOT EXISTS house_number VARCHAR(20)",
+        "ALTER TABLE leads  ADD COLUMN IF NOT EXISTS apartment_number VARCHAR(10)",
+        # Универсальный слой типизированных точек (общежития/кафе/гостиницы и т.д.),
+        # НЕ часть адресного дерева service_regions, только ссылается на него.
+        # В ARTEZ scoping был через колонку project (разные продукты на одной
+        # БД) — здесь тенант уже сама компания, поэтому company_id вместо project.
+        """CREATE TABLE IF NOT EXISTS places (
+            id                SERIAL PRIMARY KEY,
+            company_id        INTEGER REFERENCES companies(id) DEFAULT 1,
+            region_id         INTEGER REFERENCES service_regions(id),
+            category_ru       TEXT,
+            category_uz       TEXT,
+            name_ru           TEXT NOT NULL,
+            name_uz           TEXT,
+            lat               TEXT,
+            location_address  TEXT,
+            note              TEXT,
+            extra             JSONB,
+            active            BOOLEAN DEFAULT TRUE,
+            created_at        TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_places_region ON places(region_id)",
+        "CREATE INDEX IF NOT EXISTS idx_places_company ON places(company_id)",
+        # Справочник категорий точек — редактируемый самой компанией (своя
+        # копия у каждой, засевается автоматически при создании компании,
+        # см. create_company / _seed_default_place_categories).
+        """CREATE TABLE IF NOT EXISTS place_categories (
+            id           SERIAL PRIMARY KEY,
+            company_id   INTEGER REFERENCES companies(id) DEFAULT 1,
+            name_ru      TEXT NOT NULL,
+            name_uz      TEXT,
+            icon         TEXT,
+            sort_order   INT DEFAULT 0,
+            active       BOOLEAN DEFAULT TRUE,
+            created_at   TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_place_categories_company ON place_categories(company_id)",
     ]
     async with pool.acquire() as c:
         for sql in other_migrations:
@@ -797,6 +1360,13 @@ async def create_tables():
                 "INSERT INTO autodial_ivrs (exten,label,ivr_group) VALUES ($1,$2,$3)",
                 ivr_seeds
             )
+        # Справочник категорий точек — своя копия у каждой компании (мультитенант,
+        # в отличие от ARTEZ, где список один на всех). Компаниям, у которых их
+        # ещё нет (в т.ч. уже существующим на момент этой миграции), заводим
+        # стартовый список; create_company делает то же для новых компаний.
+        company_ids = [r["id"] for r in await c.fetch("SELECT id FROM companies")]
+        for cid_ in company_ids:
+            await _seed_default_place_categories(cid_, conn=c)
 
     # ── Шаг 2: миграции staff (добавляем недостающие колонки) ────────────
     staff_migrations = [
@@ -10281,13 +10851,16 @@ async def create_company(name: str, slug: str, secret_key: str,
     if not pool: return None
     async with pool.acquire() as conn:
         try:
-            return await conn.fetchrow("""
+            row = await conn.fetchrow("""
                 INSERT INTO companies (name, slug, secret_key, plan, max_branches, max_staff, active)
                 VALUES ($1, $2, $3, $4, $5, $6, TRUE)
                 RETURNING *
             """, name, slug, secret_key, plan, max_branches, max_staff)
         except Exception:
             return None  # slug уже занят
+    if row:
+        await _seed_default_place_categories(row["id"])
+    return row
 
 async def get_company_slug(company_id: int) -> str:
     if not pool: return ""
