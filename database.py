@@ -5996,11 +5996,12 @@ async def get_crm_clients_search_count(search: str = "") -> int:
         return await conn.fetchval("SELECT COUNT(*) FROM crm_clients WHERE company_id=$1", cid)
 
 async def get_clients_map_points(date_from: str = None, date_to: str = None) -> list:
-    """По одной точке на клиента (своей компании) — координаты последнего заказа
-    с указанной точкой (у самого клиента координат не хранится, только текстовый
-    адрес). date_from/date_to (YYYY-MM-DD, включительно) фильтруют, СРЕДИ КАКИХ
-    заказов искать "последний" — фильтр внутри WHERE той же выборки, ДО DISTINCT
-    ON, иначе получится последний заказ вообще, а не последний внутри периода."""
+    """По одной точке на КАЖДЫЙ уникальный адрес клиента своей компании (у
+    самого клиента координат не хранится, только текстовый адрес в заказах) —
+    если клиент заказывал с разных адресов, каждый получает свою метку;
+    несколько заказов с ОДНИМ адресом схлопываются в одну точку (берётся
+    самый свежий). date_from/date_to (YYYY-MM-DD, включительно) фильтруют,
+    СРЕДИ КАКИХ заказов искать — важно фильтровать ДО DISTINCT ON."""
     if not pool: return []
     cid = _cid()
     # asyncpg с явным ::date в SQL требует datetime.date, а не строку — передача
@@ -6020,14 +6021,14 @@ async def get_clients_map_points(date_from: str = None, date_to: str = None) -> 
         where.append(f"o.created_at < (${len(params)}::date + INTERVAL '1 day')")
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"""
-            SELECT DISTINCT ON (o.client_phone)
+            SELECT DISTINCT ON (o.client_phone, o.location)
                    c.id AS client_id, o.client_phone AS phone,
                    c.first_name, c.last_name, c.status,
                    o.location, o.location_address
             FROM orders o
             JOIN crm_clients c ON c.phone = o.client_phone AND c.company_id = o.company_id
             WHERE {" AND ".join(where)}
-            ORDER BY o.client_phone, o.created_at DESC
+            ORDER BY o.client_phone, o.location, o.created_at DESC
         """, *params)
         return [dict(r) for r in rows]
 
