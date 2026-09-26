@@ -9223,8 +9223,7 @@ async def get_routes_today(company_id: int, branch: str | None = None) -> list:
                    o.address, o.short_address, o.location, o.location_address,
                    o.delivery_address, o.delivery_short_address,
                    o.delivery_location, o.delivery_location_address,
-                   COALESCE((SELECT SUM(COALESCE(sqm*price_per_sqm,0)) FROM order_items WHERE order_id=o.id),
-                            COALESCE(o.total_price,0)) AS items_total,
+                   COALESCE(o.total_price,0) AS total_price,
                    COALESCE(o.discount_sum,0)+COALESCE(o.delivery_discount,0)+COALESCE(o.manual_discount,0) AS total_discount,
                    COALESCE((SELECT SUM(amount) FROM order_payments WHERE order_id=o.id
                               AND ((method='cash' AND NOT (confirmed=FALSE AND confirmed_at IS NOT NULL))
@@ -9265,11 +9264,21 @@ async def get_routes_today(company_id: int, branch: str | None = None) -> list:
                 "delivery_short_address": row.get("delivery_short_address"),
                 "delivery_location":         row.get("delivery_location"),
                 "delivery_location_address": row.get("delivery_location_address"),
-                "items_total":    float(row["items_total"]),
+                "total_price":    float(row["total_price"]),
                 "total_discount": float(row["total_discount"]),
                 "paid_amount":    float(row["paid_amount"]),
                 "item_count":     row["item_count"],
             })
+        # items_total — та же формула с учётом мин.по.позиции/мин.по.заказу, что и
+        # карточка заказа (get_orders_items_totals), а не сырой SUM(sqm*price_per_sqm) —
+        # иначе "к оплате" в staff «Доставка» у водителя расходится с карточкой заказа
+        # (тот же класс бага, что уже был исправлен в get_route() выше).
+        all_stops = [s for r in routes.values() for s in r["stops"]]
+        item_totals = await get_orders_items_totals([s["order_id"] for s in all_stops])
+        for s in all_stops:
+            oid = s["order_id"]
+            s["items_total"] = item_totals[oid] if oid in item_totals else s["total_price"]
+            s.pop("total_price", None)
         return list(routes.values())
 
 async def driver_set_stop_status(order_id: int, status: str):
