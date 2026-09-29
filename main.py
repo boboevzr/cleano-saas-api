@@ -2243,6 +2243,24 @@ def _build_stop_text_short(stop: dict, num: int) -> str:
     count_str = f" / {item_count}" if item_count else ""
     return f"📦 #{num}·{h(order_num)}{count_str} {addr_part}\n{contact}\n{pay_line}"
 
+def _build_address_list_text(stops: list[dict]) -> str:
+    """Компактный список адресов всех остановок маршрута со ссылками на Яндекс-навигатор —
+    отдельным сообщением в конец канала, чтобы водитель мог быстро открыть нужный адрес,
+    не листая карточки каждой остановки (перенос из ARTEZ, запрос пользователя 2026-09-29)."""
+    import html as _html
+    def h(s): return _html.escape(str(s)) if s else ""
+    lines = ["📍 <b>Адреса маршрута</b>"]
+    for i, s in enumerate(stops, 1):
+        addr = s.get("short_address") or s.get("address") or s.get("location_address") or "—"
+        loc  = _parse_loc_str(s.get("location"))
+        if loc:
+            yandex = f"https://yandex.com/maps/?rtext=~{loc[0]},{loc[1]}&rtt=auto"
+            lines.append(f'{i}. <a href="{yandex}">{h(addr)}</a>')
+        else:
+            lines.append(f'{i}. {h(addr)}')
+    return "\n".join(lines)
+
+
 @app.post("/api/admin/routes/{route_id}/send-to-delivery-group")
 async def send_route_to_delivery_group(route_id: int, me=Depends(get_current_staff)):
     route = await db.get_route(route_id)
@@ -2336,6 +2354,11 @@ async def send_route_to_delivery_group(route_id: int, me=Depends(get_current_sta
     ftr_id = await _send_tg_with_kb(dest, footer_text, {"inline_keyboard": []}, silent=True, protect=True)
     if ftr_id:
         new_msg_ids["__footer__"] = ftr_id
+
+    addr_list_text = _build_address_list_text(stops)
+    addr_id = await _send_tg_with_kb(dest, addr_list_text, {"inline_keyboard": []}, silent=True, protect=True)
+    if addr_id:
+        new_msg_ids["__addrlist__"] = addr_id
 
     if sent == 0 and tg_error:
         logging.error(f"send-to-delivery-group failed: {tg_error}")
