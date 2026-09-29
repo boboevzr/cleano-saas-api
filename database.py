@@ -3444,12 +3444,17 @@ async def check_promo_eligibility(user_id: int, phone: str, channel: str) -> dic
             promo["id"], user_id
         )
         if not state:
+            now = datetime.now(timezone.utc)
+            if promo["window_hours"]:
+                expires_at = min(now + timedelta(hours=promo["window_hours"]), promo["ends_at"])
+            else:
+                expires_at = promo["ends_at"]
             state = await conn.fetchrow("""
                 INSERT INTO promo_user_state (promotion_id, user_id, shown_at, expires_at, channel)
-                VALUES ($1, $2, NOW(), NOW() + ($3 * INTERVAL '1 hour'), $4)
+                VALUES ($1, $2, NOW(), $3, $4)
                 ON CONFLICT (promotion_id, user_id) DO NOTHING
                 RETURNING *
-            """, promo["id"], user_id, promo["window_hours"], channel)
+            """, promo["id"], user_id, expires_at, channel)
             if state:
                 mode = "full"
             else:
@@ -3590,6 +3595,19 @@ async def update_promotion(promo_id: int, **kwargs) -> dict | None:
                 promo_id, *vals, cid
             )
             return dict(row) if row else None
+
+
+async def reset_promo_tracking(promo_id: int) -> int:
+    """Admin: чистит promo_user_state для акции текущей компании — позволяет
+    повторно показать акцию тем, кто её уже видел (напр. при перезапуске кампании).
+    Скоуп по company_id — иначе можно было бы сбросить трекинг чужой компании."""
+    cid = _cid()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM promo_user_state WHERE promotion_id=$1 AND company_id=$2",
+            promo_id, cid
+        )
+        return int(result.split()[-1]) if result else 0
 
 
 # ══════════════════════════════════════

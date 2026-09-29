@@ -4128,10 +4128,10 @@ class PromotionCreateRequest(BaseModel):
     title_uz:        str
     text_ru:         str
     text_uz:         str
-    discount_pct:    float
+    discount_pct:    float = 0
     starts_at:       str | None = None
     ends_at:         str
-    window_hours:    int = 48
+    window_hours:    int | None = None
     sound_enabled:   bool = True
     target_new_only: bool = False
     is_active:       bool = True
@@ -4163,7 +4163,7 @@ async def admin_list_promotions(_=Depends(_get_admin)):
 async def admin_create_promotion(body: PromotionCreateRequest, _=Depends(_get_admin)):
     """Создаёт новую промо-кампанию. При is_active=true остальные кампании деактивируются
     (правило "не более одной активной одновременно")."""
-    if not (0 < body.discount_pct <= 100):
+    if not (0 <= body.discount_pct <= 100):
         raise HTTPException(status_code=400, detail="Скидка должна быть в диапазоне от 0 до 100%")
     starts_at = _parse_promo_dt(body.starts_at)
     ends_at = _parse_promo_dt(body.ends_at)
@@ -4173,7 +4173,7 @@ async def admin_create_promotion(body: PromotionCreateRequest, _=Depends(_get_ad
         row = await db.create_promotion(
             code=body.code.strip(), title_ru=body.title_ru, title_uz=body.title_uz,
             text_ru=body.text_ru, text_uz=body.text_uz, discount_pct=body.discount_pct,
-            ends_at=ends_at, starts_at=starts_at, window_hours=body.window_hours,
+            ends_at=ends_at, starts_at=starts_at, window_hours=body.window_hours or 0,
             sound_enabled=body.sound_enabled, target_new_only=body.target_new_only,
             is_active=body.is_active,
         )
@@ -4191,8 +4191,10 @@ async def admin_update_promotion(promo_id: int, body: PromotionUpdateRequest, _=
     деактивируются (правило "не более одной активной одновременно")."""
     data = body.dict(exclude_unset=True)
     if "discount_pct" in data and data["discount_pct"] is not None:
-        if not (0 < data["discount_pct"] <= 100):
+        if not (0 <= data["discount_pct"] <= 100):
             raise HTTPException(status_code=400, detail="Скидка должна быть в диапазоне от 0 до 100%")
+    if "window_hours" in data and data["window_hours"] is None:
+        data["window_hours"] = 0
     if "starts_at" in data:
         data["starts_at"] = _parse_promo_dt(data["starts_at"])
     if "ends_at" in data:
@@ -4213,6 +4215,14 @@ async def admin_update_promotion(promo_id: int, body: PromotionUpdateRequest, _=
     if not row:
         raise HTTPException(status_code=404, detail="Акция не найдена")
     return {"ok": True, "promotion": row}
+
+
+@app.post("/api/admin/promotions/{promo_id}/reset-tracking")
+async def admin_reset_promo_tracking(promo_id: int, _=Depends(_get_admin)):
+    """Сбрасывает personal-трекинг показа акции (promo_user_state) — чтобы клиенты,
+    уже видевшие её, увидели снова (напр. после исправления конфигурации кампании)."""
+    deleted = await db.reset_promo_tracking(promo_id)
+    return {"ok": True, "deleted": deleted}
 
 
 class UpdateProfileRequest(BaseModel):
