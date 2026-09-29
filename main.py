@@ -6568,8 +6568,8 @@ async def create_expense(
     return {"ok": True, "expense": row}
 
 @app.get("/api/admin/expenses/my")
-async def my_expenses(staff=Depends(get_current_staff)):
-    rows = await db.get_my_expenses(staff["id"])
+async def my_expenses(date_from: str = None, date_to: str = None, staff=Depends(get_current_staff)):
+    rows = await db.get_my_expenses(staff["id"], date_from, date_to)
     return {"ok": True, "expenses": rows}
 
 @app.get("/api/admin/expenses")
@@ -7233,9 +7233,9 @@ async def _upsert_setting(col: str, val: str, company_id: int):
 
 
 @app.get("/api/admin/cash/my-balance")
-async def get_my_cash_balance(staff=Depends(get_current_staff)):
+async def get_my_cash_balance(date_from: str = None, date_to: str = None, staff=Depends(get_current_staff)):
     """Баланс наличных текущего сотрудника."""
-    bal = await db.get_my_cash_balance(staff["id"])
+    bal = await db.get_my_cash_balance(staff["id"], date_from, date_to)
     return {"ok": True, **bal}
 
 @app.get("/api/admin/cash/debug")
@@ -7258,12 +7258,14 @@ async def cash_debug(staff=Depends(get_current_staff)):
     }
 
 @app.get("/api/admin/cash/my-payments")
-async def get_my_cash_payments(staff=Depends(get_current_staff)):
+async def get_my_cash_payments(date_from: str = None, date_to: str = None, staff=Depends(get_current_staff)):
     """Наличные платежи где текущий сотрудник создал платёж или указан получателем."""
     if not db.pool: return {"ok": True, "payments": []}
     my_id = staff["id"]
+    params = [my_id]
+    clause = db._date_bounds_clause('p.created_at', date_from, date_to, params)
     async with db.pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT p.*,
                    o.order_num,
                    TRIM(COALESCE(o.client_first_name,'') || ' ' || COALESCE(o.client_last_name,'')) AS client_name,
@@ -7272,23 +7274,23 @@ async def get_my_cash_payments(staff=Depends(get_current_staff)):
             FROM order_payments p
             LEFT JOIN orders o ON o.id = p.order_id
             WHERE p.method='cash'
-              AND (p.created_by_staff_id=$1 OR p.handed_to_staff_id=$1)
+              AND (p.created_by_staff_id=$1 OR p.handed_to_staff_id=$1){clause}
             ORDER BY p.created_at DESC LIMIT 100
-        """, my_id)
+        """, *params)
         return {"ok": True, "payments": [dict(r) for r in rows]}
 
 
 @app.get("/api/admin/cash/my-handovers")
-async def get_my_sent_handovers_ep(staff=Depends(get_current_staff)):
+async def get_my_sent_handovers_ep(date_from: str = None, date_to: str = None, staff=Depends(get_current_staff)):
     """Исходящие передачи наличных текущего сотрудника."""
-    handovers = await db.get_my_sent_handovers(staff["id"])
+    handovers = await db.get_my_sent_handovers(staff["id"], date_from, date_to)
     return {"ok": True, "handovers": handovers}
 
 
 @app.get("/api/admin/cash/my-received-handovers")
-async def get_my_received_handovers_ep(staff=Depends(get_current_staff)):
+async def get_my_received_handovers_ep(date_from: str = None, date_to: str = None, staff=Depends(get_current_staff)):
     """Входящие подтверждённые передачи наличных текущего сотрудника."""
-    handovers = await db.get_my_received_handovers(staff["id"])
+    handovers = await db.get_my_received_handovers(staff["id"], date_from, date_to)
     return {"ok": True, "handovers": handovers}
 
 

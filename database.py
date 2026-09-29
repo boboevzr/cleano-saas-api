@@ -7851,55 +7851,95 @@ async def get_cashiers() -> list:
                ORDER BY (role='admin') DESC, last_name, first_name""")
         return [dict(r) for r in rows]
 
-async def get_my_cash_balance(staff_id: int) -> dict:
-    """Баланс конкретного сотрудника: принял / сдал / на руках."""
+def _parse_date_param(s: str):
+    """'YYYY-MM-DD' -> date, или None — общий парсер для date_from/date_to query-параметров
+    (asyncpg требует настоящий date/datetime для ::date каста, не голую строку)."""
+    if not s: return None
+    try: return datetime.strptime(s, "%Y-%m-%d").date()
+    except (ValueError, TypeError): return None
+
+
+def _date_bounds_clause(col: str, date_from: str, date_to: str, params: list) -> str:
+    """Добавляет date_from/date_to в params (по порядку) и возвращает SQL-фрагмент
+    " AND col >= $N::date AND col < ($M::date + 1 день)" — общий хелпер для всех
+    "моя касса"-запросов ниже (портировано из artez-api, см. память проекта)."""
+    frag = ""
+    df, dt = _parse_date_param(date_from), _parse_date_param(date_to)
+    if df:
+        params.append(df)
+        frag += f" AND {col} >= ${len(params)}::date"
+    if dt:
+        params.append(dt)
+        frag += f" AND {col} < (${len(params)}::date + INTERVAL '1 day')"
+    return frag
+
+
+async def _my_cash_sums(conn, staff_id: int, date_from: str, date_to: str) -> dict:
+    """Считает 7 составляющих баланса сотрудника (опционально в границах периода) —
+    общая часть для get_my_cash_balance(), вызывается дважды, когда нужен и
+    период, и всегда-актуальный "на руках"."""
+    p1 = [staff_id]
+    r1 = await conn.fetchval(
+        f"""SELECT COALESCE(SUM(amount),0) FROM order_payments
+           WHERE method='cash' AND created_by_staff_id=$1{_date_bounds_clause('created_at', date_from, date_to, p1)}""",
+        *p1)
+    p2 = [staff_id]
+    r2 = await conn.fetchval(
+        f"""SELECT COALESCE(SUM(amount),0) FROM order_payments
+           WHERE method='cash' AND handed_to_staff_id IS NOT NULL AND handed_to_staff_id!=$1
+           AND created_by_staff_id=$1{_date_bounds_clause('created_at', date_from, date_to, p2)}""",
+        *p2)
+    p3 = [staff_id]
+    r3 = await conn.fetchval(
+        f"SELECT COALESCE(SUM(amount),0) FROM order_payments WHERE handed_to_staff_id=$1 AND method='cash' AND (created_by_staff_id IS NULL OR created_by_staff_id<>$1){_date_bounds_clause('created_at', date_from, date_to, p3)}",
+        *p3)
+    p4 = [staff_id]
+    r4 = await conn.fetchval(
+        f"SELECT COALESCE(SUM(amount),0) FROM cash_handovers WHERE to_staff_id=$1 AND status='confirmed'{_date_bounds_clause('created_at', date_from, date_to, p4)}", *p4)
+    p5 = [staff_id]
+    r5 = await conn.fetchval(
+        f"SELECT COALESCE(SUM(amount),0) FROM cash_handovers WHERE from_staff_id=$1 AND status='confirmed'{_date_bounds_clause('created_at', date_from, date_to, p5)}", *p5)
+    p6 = [staff_id]
+    r6 = await conn.fetchval(
+        f"SELECT COALESCE(SUM(amount),0) FROM cash_handovers WHERE from_staff_id=$1 AND status='pending'{_date_bounds_clause('created_at', date_from, date_to, p6)}", *p6)
+    p7 = [staff_id]
+    r7 = await conn.fetchval(
+        f"SELECT COALESCE(SUM(amount),0) FROM expenses WHERE created_by_staff_id=$1 AND status IN ('approved','paid'){_date_bounds_clause('created_at', date_from, date_to, p7)}",
+        *p7)
+    collected         = float(r1)
+    given_imm         = float(r2)
+    recv_others       = float(r3)
+    recv_hand         = float(r4)
+    given_hand        = float(r5)
+    pending_sent      = float(r6)
+    expenses_approved = float(r7)
+    on_hand = collected - given_imm + recv_others + recv_hand - given_hand - expenses_approved
+    return {
+        "collected":            collected,
+        "given_immediately":    given_imm,
+        "received_from_others": recv_others + recv_hand,
+        "handed_over":          given_imm + given_hand,
+        "pending_sent":         pending_sent,
+        "expenses_approved":    expenses_approved,
+        "on_hand":              on_hand,
+    }
+
+
+async def get_my_cash_balance(staff_id: int, date_from: str = None, date_to: str = None) -> dict:
+    """Баланс конкретного сотрудника: принял / сдал / на руках.
+    Без date_from/date_to — текущий остаток за всё время. С ними — период-статистика,
+    но "on_hand_total" всегда за всё время (реальный физический остаток — running
+    balance, а не сумма за период). Портировано из artez-api по запросу пользователя
+    2026-09-29, см. память проекта."""
     if not pool: return {}
     async with pool.acquire() as conn:
-        # Принял от клиентов (только по staff_id)
-        r1 = await conn.fetchval(
-            """SELECT COALESCE(SUM(amount),0) FROM order_payments
-               WHERE method='cash' AND created_by_staff_id=$1""",
-            staff_id)
-        # Сдал сразу при записи (handed_to != me)
-        r2 = await conn.fetchval(
-            """SELECT COALESCE(SUM(amount),0) FROM order_payments
-               WHERE method='cash' AND handed_to_staff_id IS NOT NULL AND handed_to_staff_id!=$1
-               AND created_by_staff_id=$1""",
-            staff_id)
-        # Получил от других сотрудников через платёж (они сдали мне)
-        r3 = await conn.fetchval(
-            "SELECT COALESCE(SUM(amount),0) FROM order_payments WHERE handed_to_staff_id=$1 AND method='cash' AND (created_by_staff_id IS NULL OR created_by_staff_id<>$1)",
-            staff_id)
-        # Получил через ручную передачу (cash_handovers to me, только подтверждённые)
-        r4 = await conn.fetchval(
-            "SELECT COALESCE(SUM(amount),0) FROM cash_handovers WHERE to_staff_id=$1 AND status='confirmed'", staff_id)
-        # Сдал через ручную передачу (cash_handovers from me, только подтверждённые)
-        r5 = await conn.fetchval(
-            "SELECT COALESCE(SUM(amount),0) FROM cash_handovers WHERE from_staff_id=$1 AND status='confirmed'", staff_id)
-        # Ожидают подтверждения (cash_handovers from me, status='pending')
-        r6 = await conn.fetchval(
-            "SELECT COALESCE(SUM(amount),0) FROM cash_handovers WHERE from_staff_id=$1 AND status='pending'", staff_id)
-        # Расходы утверждённые — вычитаются из наличных на руках
-        r7 = await conn.fetchval(
-            "SELECT COALESCE(SUM(amount),0) FROM expenses WHERE created_by_staff_id=$1 AND status IN ('approved','paid')",
-            staff_id)
-        collected         = float(r1)
-        given_imm         = float(r2)
-        recv_others       = float(r3)
-        recv_hand         = float(r4)
-        given_hand        = float(r5)
-        pending_sent      = float(r6)
-        expenses_approved = float(r7)
-        on_hand = collected - given_imm + recv_others + recv_hand - given_hand - expenses_approved
-        return {
-            "collected":            collected,
-            "given_immediately":    given_imm,
-            "received_from_others": recv_others + recv_hand,
-            "handed_over":          given_imm + given_hand,
-            "pending_sent":         pending_sent,
-            "expenses_approved":    expenses_approved,
-            "on_hand":              on_hand,
-        }
+        result = await _my_cash_sums(conn, staff_id, date_from, date_to)
+        if date_from or date_to:
+            all_time = await _my_cash_sums(conn, staff_id, None, None)
+            result["on_hand_total"] = all_time["on_hand"]
+        else:
+            result["on_hand_total"] = result["on_hand"]
+        return result
 
 async def get_cash_balance() -> list:
     """Баланс наличных по всем сотрудникам (два уровня: исполнители + ответственные)."""
@@ -8018,32 +8058,36 @@ async def get_pending_handovers_for(staff_id: int) -> list:
         """, staff_id)
         return [dict(r) for r in rows]
 
-async def get_my_sent_handovers(staff_id: int) -> list:
+async def get_my_sent_handovers(staff_id: int, date_from: str = None, date_to: str = None) -> list:
     """Исходящие передачи наличных от данного сотрудника (все типы: сотрудник / банк / сейф)."""
     if not pool: return []
+    params = [staff_id]
+    clause = _date_bounds_clause('ch.created_at', date_from, date_to, params)
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT ch.*,
                    TRIM(COALESCE(st.last_name,'') || ' ' || COALESCE(st.first_name,'')) AS to_name
             FROM cash_handovers ch
             LEFT JOIN staff st ON st.id = ch.to_staff_id
-            WHERE ch.from_staff_id = $1
+            WHERE ch.from_staff_id = $1{clause}
             ORDER BY ch.created_at DESC LIMIT 50
-        """, staff_id)
+        """, *params)
         return [dict(r) for r in rows]
 
-async def get_my_received_handovers(staff_id: int) -> list:
+async def get_my_received_handovers(staff_id: int, date_from: str = None, date_to: str = None) -> list:
     """Входящие подтверждённые передачи наличных для данного сотрудника."""
     if not pool: return []
+    params = [staff_id]
+    clause = _date_bounds_clause('ch.created_at', date_from, date_to, params)
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT ch.*,
                    TRIM(COALESCE(sf.last_name,'') || ' ' || COALESCE(sf.first_name,'')) AS from_name
             FROM cash_handovers ch
             LEFT JOIN staff sf ON sf.id = ch.from_staff_id
-            WHERE ch.to_staff_id = $1 AND ch.status = 'confirmed'
+            WHERE ch.to_staff_id = $1 AND ch.status = 'confirmed'{clause}
             ORDER BY ch.created_at DESC LIMIT 50
-        """, staff_id)
+        """, *params)
         return [dict(r) for r in rows]
 
 async def add_safe_deposit(from_staff_id: int, amount: float, note: str = '') -> dict:
@@ -9744,10 +9788,12 @@ async def get_expenses(branch: str = None, status: str = None,
         """, *params)
         return [dict(r) for r in rows]
 
-async def get_my_expenses(staff_id: int) -> list:
+async def get_my_expenses(staff_id: int, date_from: str = None, date_to: str = None) -> list:
     if not pool: return []
+    params = [staff_id]
+    clause = _date_bounds_clause('e.created_at', date_from, date_to, params)
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT e.*,
                    ec.name_ru AS category_name_ru, ec.name_uz AS category_name_uz,
                    ec.icon AS category_icon, ec.approve_level, ec.receipt_required,
@@ -9755,9 +9801,9 @@ async def get_my_expenses(staff_id: int) -> list:
             FROM expenses e
             LEFT JOIN expense_categories ec ON ec.id = e.category_id
             LEFT JOIN expense_categories ep ON ep.id = ec.parent_id
-            WHERE e.created_by_staff_id = $1
+            WHERE e.created_by_staff_id = $1{clause}
             ORDER BY e.created_at DESC LIMIT 50
-        """, staff_id)
+        """, *params)
         return [dict(r) for r in rows]
 
 async def get_pending_expenses_for_manager(branch: str = None) -> list:
