@@ -2017,12 +2017,16 @@ async def update_route(route_id: int, body: dict, me=Depends(get_current_staff))
         raise HTTPException(status_code=403)
     row = await db.update_route(route_id, body)
     if row.get("date"): row["date"] = str(row["date"])
+    await _auto_sync_route_channel(route_id)
     return {"ok": True, "route": row}
 
 @app.delete("/api/admin/routes/{route_id}")
 async def delete_route(route_id: int, me=Depends(get_current_staff)):
     if me.get("role") not in ("admin","logistics"):
         raise HTTPException(status_code=403)
+    route = await db.get_route(route_id)
+    if route:
+        await _delete_route_channel_messages(route)
     await db.delete_route(route_id)
     return {"ok": True}
 
@@ -2039,6 +2043,7 @@ async def add_route_orders(route_id: int, body: dict, me=Depends(get_current_sta
         names = ", ".join(str(c) for c in conflicts[:5])
         raise HTTPException(400, f"Заказы уже в активном маршруте: {names}")
     count = await db.add_orders_to_route(route_id, order_ids)
+    await _auto_sync_route_channel(route_id)
     return {"ok": True, "added": count}
 
 @app.delete("/api/admin/routes/{route_id}/orders/{order_id}")
@@ -2046,11 +2051,15 @@ async def remove_route_order(route_id: int, order_id: int, me=Depends(get_curren
     if me.get("role") not in ("admin","logistics","manager"):
         raise HTTPException(status_code=403)
     await db.remove_order_from_route(route_id, order_id)
+    await _auto_sync_route_channel(route_id)
     return {"ok": True}
 
 @app.patch("/api/admin/routes/{route_id}/orders/{order_id}")
 async def update_route_stop(route_id: int, order_id: int, body: dict, me=Depends(get_current_staff)):
+    if me.get("role") not in ("admin","logistics","manager"):
+        raise HTTPException(status_code=403)
     await db.update_route_stop(route_id, order_id, body)
+    await _auto_sync_route_channel(route_id)
     return {"ok": True}
 
 @app.post("/api/admin/routes/{route_id}/send-to-driver")
@@ -2261,28 +2270,67 @@ def _build_address_list_text(stops: list[dict]) -> str:
     return "\n".join(lines)
 
 
-@app.post("/api/admin/routes/{route_id}/send-to-delivery-group")
-async def send_route_to_delivery_group(route_id: int, me=Depends(get_current_staff)):
-    route = await db.get_route(route_id)
-    if not route:
-        raise HTTPException(404, "Маршрут не найден")
+def _route_channel_msg_ids(route: dict) -> dict:
+    import json as _jmod
+    _raw = route.get("tg_delivery_msg_ids")
+    if isinstance(_raw, str):
+        try: _raw = _jmod.loads(_raw)
+        except Exception: _raw = {}
+    return _raw or {}
 
-    branch = route.get("branch", "")
+
+async def _resolve_route_channel_id(branch: str) -> int:
+    """Company-scoped канал филиала (get_branch_tg_group_id), с фолбэком на
+    глобальные ключи настроек — та же цепочка, что была в send-to-delivery-group."""
     branch_channel_id = await db.get_branch_tg_group_id(branch, "tg_delivery_channel_id") if branch else None
     if branch_channel_id:
-        channel_id = int(branch_channel_id)
-    elif branch == "navoi":
-        channel_id_str = await _get_cfg("delivery_channel_navoi_id")
-        channel_id = int(channel_id_str) if channel_id_str else 0
-    else:
-        channel_id_str = await _get_cfg("delivery_channel_zarafshan_id")
-        channel_id = int(channel_id_str) if channel_id_str else 0
+        return int(branch_channel_id)
+    channel_id_str = await _get_cfg("delivery_channel_navoi_id" if branch == "navoi" else "delivery_channel_zarafshan_id")
+    return int(channel_id_str) if channel_id_str else 0
+
+
+async def _delete_route_channel_messages(route: dict) -> None:
+    """Удаляет все сообщения маршрута из канала водителей. Целится в chat_id,
+    куда сообщения были реально посланы (__channel__), а не в текущий, заново
+    разрешённый по branch — филиал маршрута мог с тех пор измениться."""
+    old_msg_ids = _route_channel_msg_ids(route)
+    if not old_msg_ids or not BOT_TOKEN:
+        return
+    chat_id = old_msg_ids.get("__channel__") or await _resolve_route_channel_id(route.get("branch", ""))
+    if not chat_id:
+        return
+    async with aiohttp.ClientSession() as sess:
+        for key, msg_id_str in old_msg_ids.items():
+            if key in ("__group__", "__channel__"):
+                continue
+            try:
+                await sess.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage",
+                    json={"chat_id": str(chat_id), "message_id": int(msg_id_str)},
+                    timeout=aiohttp.ClientTimeout(total=4))
+            except Exception:
+                pass
+
+
+async def _sync_route_channel(route_id: int) -> dict:
+    """Полный ресинк маршрута с каналом водителей: удаляет старые сообщения и
+    шлёт всё заново. Нумерация #1/#2/#3 в тексте каждой остановки зависит от
+    порядка — при реордере/добавлении/удалении остановки частичное редактирование
+    невозможно, поэтому полный пересыл — не костыль, а необходимость.
+    Не бросает исключений — вызывающий код (авто-синк при изменении/удалении
+    маршрута) не должен падать из-за сбоя Telegram."""
+    route = await db.get_route(route_id)
+    if not route:
+        return {"ok": False, "error": "route_not_found"}
+
+    branch = route.get("branch", "")
+    channel_id = await _resolve_route_channel_id(branch)
     if not channel_id:
-        raise HTTPException(400, "Канал водителей не настроен (Настройки → Telegram → Водители)")
+        return {"ok": False, "error": "no_channel"}
 
     stops = route.get("stops", [])
     if not stops:
-        raise HTTPException(400, "В маршруте нет заказов")
+        return {"ok": False, "error": "no_stops"}
 
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -2294,24 +2342,7 @@ async def send_route_to_delivery_group(route_id: int, me=Depends(get_current_sta
     route_date = str(route.get("date", ""))
     route_name = route.get("name", "")
 
-    # Удаляем предыдущие сообщения из канала (старые записи "__group__" от
-    # удалённой фичи группы-уведомления просто не найдутся в канале и молча
-    # проигнорируются — see except ниже, это ожидаемая деградация)
-    _raw = route.get("tg_delivery_msg_ids")
-    if isinstance(_raw, str):
-        try: _raw = _jmod.loads(_raw)
-        except Exception: _raw = {}
-    old_msg_ids: dict = _raw or {}
-    if old_msg_ids:
-        async with aiohttp.ClientSession() as sess:
-            for key, msg_id_str in old_msg_ids.items():
-                try:
-                    await sess.post(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage",
-                        json={"chat_id": str(channel_id), "message_id": int(msg_id_str)},
-                        timeout=aiohttp.ClientTimeout(total=4))
-                except Exception:
-                    pass
+    await _delete_route_channel_messages(route)
 
     # ── Канал: заголовок + остановки + подвал ──
     dest = channel_id
@@ -2360,17 +2391,50 @@ async def send_route_to_delivery_group(route_id: int, me=Depends(get_current_sta
     if addr_id:
         new_msg_ids["__addrlist__"] = addr_id
 
-    if sent == 0 and tg_error:
-        logging.error(f"send-to-delivery-group failed: {tg_error}")
-        raise HTTPException(400, f"Telegram: {tg_error}")
-
     if new_msg_ids and db.pool:
         async with db.pool.acquire() as conn:
             await conn.execute(
                 "UPDATE routes SET tg_delivery_msg_ids=$1 WHERE id=$2",
                 _jmod.dumps(new_msg_ids), route_id)
 
+    if sent == 0 and tg_error:
+        return {"ok": False, "error": tg_error}
     return {"ok": True, "sent": sent}
+
+
+async def _auto_sync_route_channel(route_id: int) -> None:
+    """Автоматический ресинк после изменения маршрута — только если маршрут уже
+    был отправлен в канал ранее (иначе не начинаем спамить канал без явной
+    первой отправки). Ошибки Telegram-синка не должны ломать сам запрос."""
+    try:
+        route = await db.get_route(route_id)
+        if not route or not _route_channel_msg_ids(route):
+            return
+        await _sync_route_channel(route_id)
+    except Exception as e:
+        logging.warning(f"_auto_sync_route_channel route={route_id}: {e}")
+
+
+@app.post("/api/admin/routes/{route_id}/send-to-delivery-group")
+async def send_route_to_delivery_group(route_id: int, me=Depends(get_current_staff)):
+    route = await db.get_route(route_id)
+    if not route:
+        raise HTTPException(404, "Маршрут не найден")
+    if not route.get("stops"):
+        raise HTTPException(400, "В маршруте нет заказов")
+    channel_id = await _resolve_route_channel_id(route.get("branch", ""))
+    if not channel_id:
+        raise HTTPException(400, "Канал водителей не настроен (Настройки → Telegram → Водители)")
+
+    result = await _sync_route_channel(route_id)
+    if not result.get("ok"):
+        err = result.get("error", "")
+        if err == "no_stops":
+            raise HTTPException(400, "В маршруте нет заказов")
+        if err == "no_channel":
+            raise HTTPException(400, "Канал водителей не настроен (Настройки → Telegram → Водители)")
+        raise HTTPException(400, f"Telegram: {err or 'ошибка отправки'}")
+    return result
 
 
 @app.delete("/api/admin/staff/{staff_id}")
