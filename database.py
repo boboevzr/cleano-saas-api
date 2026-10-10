@@ -3839,6 +3839,18 @@ async def _price_match_maps() -> tuple[dict, dict]:
             uz_map[uz_label] = (svc_key, type_key)
     return ru_map, uz_map
 
+def _group_unit_price(qty: float, price_weight: float, first_price, catalog) -> float | None:
+    """Цена единицы для «мин. по заказу» — из ПОЗИЦИЙ заказа (цена на момент добавления),
+    а не текущая из прайса: смена прайса не должна пересчитывать уже созданные заказы.
+    Позиции одной услуги по разной цене (добавлены до и после смены прайса) — средняя,
+    взвешенная по площади/штукам. Прайс — только если у позиций цены ещё нет."""
+    if qty > 0 and price_weight > 0:
+        return round(price_weight / qty, 2)  # без хвостов float (15000.000000000004)
+    if first_price:
+        return first_price
+    return float(catalog["price"]) if (catalog and catalog.get("price")) else None
+
+
 async def get_orders_items_totals(order_ids: list[int]) -> dict[int, float]:
     """Order-level 'Итого' с учётом мин.по.позиции/мин.по.заказу — та же логика,
     что staffRenderItems() в staff.html (группировка по услуге, floor по каталогу).
@@ -3865,12 +3877,16 @@ async def get_orders_items_totals(order_ids: list[int]) -> dict[int, float]:
             continue
         m = find_match(it)
         gkey = it["service_ru"] or (f"{m[0]}::{m[1]}" if m else it["service"])
-        g = groups.setdefault((oid, gkey), {"sqm": 0.0, "count": 0, "clamped": 0.0, "match": m})
+        g = groups.setdefault((oid, gkey), {"sqm": 0.0, "count": 0, "clamped": 0.0, "match": m,
+                                            "price_weight": 0.0, "first_price": None})
         sqm   = float(it["sqm"] or 0)
         price = float(it["price_per_sqm"] or 0)
         total = float(it["total_sum"] or 0)
         g["sqm"]   += sqm
         g["count"] += 1
+        g["price_weight"] += sqm * price
+        if g["first_price"] is None and price:
+            g["first_price"] = price
         catalog  = prices.get(m[0], {}).get(m[1]) if m else None
         pos_min  = catalog.get("min_order") if catalog else None
         g["clamped"] += (pos_min * price) if (pos_min and sqm and sqm < pos_min and price) else total
@@ -3880,7 +3896,7 @@ async def get_orders_items_totals(order_ids: list[int]) -> dict[int, float]:
         m = g["match"]
         catalog   = prices.get(m[0], {}).get(m[1]) if m else None
         group_min = catalog.get("min_order_total") if catalog else None
-        price     = catalog.get("price") if catalog else None
+        price     = _group_unit_price(g["sqm"], g["price_weight"], g["first_price"], catalog)
         qty       = g["sqm"] if g["sqm"] > 0 else g["count"]
         contribution = (group_min * price) if (group_min and qty < group_min and price) else g["clamped"]
         totals[oid] = totals.get(oid, 0.0) + contribution
@@ -3938,11 +3954,15 @@ async def get_order_items_billing(order_id: int) -> dict:
                 "label": it["service_ru"] or it["service"],
                 "billed_sqm": 0.0, "raw_sqm": 0.0, "count": 0,
                 "billed_amount": 0.0, "match": m,
+                "price_weight": 0.0, "first_price": None,
             })
             g["billed_sqm"]    += billed_sqm
             g["raw_sqm"]       += eff_sqm
             g["count"]         += 1
             g["billed_amount"] += billed_total
+            g["price_weight"]  += billed_sqm * price
+            if g["first_price"] is None and price:
+                g["first_price"] = price
         else:
             order_total += eff_total
 
@@ -3951,7 +3971,7 @@ async def get_order_items_billing(order_id: int) -> dict:
         m = g["match"]
         catalog = prices.get(m[0], {}).get(m[1]) if m else None
         group_min = float(catalog["min_order_total"]) if (catalog and catalog.get("min_order_total")) else None
-        price = float(catalog["price"]) if (catalog and catalog.get("price")) else None
+        price = _group_unit_price(g["billed_sqm"], g["price_weight"], g["first_price"], catalog)
         qty = g["billed_sqm"] if g["billed_sqm"] > 0 else g["count"]
         group_clamped = bool(group_min and qty < group_min and price)
         group_amount = (group_min * price) if group_clamped else g["billed_amount"]
