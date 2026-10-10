@@ -180,6 +180,14 @@ def generate_receipt_jpeg(order: dict, items: list[dict], branch_contacts: list[
             total_h = _right_text(draw, y, total_line, f["item_name"])
             y += total_h + 4
 
+        # Скидка клиенту видна (перенос из ARTEZ 2026-10-10): цена по прайсу -> цена по договору
+        list_price = it.get("list_price")
+        if list_price and price and float(price) < float(list_price):
+            disc_line = (f"Прайс {fmt_n(list_price)} → ваша цена {fmt_n(price)} "
+                         f"(скидка {fmt_n(float(list_price) - float(price))} сум)")
+            draw.text((PAD + 14, y), disc_line, font=f["item_sub"], fill=BLACK)
+            y += _measure(draw, disc_line, f["item_sub"])[1] + 4
+
         y += 12
         _dashed_line(draw, y)
         y += 16
