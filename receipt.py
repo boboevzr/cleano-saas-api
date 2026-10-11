@@ -201,17 +201,16 @@ def generate_receipt_jpeg(order: dict, items: list[dict], branch_contacts: list[
         contacts_line = "   ·   ".join(c for c in branch_contacts if c)
         y += _center_text(draw, y, contacts_line, f["footer_bold"]) + 6
 
-    link_segments = []
-    if bot_link:
-        if link_segments:
-            link_segments.append(("   ·   ", f["footer"]))
-        link_segments += [("🤖 ", f["emoji"]), (f"Бот заявок: {bot_link}", f["footer"])]
-    if site_link:
-        if link_segments:
-            link_segments.append(("   ·   ", f["footer"]))
-        link_segments += [("🌐 ", f["emoji"]), (site_link, f["footer"])]
-    if link_segments:
-        y += _center_mixed_line(draw, y, link_segments) + 16
+    bot_seg = [("🤖 ", f["emoji"]), (f"Бот заявок: {bot_link}", f["footer"])] if bot_link else []
+    site_seg = [("🌐 ", f["emoji"]), (site_link, f["footer"])] if site_link else []
+    one_line = bot_seg + ([("   ·   ", f["footer"])] if bot_seg and site_seg else []) + site_seg
+    if one_line:
+        # Бот и сайт в одну строку, если влезают; иначе — две строки (длинный домен
+        # {slug}.cleano.uz + юзернейм бота обрезались по краям чека)
+        width = sum(_measure(draw, t, fnt)[0] for t, fnt in one_line)
+        lines = [one_line] if width <= W - 2 * PAD else [s for s in (bot_seg, site_seg) if s]
+        for i, segs in enumerate(lines):
+            y += _center_mixed_line(draw, y, segs) + (16 if i == len(lines) - 1 else 6)
     else:
         y += 4
 
