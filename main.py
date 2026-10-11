@@ -5569,6 +5569,16 @@ def _substitute_receipt_tokens(text: str, order: dict, grand_total: float) -> st
     return text
 
 
+async def _company_site_domain(company_id: int) -> str:
+    """Сайт компании для чека — то же правило, что в _notify_new_lead/_render_sms_notification:
+    artez -> artez.uz, остальные -> {slug}.cleano.uz. Раньше чек брал дефолт receipt.py
+    ("artez.uz") — у всех компаний в чеке был сайт ARTEZ."""
+    slug = await db.get_company_slug(company_id) if company_id else None
+    if slug == "artez":
+        return "artez.uz"
+    return f"{slug}.cleano.uz" if slug else "cleano.uz"
+
+
 async def _render_order_receipt(order_id: int) -> tuple[bytes, dict]:
     order = await db.get_order_by_id(order_id)
     if not order:
@@ -5589,9 +5599,10 @@ async def _render_order_receipt(order_id: int) -> tuple[bytes, dict]:
     order_bot_username = await _get_cfg("order_bot_username")
     bot_link = f"t.me/{order_bot_username}" if order_bot_username else ""
 
+    site_link = await _company_site_domain(order.get("company_id") or db._cid())
     jpeg_bytes = receipt.generate_receipt_jpeg(order, items, branch_contacts,
                                                 header_text, slogan, footer_note,
-                                                bot_link, grand_total=grand_total)
+                                                bot_link, site_link=site_link, grand_total=grand_total)
     return jpeg_bytes, order
 
 
@@ -5713,7 +5724,7 @@ async def preview_receipt(body: dict, _=Depends(get_admin)):
     order_bot_username = await _get_cfg("order_bot_username")
     bot_link = f"t.me/{order_bot_username}" if order_bot_username else ""
     jpeg_bytes = receipt.generate_receipt_jpeg(mock_order, mock_items, contacts, header_text, slogan, footer_note,
-                                                bot_link)
+                                                bot_link, site_link=await _company_site_domain(db._cid()))
     return Response(content=jpeg_bytes, media_type="image/jpeg")
 
 
