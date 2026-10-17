@@ -1709,8 +1709,8 @@ async def staff_login(req: StaffLoginRequest, request: Request):
     if not staff.get("active", True):
         raise HTTPException(status_code=401, detail="Сотрудник деактивирован")
 
-    # IP — первый из X-Forwarded-For (Railway за прокси), иначе адрес соединения
-    ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip() \
+    # IP — последний из X-Forwarded-For (его дописал прокси Railway; левые клиент может подделать)
+    ip = (request.headers.get("x-forwarded-for") or "").split(",")[-1].strip() \
          or (request.client.host if request.client else "")
     sid = await db.create_staff_session(staff["id"], request.headers.get("user-agent"), ip)
     token = create_staff_token(staff["id"], staff["login"], staff["role"],
@@ -4675,7 +4675,7 @@ async def admin_login(req: AdminLoginRequest, request: Request):
         token = create_admin_token(company_id)
     else:
         # менеджер/колл-центр в admin.html — обычный staff-токен, значит с сессией
-        ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip() \
+        ip = (request.headers.get("x-forwarded-for") or "").split(",")[-1].strip() \
              or (request.client.host if request.client else "")
         sid = await db.create_staff_session(staff["id"], request.headers.get("user-agent"), ip)
         token = create_staff_token(staff["id"], staff["login"], staff["role"], company_id, sid=sid)
