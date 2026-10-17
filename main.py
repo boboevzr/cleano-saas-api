@@ -1440,13 +1440,14 @@ def create_token(user_id: int, phone: str, company_id: int = 1) -> str:
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-def create_staff_token(staff_id: int, login: str, role: str, company_id: int = 1) -> str:
+def create_staff_token(staff_id: int, login: str, role: str, company_id: int = 1, sid: int | None = None) -> str:
     payload = {
         "sub": str(staff_id),
         "login": login,
         "role": role,
         "type": "staff",
         "company_id": company_id,
+        "sid": sid,   # staff_sessions.id — завершённая сессия не пускает (перенос из ARTEZ 2026-10-17)
         "exp": datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRE_DAYS),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -1553,13 +1554,31 @@ async def get_current_staff(authorization: str = Header(None)):
                 "branch": None, "tg_username": None, "position": None, "company_id": company_id}
     if payload.get("type") != "staff":
         raise HTTPException(status_code=401, detail="Требуется токен сотрудника")
-    staff = await db.get_staff_by_id(int(payload["sub"]))
-    if not staff or not staff["active"]:
-        raise HTTPException(status_code=401, detail="Сотрудник не найден или деактивирован")
-    s = dict(staff)
-    # company_id from DB record (authoritative), fallback to token claim
-    s.setdefault("company_id", payload.get("company_id", 1))
+    s = await _staff_from_payload(payload)
+    if not s:
+        raise HTTPException(status_code=401, detail="Сессия завершена — войдите заново")
     await _reject_if_subscription_closed(s["company_id"])
+    return s
+
+
+async def _staff_from_payload(payload: dict) -> dict | None:
+    """Действующий сотрудник по staff-JWT: активен И сессия (sid) не завершена.
+    Токены без sid (выданы до переноса сессий) не принимаются — один повторный вход
+    у всех. Возвращает staff + «_sid»; company_id — из записи сотрудника (авторитетно)."""
+    if payload.get("type") != "staff" or not payload.get("sid"):
+        return None
+    try:
+        staff_id, sid = int(payload["sub"]), int(payload["sid"])
+    except (TypeError, ValueError):
+        return None
+    staff = await db.get_staff_by_id(staff_id)
+    if not staff or not staff["active"]:
+        return None
+    if not await db.check_staff_session(sid, staff_id):
+        return None
+    s = dict(staff)
+    s.setdefault("company_id", payload.get("company_id", 1))
+    s["_sid"] = sid
     return s
 
 
@@ -1664,7 +1683,7 @@ def _staff_public(s: dict) -> dict:
     }
 
 @app.post("/api/staff/login")
-async def staff_login(req: StaffLoginRequest):
+async def staff_login(req: StaffLoginRequest, request: Request):
     company_id = req.company_id
     if req.company_slug:
         company_id = await db.get_company_id_by_slug(req.company_slug)
@@ -1687,9 +1706,15 @@ async def staff_login(req: StaffLoginRequest):
         raise HTTPException(status_code=401, detail="Неверный логин или пароль")
 
     await _reject_if_subscription_closed(company_id)
+    if not staff.get("active", True):
+        raise HTTPException(status_code=401, detail="Сотрудник деактивирован")
 
+    # IP — первый из X-Forwarded-For (Railway за прокси), иначе адрес соединения
+    ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip() \
+         or (request.client.host if request.client else "")
+    sid = await db.create_staff_session(staff["id"], request.headers.get("user-agent"), ip)
     token = create_staff_token(staff["id"], staff["login"], staff["role"],
-                               company_id=staff.get("company_id") or 1)
+                               company_id=staff.get("company_id") or 1, sid=sid)
     pub = _staff_public(dict(staff))
     pub["must_change_password"] = bool(staff.get("must_change_password"))
     return {"ok": True, "token": token, "staff": pub}
@@ -1699,9 +1724,14 @@ async def staff_me(staff=Depends(get_current_staff)):
     return {"ok": True, "staff": _staff_public(staff)}
 
 @app.get("/api/staff/list")
-async def staff_list(role: str = None, _=Depends(get_current_staff)):
+async def staff_list(role: str = None, me=Depends(get_current_staff)):
     rows = await db.get_all_staff()
     staff = [_staff_public(dict(r)) for r in rows]
+    # Пароли открытым текстом (🔑 в admin.html) — только админу. Раньше этот список с
+    # паролями ВСЕХ сотрудников компании (вкл. админа) получал любой сотрудник.
+    if me.get("role") != "admin":
+        for s in staff:
+            s.pop("plain_password", None)
     if role:
         staff = [s for s in staff if s.get("role") == role]
     return {"ok": True, "staff": staff}
@@ -2526,11 +2556,61 @@ async def delete_position_ep(pos_id: int, me=Depends(get_current_staff)):
 async def staff_change_password(staff_id: int, body: dict, me=Depends(get_current_staff)):
     if me["role"] != "admin" and me["id"] != staff_id:
         raise HTTPException(status_code=403, detail="Нет доступа")
+    # Раньше admin ЛЮБОЙ компании мог сменить пароль сотруднику другой компании
+    # (update_staff_password не фильтрует по компании) — проверяем явно.
+    await _staff_of_my_company(staff_id, me)
     new_pw = body.get("password", "")
     if len(new_pw) < 6:
         raise HTTPException(status_code=400, detail=bi("Минимум 6 символов","Kamida 6 ta belgi"))
     await db.update_staff_password(staff_id, pwd_context.hash(new_pw[:72]), plain=new_pw)
+    # Смена пароля завершает все сессии логина; свою (если меняет себе) — оставляем
+    keep = me.get("_sid") if me.get("id") == staff_id else None
+    ended = await db.revoke_staff_sessions(staff_id, "password_changed", except_sid=keep)
+    return {"ok": True, "sessions_ended": ended}
+
+
+async def _staff_of_my_company(staff_id: int, me: dict) -> dict:
+    """Сотрудник staff_id существует и принадлежит компании текущего пользователя."""
+    target = await db.get_staff_by_id(staff_id)
+    if not target or (target.get("company_id") or 1) != (me.get("company_id") or 1):
+        raise HTTPException(status_code=404, detail="Сотрудник не найден")
+    return dict(target)
+
+
+# ── Сессии сотрудников (перенос из ARTEZ 2026-10-17) ──────────────────────────
+@app.get("/api/admin/staff-sessions")
+async def all_staff_sessions(me=Depends(require_perm("staff"))):
+    rows = await db.list_all_staff_sessions(me.get("company_id") or 1)
+    for r in rows:
+        for k in ("created_at", "last_seen_at"):
+            if r.get(k): r[k] = r[k].isoformat()
+    return {"ok": True, "sessions": rows}
+
+
+@app.get("/api/admin/staff/{staff_id}/sessions")
+async def staff_sessions_list(staff_id: int, me=Depends(require_perm("staff"))):
+    await _staff_of_my_company(staff_id, me)
+    rows = await db.list_staff_sessions(staff_id)
+    for r in rows:
+        for k in ("created_at", "last_seen_at"):
+            if r.get(k): r[k] = r[k].isoformat()
+    return {"ok": True, "sessions": rows}
+
+
+@app.delete("/api/admin/staff/{staff_id}/sessions/{sid}")
+async def staff_session_revoke(staff_id: int, sid: int, me=Depends(require_perm("staff"))):
+    await _staff_of_my_company(staff_id, me)
+    if not await db.revoke_staff_sessions(staff_id, "revoked_by_admin", sid=sid):
+        raise HTTPException(status_code=404, detail="Сессия не найдена или уже завершена")
     return {"ok": True}
+
+
+@app.post("/api/admin/staff/{staff_id}/sessions/revoke-all")
+async def staff_sessions_revoke_all(staff_id: int, me=Depends(require_perm("staff"))):
+    await _staff_of_my_company(staff_id, me)
+    keep = me.get("_sid") if me.get("id") == staff_id else None
+    ended = await db.revoke_staff_sessions(staff_id, "revoked_by_admin", except_sid=keep)
+    return {"ok": True, "sessions_ended": ended}
 
 
 # ══════════════════════════════════════
@@ -3064,6 +3144,7 @@ async def staff_orders(status: str = None, branch: str = None, limit: int = 50, 
     if staff.get("hide_client_phone"):
         for o in result:
             o["client_phone"] = ""
+            o["client_phone2"] = ""   # запасной тоже скрыт
     return {"ok": True, "orders": result, "total": total, "limit": limit, "offset": offset}
 
 @app.get("/api/staff/orders/own")
@@ -3075,6 +3156,7 @@ async def staff_own_orders(status: str = None, limit: int = 50, offset: int = 0,
     if staff.get("hide_client_phone"):
         for o in result:
             o["client_phone"] = ""
+            o["client_phone2"] = ""   # запасной тоже скрыт
     return {"ok": True, "orders": result, "total": total, "limit": limit, "offset": offset}
 
 @app.post("/api/staff/orders/create")
@@ -3213,9 +3295,9 @@ async def _get_admin_or_staff_clients(authorization: str = Header(None)):
         return True
     if payload.get("type") != "staff":
         raise HTTPException(status_code=403, detail="Нет доступа")
-    staff = await db.get_staff_by_id(int(payload["sub"]))
-    if not staff or not staff["active"]:
-        raise HTTPException(status_code=403, detail="Нет доступа")
+    staff = await _staff_from_payload(payload)
+    if not staff:
+        raise HTTPException(status_code=401, detail="Сессия завершена — войдите заново")
     role = staff.get("role") or ""
     perms = ROLE_PERMISSIONS.get(role, [])
     if "clients" in perms or role == "admin":
@@ -4572,7 +4654,7 @@ async def get_admin(authorization: str = Header(None)):
     return True
 
 @app.post("/api/admin/login")
-async def admin_login(req: AdminLoginRequest):
+async def admin_login(req: AdminLoginRequest, request: Request):
     company_id = req.company_id
     if req.company_slug:
         company_id = await db.get_company_id_by_slug(req.company_slug)
@@ -4592,7 +4674,11 @@ async def admin_login(req: AdminLoginRequest):
     if staff["role"] == "admin":
         token = create_admin_token(company_id)
     else:
-        token = create_staff_token(staff["id"], staff["login"], staff["role"], company_id)
+        # менеджер/колл-центр в admin.html — обычный staff-токен, значит с сессией
+        ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip() \
+             or (request.client.host if request.client else "")
+        sid = await db.create_staff_session(staff["id"], request.headers.get("user-agent"), ip)
+        token = create_staff_token(staff["id"], staff["login"], staff["role"], company_id, sid=sid)
     return {"ok": True, "token": token}
 
 @app.post("/api/admin/change-master-password")
@@ -4869,6 +4955,7 @@ async def agent_change_password(body: dict, staff=Depends(get_current_staff)):
     hashed = pwd_context.hash(new_pw[:72])
     await db.update_staff_password(staff["id"], hashed, plain=new_pw)
     await db.clear_staff_temp_password(staff["id"])
+    await db.revoke_staff_sessions(staff["id"], "password_changed", except_sid=staff.get("_sid"))
     return {"ok": True}
 
 
@@ -5189,6 +5276,7 @@ async def admin_get_order(order_id: int, staff=Depends(get_current_staff)):
     if staff.get("hide_client_phone"):
         order = dict(order)
         order["client_phone"] = ""
+        order["client_phone2"] = ""
     return {"ok": True, "order": order}
 
 _ORDER_EDITABLE_STATUSES = {"new","confirmed","pickup","received","washing","drying","packing","ready"}
@@ -7639,6 +7727,10 @@ async def serve_order_photo(
     except Exception:
         raise HTTPException(status_code=401)
 
+    # staff-токен — только действующий сотрудник с живой сессией (не уволенный)
+    if payload.get("type") == "staff" and not await _staff_from_payload(payload):
+        raise HTTPException(status_code=401)
+
     row = await db.get_photo_by_id(photo_id, payload.get("company_id") or 1)
     if not row:
         raise HTTPException(status_code=404)
@@ -7670,6 +7762,9 @@ async def serve_item_media(
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
     except Exception:
+        raise HTTPException(status_code=401)
+
+    if payload.get("type") == "staff" and not await _staff_from_payload(payload):
         raise HTTPException(status_code=401)
 
     row = await db.get_item_media_by_id(media_id, payload.get("company_id") or 1)
@@ -10178,11 +10273,18 @@ async def ws_chat_client(websocket: WebSocket, code: str):
 async def ws_chat_staff(websocket: WebSocket, token: str):
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        staff_id = int(payload.get("sub"))
-        staff_company_id = int(payload.get("company_id") or 1)
     except Exception:
         await websocket.close(code=4001)
         return
+    # Раньше подходил ЛЮБОЙ JWT с числовым sub (в т.ч. клиентский токен сайта — к чату
+    # как сотрудник с тем же id). Теперь — только staff-токен с живой сессией; компания —
+    # из записи сотрудника, а не из токена (перенос из ARTEZ 2026-10-17).
+    _st = await _staff_from_payload(payload)
+    if not _st:
+        await websocket.close(code=4001)
+        return
+    staff_id = _st["id"]
+    staff_company_id = int(_st.get("company_id") or 1)
 
     await _chat.connect_staff(staff_id, websocket, staff_company_id)
     staff_row = await db.get_staff_by_id(staff_id)
@@ -11955,7 +12057,9 @@ async def saas_impersonate_company(company_id: int, _=Depends(get_superadmin)):
     admin = await db.get_company_admin_staff(company_id)
     if not admin:
         raise HTTPException(status_code=404, detail="Admin-сотрудник не найден")
-    token = create_staff_token(admin["id"], admin["login"], admin["role"], company_id)
+    # вход суперадмина «как admin компании» — тоже сессия (видна компании в «🔐 Сессии»)
+    sid = await db.create_staff_session(admin["id"], "Cleano superadmin (impersonate)", None)
+    token = create_staff_token(admin["id"], admin["login"], admin["role"], company_id, sid=sid)
     return {"ok": True, "token": token, "company_name": c["name"], "slug": c["slug"]}
 
 

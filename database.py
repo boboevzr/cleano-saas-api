@@ -980,6 +980,20 @@ async def create_tables():
         "ALTER TABLE staff ADD COLUMN IF NOT EXISTS notify_new_users BOOLEAN DEFAULT FALSE",
         "ALTER TABLE staff ADD COLUMN IF NOT EXISTS hide_client_phone BOOLEAN DEFAULT FALSE",
         "ALTER TABLE clients ADD COLUMN IF NOT EXISTS blocked BOOLEAN DEFAULT FALSE",
+        # Сессии сотрудников (перенос из ARTEZ 2026-10-17): каждый вход staff — строка;
+        # номер сессии в JWT (sid). Завершённая сессия (revoked_at) не пускает, даже если
+        # токен ещё не истёк. Компания — через staff.company_id (JOIN), отдельной колонки нет.
+        """CREATE TABLE IF NOT EXISTS staff_sessions (
+            id           SERIAL PRIMARY KEY,
+            staff_id     INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            user_agent   TEXT,
+            ip           TEXT,
+            revoked_at   TIMESTAMPTZ,
+            revoked_reason TEXT
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_staff_sessions_staff ON staff_sessions(staff_id) WHERE revoked_at IS NULL",
         # Автодозвон: кампании
         """CREATE TABLE IF NOT EXISTS autodial_campaigns (
             id             SERIAL PRIMARY KEY,
@@ -4777,6 +4791,60 @@ async def get_all_commissions(year: int = None, month: int = None) -> list:
         sql += " ORDER BY c.created_at DESC LIMIT 500"
         rows = await conn.fetch(sql, *args)
         return [dict(r) for r in rows]
+
+# ── Сессии сотрудников (перенос из ARTEZ 2026-10-17) ────────────────────────
+async def create_staff_session(staff_id: int, user_agent: str = None, ip: str = None) -> int:
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "INSERT INTO staff_sessions (staff_id, user_agent, ip) VALUES ($1, $2, $3) RETURNING id",
+            staff_id, (user_agent or "")[:300] or None, (ip or "")[:64] or None)
+
+
+async def check_staff_session(sid: int, staff_id: int) -> bool:
+    """Сессия жива? «Последняя активность» — не чаще раза в 2 минуты."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT revoked_at IS NULL AS alive, last_seen_at < NOW() - INTERVAL '2 minutes' AS stale "
+            "FROM staff_sessions WHERE id=$1 AND staff_id=$2", sid, staff_id)
+        if not row or not row["alive"]:
+            return False
+        if row["stale"]:
+            await conn.execute("UPDATE staff_sessions SET last_seen_at=NOW() WHERE id=$1", sid)
+        return True
+
+
+async def list_staff_sessions(staff_id: int) -> list[dict]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, created_at, last_seen_at, user_agent, ip FROM staff_sessions "
+            "WHERE staff_id=$1 AND revoked_at IS NULL ORDER BY last_seen_at DESC", staff_id)
+        return [dict(r) for r in rows]
+
+
+async def list_all_staff_sessions(company_id: int) -> list[dict]:
+    """Все активные сессии сотрудников ОДНОЙ компании — admin.html → «🔐 Сессии»."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT ss.id, ss.staff_id, ss.created_at, ss.last_seen_at, ss.user_agent, ss.ip,
+                   s.login, s.role, s.first_name, s.last_name, s.position, s.active
+            FROM staff_sessions ss JOIN staff s ON s.id = ss.staff_id
+            WHERE ss.revoked_at IS NULL AND s.company_id = $1
+            ORDER BY ss.last_seen_at DESC""", company_id)
+        return [dict(r) for r in rows]
+
+
+async def revoke_staff_sessions(staff_id: int, reason: str, sid: int | None = None,
+                                except_sid: int | None = None) -> int:
+    """Завершить одну сессию (sid) или все сессии сотрудника (кроме except_sid).
+    Компанию проверяет вызывающий эндпоинт (staff_id своей компании)."""
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE staff_sessions SET revoked_at=NOW(), revoked_reason=$2 "
+            "WHERE staff_id=$1 AND revoked_at IS NULL "
+            "AND ($3::int IS NULL OR id=$3) AND ($4::int IS NULL OR id<>$4)",
+            staff_id, reason, sid, except_sid)
+        return int(res.split()[-1]) if res else 0
+
 
 async def update_staff_password(staff_id: int, password_hash: str, plain: str = None):
     if not pool: return
