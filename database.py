@@ -7231,7 +7231,8 @@ async def recalc_client_discount(order_id: int) -> dict | None:
                    o.client_discount_kind
             FROM orders o WHERE o.id=$1
         """, order_id)
-    if not o or not o["client_discount_enabled"] or o["status"] in ("delivered", "cancelled"):
+    # только заказ компании текущего запроса — пересчёт чужого заказа по id не нужен никому
+    if not o or o["company_id"] != _cid() or not o["client_discount_enabled"] or o["status"] in ("delivered", "cancelled"):
         return None
     try:
         online_pct = float(await get_config_for_company("client_discount_online_pct", o["company_id"]) or 0)

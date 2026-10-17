@@ -5936,6 +5936,9 @@ async def admin_get_order_items(order_id: int, staff=Depends(get_current_staff))
     # Мойщик видит только цену по прайсу — договорная цена и скидка скрыты НА СЕРВЕРЕ.
     # Самовосстановление скидки клиента: позиции мог создать бот (create_pickup_items),
     # где пересчёта нет — карточку открывают до любых денежных действий по заказу.
+    # Заказ — только своей компании (раньше позиции чужого заказа читались по id — IDOR).
+    if not await db.get_order_by_id(order_id):
+        raise HTTPException(status_code=404, detail="Заказ не найден")
     await db.recalc_client_discount(order_id)
     billing = await db.get_order_items_billing(order_id, as_list_price=staff.get("role") == "washer")
     return {"ok": True, "items": billing["items"], "groups": billing["groups"], "order_total": billing["order_total"]}
