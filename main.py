@@ -8583,6 +8583,36 @@ async def driver_returned(order_id: int, reason_index: int = Body(..., embed=Tru
     asyncio.create_task(_update_api_channel_stop(order_id))
     return {"ok": True}
 
+@app.post("/api/staff/my-route/stops/{order_id}/resume")
+async def driver_resume_stop(order_id: int, staff=Depends(get_current_staff)):
+    """«↩️ Вернуть в маршрут» — клиент вышел на связь после «Не забрал»/«Вернул»:
+    skipped → pending (статус заказа не трогаем). Только пока маршрут не закрыт,
+    заказ не отменён и заказ — своей компании (перенос из ARTEZ 2026-10-17)."""
+    if not _can_drive(staff): raise HTTPException(403, "Нет доступа")
+    name = _driver_name(staff)
+    async with db.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT ro.stop_status, r.status AS route_status, o.status AS order_status
+               FROM route_orders ro
+               JOIN routes r ON r.id = ro.route_id
+               JOIN orders o ON o.id = ro.order_id
+               WHERE ro.order_id=$1 AND o.company_id=$2
+               ORDER BY ro.route_id DESC LIMIT 1""", order_id, staff.get("company_id"))
+        if not row: raise HTTPException(404, "Остановка не найдена")
+        if row["stop_status"] != "skipped":
+            raise HTTPException(400, "Остановка не пропущена")
+        if row["route_status"] == "done":
+            raise HTTPException(400, "Маршрут уже закрыт")
+        if row["order_status"] == "cancelled":
+            raise HTTPException(400, "Заказ отменён")
+        await conn.execute(
+            "UPDATE route_orders SET stop_status='pending', driver_confirmed=FALSE WHERE order_id=$1", order_id)
+        await conn.execute(
+            "INSERT INTO order_activity (order_id, staff_id, staff_name, action, details) VALUES ($1,$2,$3,$4,$5)",
+            order_id, staff["id"], name, "resumed", "↩️ Вернул в маршрут: клиент вышел на связь")
+    asyncio.create_task(_update_api_channel_stop(order_id))
+    return {"ok": True}
+
 async def _driver_deliver_core(order_id: int, staff: dict, method: str = "", amount: float = 0, source: str = "web") -> dict:
     """Общая логика «Доставлено» (опционально с оплатой) — см. _driver_take_delivery_core."""
     if not _can_drive(staff): raise HTTPException(403, "Нет доступа")
@@ -9185,7 +9215,13 @@ SITE_SETTINGS_DEFAULTS = {
     "bot_maintenance_mode": "false",
     # Конструктор печати списка заказов — JSON-массив блоков (см. _DEFAULT_BULK_PRINT_TEMPLATE)
     "bulk_print_template": _json.dumps(_DEFAULT_BULK_PRINT_TEMPLATE, ensure_ascii=False),
+    # Карты менеджеров для оплаты Click/перевода — JSON [{number,name}], до 10.
+    # НЕ публичный ключ; company-scoped через db.get_config/set_config (_cid()) —
+    # у каждой компании свой список (перенос из ARTEZ 2026-10-17).
+    "manager_cards": "[]",
 }
+
+MAX_MANAGER_CARDS = 10
 
 async def _get_cfg(key: str) -> str:
     """БД → env-fallback из SITE_SETTINGS_DEFAULTS."""
@@ -9316,6 +9352,35 @@ class SiteSettings(BaseModel):
     site_maintenance_mode:   str | None = None
     bot_maintenance_mode:    str | None = None
     bulk_print_template:     str | None = None
+    manager_cards:           str | None = None
+
+    @field_validator("manager_cards")
+    @classmethod
+    def _validate_manager_cards(cls, v):
+        # Нормализуем до [{number:"16 цифр", name:"ФИО"}] — номер храним без
+        # пробелов, форматирование 4×4 делает фронт.
+        if v is None:
+            return v
+        try:
+            raw = _json.loads(v)
+        except Exception:
+            raise ValueError("manager_cards: некорректный JSON")
+        if not isinstance(raw, list):
+            raise ValueError("manager_cards: ожидается список")
+        if len(raw) > MAX_MANAGER_CARDS:
+            raise ValueError(f"Не больше {MAX_MANAGER_CARDS} карт")
+        cards = []
+        for c in raw:
+            if not isinstance(c, dict):
+                raise ValueError("manager_cards: некорректная карта")
+            number = "".join(ch for ch in str(c.get("number") or "") if ch.isdigit())
+            name = " ".join(str(c.get("name") or "").split())[:60]
+            if len(number) != 16:
+                raise ValueError(f"Номер карты должен быть из 16 цифр: {c.get('number')!r}")
+            if not name:
+                raise ValueError(f"Не указано Ф.И.О. для карты {number}")
+            cards.append({"number": number, "name": name})
+        return _json.dumps(cards, ensure_ascii=False)
 
 @app.get("/api/admin/settings/site")
 async def get_admin_site_settings(_=Depends(get_admin)):
@@ -9341,6 +9406,19 @@ async def get_bulk_print_template(_=Depends(get_current_staff)):
     except Exception:
         blocks = _DEFAULT_BULK_PRINT_TEMPLATE
     return {"ok": True, "blocks": blocks}
+
+@app.get("/api/staff/manager-cards")
+async def get_manager_cards(me=Depends(get_current_staff)):
+    """Карты менеджеров своей компании — для «💳 Печать ПК» в admin.html →
+    Маршруты. _get_cfg company-scoped (компания из JWT). Роли — как у маршрута,
+    кроме водителя (ему карта уходит на бумажке)."""
+    if me.get("role") not in ("admin", "logistics", "manager"):
+        raise HTTPException(status_code=403)
+    try:
+        cards = _json.loads(await _get_cfg("manager_cards") or "[]")
+    except Exception:
+        cards = []
+    return {"ok": True, "cards": cards if isinstance(cards, list) else []}
 
 
 # ── Telegram: шаблоны уведомлений ──────────────────────────────────────
