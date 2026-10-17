@@ -394,6 +394,7 @@ async def _send_debt_reminders():
                 f"💸 Долг по заказу {d['order_num']}\n"
                 f"👤 {d.get('client_first_name','')} {d.get('client_last_name','')}\n"
                 f"📞 {d.get('client_phone') or '—'}\n"
+                + (f"📞 {d['client_phone2']}\n" if d.get('client_phone2') else "") +
                 f"💰 {int(d['debt_amount']):,} сум\n"
                 f"📅 Срок: {due_date.strftime('%d.%m.%Y')}"
             ).replace(',', ' ')
@@ -445,6 +446,7 @@ async def _send_postpone_reminders():
             f"📋 Заказ {o.get('order_num')}\n"
             f"👤 {client}\n"
             f"📞 {o.get('client_phone') or '—'}\n"
+            + (f"📞 {o['client_phone2']}\n" if o.get('client_phone2') else "") +
             f"📝 Причина: {o.get('postpone_reason') or '—'}\n"
             f"👷 Отложил: {o.get('postponed_by_name') or '—'}\n\n"
             f"Нужно созвониться с клиентом — согласовать доставку или отложить ещё."
@@ -496,6 +498,7 @@ async def _route_rollover_worker():
         next_midnight = (now + _td(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
         await asyncio.sleep((next_midnight - now).total_seconds())
         try:
+            await db.recalc_route_statuses()   # выполненные — закрыть, а не переносить
             n = await db.roll_forward_stale_routes()
             if n:
                 logging.info(f"route rollover: перенесено маршрутов на сегодня: {n}")
@@ -2014,6 +2017,7 @@ async def list_routes(date: str | None = None, driver_id: int | None = None,
                       me=Depends(get_current_staff)):
     if me.get("role") not in ("admin","logistics","manager"):
         raise HTTPException(status_code=403)
+    await db.recalc_route_statuses()
     await db.roll_forward_stale_routes()
     rows = await db.get_routes(date=date, driver_id=driver_id, branch=branch, status=status)
     for r in rows:
@@ -2034,6 +2038,7 @@ async def create_route(body: dict, me=Depends(get_current_staff)):
 async def get_route(route_id: int, me=Depends(get_current_staff)):
     if me.get("role") not in ("admin","logistics","manager","driver"):
         raise HTTPException(status_code=403)
+    await db.recalc_route_statuses()
     route = await db.get_route(route_id)
     if not route: raise HTTPException(status_code=404)
     if route.get("date"): route["date"] = str(route["date"])
@@ -2052,7 +2057,8 @@ async def update_route(route_id: int, body: dict, me=Depends(get_current_staff))
 
 @app.delete("/api/admin/routes/{route_id}")
 async def delete_route(route_id: int, me=Depends(get_current_staff)):
-    if me.get("role") not in ("admin","logistics"):
+    # manager — для кнопки «🗑 Удалить маршрут» в staff → Доставка (перенос из ARTEZ 2026-10-17)
+    if me.get("role") not in ("admin","logistics","manager"):
         raise HTTPException(status_code=403)
     route = await db.get_route(route_id)
     if route:
@@ -2140,6 +2146,8 @@ async def send_route_to_driver(route_id: int, me=Depends(get_current_staff)):
                 pass
         if s.get("client_phone"):
             line += f"\n   📞 {s['client_phone']}"
+        if s.get("client_phone2"):
+            line += f"\n   📞 {s['client_phone2']}"
         lines.append(line)
 
     lines += ["", f"Всего точек: {len(stops)}"]
@@ -2230,6 +2238,8 @@ def _build_stop_text(route: dict, stop: dict, num: int, template: str) -> str:
     client = f"{stop.get('client_first_name', '')} {stop.get('client_last_name', '')}".strip() or "—"
     addr   = stop.get("short_address") or stop.get("address") or stop.get("location_address") or "—"
     phone  = f"📞 {stop['client_phone']}\n" if stop.get("client_phone") else ""
+    if stop.get("client_phone2"):
+        phone += f"📞 {stop['client_phone2']}\n"
     loc    = _parse_loc_str(stop.get("location"))
     map_link = f"🗺 https://maps.google.com/?q={loc[0]},{loc[1]}\n" if loc else ""
     status = _ORDER_STATUS_RU.get(stop.get("order_status", ""), "—")
@@ -2259,6 +2269,7 @@ def _build_stop_text_short(stop: dict, num: int) -> str:
     last  = (stop.get("client_last_name")  or "").strip()
     client = f"{first} {last}".strip() or "—"
     phone  = stop.get("client_phone", "") or ""
+    phone2 = stop.get("client_phone2", "") or ""
     loc    = _parse_loc_str(stop.get("location"))
 
     if loc:
@@ -2269,6 +2280,7 @@ def _build_stop_text_short(stop: dict, num: int) -> str:
 
     contact = f"👤 {h(client)}"
     if phone: contact += f" 📞{h(phone)}"
+    if phone2: contact += f" 📞{h(phone2)}"
 
     total = float(stop.get("items_total") or stop.get("total_price") or 0)
     disc  = (float(stop.get("discount_sum") or 0) + float(stop.get("delivery_discount") or 0)
@@ -5550,20 +5562,9 @@ async def admin_change_order_status(order_id: int, staff=Depends(get_current_sta
             logging.warning(f"agent commission failed order={order_id}: {_ce}")
 
     try:
-        async with db.pool.acquire() as _c:
-            if status == "delivered":
-                await _c.execute(
-                    "UPDATE route_orders SET stop_status='done' WHERE order_id=$1 AND stop_status!='done'",
-                    order_id)
-            elif status == "cancelled":
-                await _c.execute(
-                    "UPDATE route_orders SET stop_status='skipped' WHERE order_id=$1 AND stop_status='pending'",
-                    order_id)
-            else:
-                # Любой активный статус (delivery, ready, washing и т.д.) — сбросить 'done' на 'pending'
-                await _c.execute(
-                    "UPDATE route_orders SET stop_status='pending' WHERE order_id=$1 AND stop_status='done'",
-                    order_id)
+        # по цели остановки (забор/доставка), см. db.sync_route_stops_for_order —
+        # раньше любая смена статуса сбрасывала «Выполнено» и у забора (перенос из ARTEZ)
+        await db.sync_route_stops_for_order(order_id, status)
     except Exception as _e:
         logging.warning(f"route_orders sync failed order={order_id}: {_e}")
 
@@ -8436,6 +8437,7 @@ def _can_drive(staff: dict) -> bool:
 async def get_my_route(staff=Depends(get_current_staff)):
     if not _can_drive(staff):
         raise HTTPException(403, "Нет доступа")
+    await db.recalc_route_statuses()
     await db.roll_forward_stale_routes()
     routes = await db.get_routes_today(staff["company_id"], staff.get("branch"))
     payment_events = []
@@ -8755,7 +8757,7 @@ async def driver_close_with_debt(order_id: int, staff=Depends(get_current_staff)
     # Данные заказа + вычисляем долг так же как фронт (items_total - discount - paid)
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow("""
-            SELECT o.order_num, o.client_first_name, o.client_last_name, o.client_phone,
+            SELECT o.order_num, o.client_first_name, o.client_last_name, o.client_phone, o.client_phone2,
                    o.short_address, o.address,
                    COALESCE((SELECT SUM(COALESCE(sqm*price_per_sqm,0)) FROM order_items WHERE order_id=o.id),
                             COALESCE(o.total_price,0)) AS items_total,
@@ -8784,6 +8786,7 @@ async def driver_close_with_debt(order_id: int, staff=Depends(get_current_staff)
              f"📋 Заказ: <b>{order_num}</b>",
              f"👤 Клиент: <b>{client}</b>"]
     if phone: lines.append(f"📞 {phone}")
+    if row["client_phone2"]: lines.append(f"📞 {row['client_phone2']}")
     lines.append(f"📍 {addr}")
     lines.append("")
     if total > 0: lines.append(f"💰 Сумма: <b>{_fmtd(total)} с</b>")
@@ -9014,6 +9017,8 @@ def _fmt_stop_text_api(info: dict, num: int) -> str:
     pay_line = f"💰 {_f(net)} · Опл: {_f(paid)} · Долг: {_f(debt)}"
     contact = f"👤 {h(client)}"
     if phone: contact += f" 📞{h(phone)}"
+    # запасной номер — тот же формат, что _build_stop_text_short при первой отправке в канал
+    if info.get("client_phone2"): contact += f" 📞{h(info['client_phone2'])}"
     count_str = f" / {item_count}" if item_count else ""
     return f"📦 #{num}·{h(order_num)}{count_str} 📍{h(addr)}\n{contact}\n{pay_line}"
 
