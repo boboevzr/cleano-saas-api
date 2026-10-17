@@ -5239,6 +5239,9 @@ async def staff_get_service_types(service_key: str = None, _=Depends(get_current
 async def admin_upsert_service(req: ServiceRequest, _=Depends(get_admin)):
     if not req.key.strip():
         raise HTTPException(status_code=400, detail="Укажите ключ услуги")
+    # ключ попадает в onclick/атрибуты admin.html — только [a-z0-9_]; старые ключи можно сохранять
+    if not re.fullmatch(r"[a-z0-9_]{1,30}", req.key.strip()) and req.key.strip() not in [s["key"] for s in await db.get_services()]:
+        raise HTTPException(status_code=400, detail="Ключ услуги — латиница в нижнем регистре, цифры и _ (до 30 символов)")
     if not req.name_ru.strip():
         raise HTTPException(status_code=400, detail="Укажите название на RU")
     if not req.name_uz.strip():
@@ -5323,6 +5326,9 @@ async def admin_get_service_types(service_key: str = None, _=Depends(get_admin))
 
 @app.put("/api/admin/service-types")
 async def admin_upsert_service_type(req: ServiceTypeRequest, _=Depends(get_admin)):
+    # ключ варианта попадает в onclick/атрибуты admin.html — только [a-z0-9_]; существующие можно переименовывать
+    if not re.fullmatch(r"[a-z0-9_]{1,50}", req.type_key.strip()) and req.type_key.strip() not in [t["type_key"] for t in await db.get_service_types(req.service_key.strip())]:
+        raise HTTPException(status_code=400, detail="Ключ варианта — латиница в нижнем регистре, цифры и _ (до 50 символов)")
     if req.service_key.strip() not in [s["key"] for s in await db.get_services()]:
         raise HTTPException(status_code=400, detail="Неверная услуга")
     if not req.type_key.strip() or len(req.type_key.strip()) > 50:

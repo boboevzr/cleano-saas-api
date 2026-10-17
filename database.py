@@ -6749,7 +6749,7 @@ async def search_contacts(q: str, limit: int = 10) -> list[dict]:
                    c.address, c.short_address, c.source,
                    cc.discount_category, cc.discount_category_pct
             FROM contacts c
-            LEFT JOIN crm_clients cc ON cc.phone = c.phone
+            LEFT JOIN crm_clients cc ON cc.phone = c.phone AND cc.company_id = c.company_id
             WHERE c.company_id=$4
               AND (c.phone ILIKE $1
                OR c.phone2 ILIKE $1
