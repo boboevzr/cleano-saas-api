@@ -5,6 +5,7 @@ import hashlib
 import secrets
 import logging
 import asyncio
+import time
 import random
 import string
 from datetime import datetime, timedelta, timezone
@@ -12877,6 +12878,9 @@ _order_bot_instances: dict[str, "Bot"] = {}
 _order_bot_dispatcher = None
 
 
+_bot_client_seen: dict = {}   # (company_id, tg_id) -> monotonic время последней отметки
+
+
 def _get_order_bot_dispatcher():
     global _order_bot_dispatcher
     if _order_bot_dispatcher is None:
@@ -12997,6 +13001,19 @@ async def order_bot_webhook(secret: str, request: Request):
             except Exception as e:
                 logging.warning(f"order_bot maintenance notice error: {e}")
         return {"ok": True}
+
+    # «Был в боте» (перенос из ARTEZ 2026-10-17): не чаще раза в 5 минут на клиента
+    # компании, в фоне — не тормозит обработку апдейта
+    try:
+        _from = ((body.get("message") or body.get("callback_query") or {}).get("from") or {})
+        _uid = _from.get("id")
+        if _uid and not _from.get("is_bot"):
+            _key, _now = (company_id, _uid), time.monotonic()
+            if _now - _bot_client_seen.get(_key, 0) > 300:
+                _bot_client_seen[_key] = _now
+                asyncio.create_task(db.touch_client_seen(_uid, company_id))
+    except Exception:
+        pass
 
     bot = _get_order_bot_instance(token)
     dp = _get_order_bot_dispatcher()

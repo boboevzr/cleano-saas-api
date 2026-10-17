@@ -995,6 +995,9 @@ async def create_tables():
         "ALTER TABLE staff ADD COLUMN IF NOT EXISTS notify_new_users BOOLEAN DEFAULT FALSE",
         "ALTER TABLE staff ADD COLUMN IF NOT EXISTS hide_client_phone BOOLEAN DEFAULT FALSE",
         "ALTER TABLE clients ADD COLUMN IF NOT EXISTS blocked BOOLEAN DEFAULT FALSE",
+        # «Был в боте» (пишет вебхук бота, раз в 5 мин); старым — примерно, из updated_at
+        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ",
+        "UPDATE clients SET last_seen_at = updated_at WHERE last_seen_at IS NULL AND updated_at IS NOT NULL",
         # Сессии сотрудников (перенос из ARTEZ 2026-10-17): каждый вход staff — строка;
         # номер сессии в JWT (sid). Завершённая сессия (revoked_at) не пускает, даже если
         # токен ещё не истёк. Компания — через staff.company_id (JOIN), отдельной колонки нет.
@@ -7183,6 +7186,17 @@ async def get_client_by_tg_phone(tg_phone: str, company_id: int = 1) -> dict | N
             return None
 
 
+async def touch_client_seen(tg_id: int, company_id: int):
+    """clients.last_seen_at = сейчас — «Был в боте» в admin → Telegram · Клиенты.
+    Только для уже существующих клиентов этой компании (новых создаёт бот при /start)."""
+    if not pool: return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE clients SET last_seen_at=NOW() WHERE tg_id=$1 AND company_id=$2", tg_id, company_id)
+    except Exception as e:
+        logging.warning(f"touch_client_seen {tg_id}/{company_id}: {e}")
+
+
 async def get_tg_clients(search: str = "", limit: int = 200) -> list[dict]:
     """Клиенты из таблицы бота (clients) — все кто писал в Telegram, своей компании.
     company_id уже проставляется ботом (см. artez_bot COMPANY_ID) — здесь просто фильтруем."""
@@ -7201,32 +7215,48 @@ async def get_tg_clients(search: str = "", limit: int = 200) -> list[dict]:
         bl_col = "blacklisted" if await conn.fetchval(
             "SELECT COUNT(*) FROM information_schema.columns WHERE table_name='clients' AND column_name='blacklisted'"
         ) else "FALSE::boolean AS blacklisted"
-        if search:
-            rows = await conn.fetch(f"""
-                SELECT id, tg_id, tg_username, first_name, last_name, phone,
-                       lang, total_orders AS orders_count,
-                       NULL::numeric AS total_spent,
-                       NULL::timestamptz AS last_order_at,
-                       created_at, {blocked_col}, {bl_col}
-                FROM clients
-                WHERE company_id=$1
-                  AND (phone ILIKE $2 OR first_name ILIKE $2
-                   OR last_name ILIKE $2 OR tg_username ILIKE $2)
-                ORDER BY created_at DESC
-                LIMIT $3
-            """, cid, f"%{search}%", limit)
-        else:
-            rows = await conn.fetch(f"""
-                SELECT id, tg_id, tg_username, first_name, last_name, phone,
-                       lang, total_orders AS orders_count,
-                       NULL::numeric AS total_spent,
-                       NULL::timestamptz AS last_order_at,
-                       created_at, {blocked_col}, {bl_col}
-                FROM clients
-                WHERE company_id=$1
-                ORDER BY created_at DESC
-                LIMIT $2
-            """, cid, limit)
+        # Заказы/оплаты/сайт — по реальным данным своей компании (раньше total_spent/
+        # last_order_at были жёстко NULL, «Заказов» — счётчик бота). Заказ клиента: тот же
+        # tg_id ИЛИ тот же номер (последние 9 цифр). Перенос из ARTEZ 2026-10-17.
+        where = ("AND (c.phone ILIKE $2 OR c.first_name ILIKE $2 OR c.last_name ILIKE $2 "
+                 "OR c.tg_username ILIKE $2 OR c.tg_phone ILIKE $2)") if search else ""
+        params = [cid, f"%{search}%", limit] if search else [cid, limit]
+        rows = await conn.fetch(f"""
+            WITH cl AS (
+                SELECT c.*, NULLIF(right(regexp_replace(COALESCE(c.phone,''),    '\D','','g'), 9), '') AS p9,
+                            NULLIF(right(regexp_replace(COALESCE(c.tg_phone,''), '\D','','g'), 9), '') AS tp9
+                FROM clients c
+                WHERE c.company_id = $1 {where}
+            )
+            SELECT c.id, c.tg_id, c.tg_username, c.first_name, c.last_name, c.phone,
+                   c.lang, c.created_at, c.updated_at, c.last_seen_at,
+                   {blocked_col}, {bl_col},
+                   COALESCE(o.orders_count, 0)::int AS orders_count,
+                   o.last_order_at,
+                   COALESCE(o.total_spent, 0) AS total_spent,
+                   u.created_at AS site_registered_at,
+                   u.last_login AS site_last_login
+            FROM cl c
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*) AS orders_count,
+                       MAX(ord.created_at) AS last_order_at,
+                       SUM(COALESCE((SELECT SUM(p.amount) FROM order_payments p
+                                      WHERE p.order_id = ord.id
+                                        AND NOT (p.confirmed = FALSE AND p.confirmed_at IS NOT NULL)), 0)) AS total_spent
+                FROM orders ord
+                WHERE ord.company_id = c.company_id AND ord.status <> 'cancelled'
+                  AND (ord.client_tg_id = c.tg_id
+                       OR right(regexp_replace(COALESCE(ord.client_phone,''), '\D','','g'), 9) IN (c.p9, c.tp9))
+            ) o ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT us.created_at, us.last_login FROM users us
+                WHERE us.company_id = c.company_id
+                  AND right(regexp_replace(COALESCE(us.phone,''), '\D','','g'), 9) IN (c.p9, c.tp9)
+                ORDER BY us.created_at LIMIT 1
+            ) u ON TRUE
+            ORDER BY COALESCE(c.last_seen_at, c.updated_at, c.created_at) DESC NULLS LAST
+            LIMIT ${len(params)}
+        """, *params)
         return [dict(r) for r in rows]
 
 async def upsert_push_subscription(staff_id: int, endpoint: str, p256dh: str, auth: str):
