@@ -2325,6 +2325,51 @@ async def ensure_saas_schema():
             logging.warning(f"step 30 prices seed error: {e}")
     logging.info("✅ API: template seeded from company_id=1 (step 30) ready")
 
+    # ── Шаг 30e (перенос из ARTEZ 2026-10-17): варианты цены услуги (service_types) —
+    # живой каталог per-company вместо зашитых standard/express; размер × скорость
+    # (пара вариантов <скорость>_<размер>); services.active — «Скрыть услугу».
+    # Без FK на services: у services ключ уникален только в паре с company_id.
+    async with pool.acquire() as c:
+        for sql in [
+            """CREATE TABLE IF NOT EXISTS service_types (
+                id           SERIAL PRIMARY KEY,
+                company_id   INTEGER NOT NULL DEFAULT 1,
+                service_key  VARCHAR(30) NOT NULL,
+                type_key     VARCHAR(50) NOT NULL,
+                name_ru      VARCHAR(100) NOT NULL,
+                name_uz      VARCHAR(100) NOT NULL,
+                order_idx    INTEGER NOT NULL DEFAULT 0,
+                speed_key    VARCHAR(20),
+                size_key     VARCHAR(40),
+                size_name_ru VARCHAR(100),
+                size_name_uz VARCHAR(100),
+                UNIQUE(company_id, service_key, type_key)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_service_types_company ON service_types(company_id, service_key)",
+            """INSERT INTO service_types (company_id, service_key, type_key, name_ru, name_uz, order_idx, speed_key)
+               SELECT company_id, key, 'standard', 'Стандартный', 'Standart', 1, 'standard' FROM services
+                WHERE company_id IS NOT NULL ON CONFLICT DO NOTHING""",
+            """INSERT INTO service_types (company_id, service_key, type_key, name_ru, name_uz, order_idx, speed_key)
+               SELECT company_id, key, 'express', 'Быстрый', 'Tezkor', 2, 'express' FROM services
+                WHERE company_id IS NOT NULL ON CONFLICT DO NOTHING""",
+            # SaaS раньше принимал в прайс любой type_key — такие варианты сохраняем (имя = ключ)
+            """INSERT INTO service_types (company_id, service_key, type_key, name_ru, name_uz, order_idx)
+               SELECT DISTINCT company_id, service_key, type_key, type_key, type_key, 10 FROM prices
+                WHERE company_id IS NOT NULL ON CONFLICT DO NOTHING""",
+            # шаблон новых компаний (company_id=0) — варианты как у компании 1 (как цены в 30d)
+            """INSERT INTO service_types (company_id, service_key, type_key, name_ru, name_uz, order_idx,
+                                         speed_key, size_key, size_name_ru, size_name_uz)
+               SELECT 0, service_key, type_key, name_ru, name_uz, order_idx, speed_key, size_key, size_name_ru, size_name_uz
+                 FROM service_types WHERE company_id=1 ON CONFLICT DO NOTHING""",
+            "ALTER TABLE prices ALTER COLUMN type_key TYPE VARCHAR(50)",
+            "ALTER TABLE staff_salary_per_unit ALTER COLUMN type_key TYPE VARCHAR(50)",
+            "ALTER TABLE services ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE",
+        ]:
+            try:
+                await c.execute(sql)
+            except Exception as e:
+                logging.warning(f"step 30e service_types skipped ({sql[:60]!r}): {e}")
+
     # ── Шаг 31: fix tg_status_messages PK for multi-tenant ──────────────────
     async with pool.acquire() as c:
         try:
@@ -3421,7 +3466,8 @@ async def save_site_order(data: dict, source: str = "site", staff_name: str = ""
             data.get("delivery_location"),
             data.get("delivery_location_address", ""),
             data.get("service"),
-            data.get("service_type") or "standard",
+            # service_type заказа — только скорость (размер — в варианте позиции)
+            "express" if str(data.get("service_type") or "").startswith("express") else "standard",
             data.get("pickup_type") or "courier",
             data.get("delivery_type") or "courier",
             data.get("pickup_date"),
@@ -3748,6 +3794,7 @@ async def seed_company_prices(company_id: int, force: bool = False):
         ]
         for skey, tkey, price, ukey, mord, mtot in defaults:
             await set_price(skey, tkey, price, ukey, mord, mtot, company_id=company_id)
+    await ensure_company_service_types(company_id)
 
 
 # ══════════════════════════════════════
@@ -3787,6 +3834,10 @@ async def upsert_service(key: str, name_ru: str, name_uz: str, emoji: str = '', 
                 emoji     = EXCLUDED.emoji,
                 order_idx = EXCLUDED.order_idx
         """, cid, key, name_ru, name_uz, emoji, order_idx)
+        for tk, ru, uz, idx in (("standard", "Стандартный", "Standart", 1), ("express", "Быстрый", "Tezkor", 2)):
+            await conn.execute("""
+                INSERT INTO service_types (company_id, service_key, type_key, name_ru, name_uz, order_idx, speed_key)
+                VALUES ($1, $2, $3, $4, $5, $6, $3) ON CONFLICT DO NOTHING""", cid, key, tk, ru, uz, idx)
         return True
 
 async def delete_service(key: str, company_id: int = None) -> bool:
@@ -3795,6 +3846,10 @@ async def delete_service(key: str, company_id: int = None) -> bool:
     cid = company_id if company_id is not None else _cid()
     async with pool.acquire() as conn:
         r = await conn.execute("DELETE FROM services WHERE company_id=$1 AND key=$2", cid, key)
+        if r == "DELETE 1":
+            # варианты и цены — без FK: чистим, чтобы удалённая услуга не всплывала в /api/prices
+            await conn.execute("DELETE FROM service_types WHERE company_id=$1 AND service_key=$2", cid, key)
+            await conn.execute("DELETE FROM prices WHERE company_id=$1 AND service_key=$2", cid, key)
         return r == "DELETE 1"
 
 async def seed_company_services(company_id: int, force: bool = False):
@@ -3826,6 +3881,208 @@ async def seed_company_services(company_id: int, force: bool = False):
         ]
         for key, ru, uz, em, idx in defaults:
             await upsert_service(key, ru, uz, em, idx, company_id=company_id)
+
+# ══════════════════════════════════════
+#  ВАРИАНТЫ ЦЕНЫ УСЛУГИ (перенос из ARTEZ 2026-10-17): per-company, per-service —
+#  скорость, размер, вместимость и т.д., не зашитый enum
+# ══════════════════════════════════════
+async def get_service_types(service_key: str = None) -> list:
+    if not pool:
+        return []
+    cid = _cid()
+    async with pool.acquire() as conn:
+        if service_key:
+            rows = await conn.fetch(
+                "SELECT * FROM service_types WHERE company_id=$1 AND service_key=$2 ORDER BY order_idx, type_key",
+                cid, service_key)
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM service_types WHERE company_id=$1 ORDER BY service_key, order_idx, type_key", cid)
+        return [dict(r) for r in rows]
+
+
+async def upsert_service_type(service_key: str, type_key: str, name_ru: str, name_uz: str, order_idx: int = 0):
+    if not pool:
+        return False
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO service_types (company_id, service_key, type_key, name_ru, name_uz, order_idx)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (company_id, service_key, type_key) DO UPDATE SET
+                name_ru   = EXCLUDED.name_ru,
+                name_uz   = EXCLUDED.name_uz,
+                order_idx = EXCLUDED.order_idx
+        """, _cid(), service_key, type_key, name_ru, name_uz, order_idx)
+        return True
+
+
+async def delete_service_type(service_key: str, type_key: str):
+    if not pool:
+        return False
+    async with pool.acquire() as conn:
+        r = await conn.execute(
+            "DELETE FROM service_types WHERE company_id=$1 AND service_key=$2 AND type_key=$3",
+            _cid(), service_key, type_key)
+        return r == "DELETE 1"
+
+
+async def ensure_company_service_types(company_id: int):
+    """Варианты компании: из шаблона (company_id=0) по её услугам + базовые
+    standard/express + варианты, уже стоящие в её прайсе."""
+    if not pool:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO service_types (company_id, service_key, type_key, name_ru, name_uz, order_idx,
+                                       speed_key, size_key, size_name_ru, size_name_uz)
+            SELECT $1::int, t.service_key, t.type_key, t.name_ru, t.name_uz, t.order_idx,
+                   t.speed_key, t.size_key, t.size_name_ru, t.size_name_uz
+              FROM service_types t
+             WHERE t.company_id = 0
+               AND EXISTS (SELECT 1 FROM services s WHERE s.company_id=$1 AND s.key=t.service_key)
+            ON CONFLICT DO NOTHING""", company_id)
+        for tk, ru, uz, idx in (("standard", "Стандартный", "Standart", 1), ("express", "Быстрый", "Tezkor", 2)):
+            await conn.execute("""
+                INSERT INTO service_types (company_id, service_key, type_key, name_ru, name_uz, order_idx, speed_key)
+                SELECT $1::int, key, $2::text, $3::text, $4::text, $5::int, $2::text FROM services WHERE company_id=$1::int
+                ON CONFLICT DO NOTHING""", company_id, tk, ru, uz, idx)
+        await conn.execute("""
+            INSERT INTO service_types (company_id, service_key, type_key, name_ru, name_uz, order_idx)
+            SELECT DISTINCT $1::int, service_key, type_key, type_key, type_key, 10 FROM prices WHERE company_id=$1::int
+            ON CONFLICT DO NOTHING""", company_id)
+
+
+# ── Размер × скорость ────────────────────────────────────────────────────────
+# Размер услуги = ПАРА вариантов service_types: <скорость>_<размер> для standard и
+# express. Публичный каталог (сайт/бот/staff-пикеры) у услуги с размерами показывает
+# только варианты с размером, скрытые услуги (services.active=FALSE) — не показывает.
+SPEEDS = (("standard", "Стандартный", "Standart"), ("express", "Быстрый", "Tezkor"))
+
+_TRANSLIT = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюяўқғҳ",
+    ["a","b","v","g","d","e","yo","zh","z","i","y","k","l","m","n","o","p","r","s","t","u","f",
+     "h","ts","ch","sh","sch","","y","","e","yu","ya","o","q","g","h"]))
+
+
+def _size_key_from_name(name: str) -> str:
+    s = "".join(_TRANSLIT.get(ch, ch) for ch in (name or "").lower())
+    s = "".join(ch if ch.isascii() and ch.isalnum() else "_" for ch in s)
+    s = "_".join(p for p in s.split("_") if p)
+    return s[:20] or "size"
+
+
+def _is_public_type(t: dict, sized: set) -> bool:
+    return t["service_key"] not in sized or bool(t.get("size_key"))
+
+
+async def get_public_services() -> list:
+    if not pool:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM services WHERE company_id=$1 AND COALESCE(active, TRUE) ORDER BY order_idx, key", _cid())
+        return [dict(r) for r in rows]
+
+
+async def get_public_service_types(service_key: str = None) -> list:
+    active = {s["key"] for s in await get_public_services()}
+    types = [t for t in await get_service_types(service_key) if t["service_key"] in active]
+    sized = {t["service_key"] for t in types if t.get("size_key")}
+    return [t for t in types if _is_public_type(t, sized)]
+
+
+async def get_public_prices() -> dict:
+    """get_all_prices без скрытых услуг и без базовых вариантов у услуг с размерами;
+    порядок вариантов — как в admin (order_idx). Цены без строки в service_types
+    (старые данные) остаются, если услуга не скрыта и без размеров."""
+    prices = await get_all_prices()
+    active = {s["key"] for s in await get_public_services()}
+    types = await get_service_types()
+    sized = {t["service_key"] for t in types if t.get("size_key")}
+    out: dict = {}
+    known = set()
+    for t in types:
+        known.add((t["service_key"], t["type_key"]))
+        if t["service_key"] not in active or not _is_public_type(t, sized):
+            continue
+        info = (prices.get(t["service_key"]) or {}).get(t["type_key"])
+        if info:
+            out.setdefault(t["service_key"], {})[t["type_key"]] = info
+    for svc, tps in prices.items():
+        if svc not in active or svc in sized:
+            continue
+        for tp, info in tps.items():
+            if (svc, tp) not in known:
+                out.setdefault(svc, {})[tp] = info
+    return out
+
+
+async def save_service_size(service_key: str, name_ru: str, name_uz: str,
+                            size_key: str | None = None) -> str:
+    """Создаёт (size_key=None) или переименовывает размер — сразу пару вариантов
+    standard_<размер> и express_<размер>. Возвращает size_key."""
+    cid = _cid()
+    async with pool.acquire() as conn:
+        if not size_key:
+            base = _size_key_from_name(name_ru)
+            used = {r["size_key"] for r in await conn.fetch(
+                "SELECT DISTINCT size_key FROM service_types WHERE company_id=$1 AND service_key=$2 AND size_key IS NOT NULL",
+                cid, service_key)}
+            size_key, n = base, 2
+            while size_key in used:
+                size_key = f"{base[:17]}_{n}"; n += 1
+        next_idx = await conn.fetchval(
+            "SELECT COALESCE(MAX(order_idx), 0) + 1 FROM service_types WHERE company_id=$1 AND service_key=$2",
+            cid, service_key)
+        existing = {r["speed_key"]: r["type_key"] for r in await conn.fetch(
+            "SELECT speed_key, type_key FROM service_types WHERE company_id=$1 AND service_key=$2 AND size_key=$3",
+            cid, service_key, size_key)}
+        for i, (speed, sp_ru, sp_uz) in enumerate(SPEEDS):
+            type_key = existing.get(speed) or f"{speed}_{size_key}"
+            await conn.execute("""
+                INSERT INTO service_types (company_id, service_key, type_key, name_ru, name_uz, order_idx,
+                                           speed_key, size_key, size_name_ru, size_name_uz)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (company_id, service_key, type_key) DO UPDATE SET
+                    name_ru = EXCLUDED.name_ru, name_uz = EXCLUDED.name_uz,
+                    size_name_ru = EXCLUDED.size_name_ru, size_name_uz = EXCLUDED.size_name_uz
+            """, cid, service_key, type_key, f"{sp_ru} — {name_ru}", f"{sp_uz} — {name_uz}",
+                next_idx + i, speed, size_key, name_ru, name_uz)
+    return size_key
+
+
+async def delete_service_size(service_key: str, size_key: str) -> int:
+    """Удаляет пару вариантов размера и их цены. Позиции заказов хранят снимок —
+    на открытые заказы не влияет."""
+    cid = _cid()
+    async with pool.acquire() as conn:
+        keys = [r["type_key"] for r in await conn.fetch(
+            "SELECT type_key FROM service_types WHERE company_id=$1 AND service_key=$2 AND size_key=$3",
+            cid, service_key, size_key)]
+        if keys:
+            await conn.execute(
+                "DELETE FROM prices WHERE company_id=$1 AND service_key=$2 AND type_key = ANY($3::text[])",
+                cid, service_key, keys)
+            await conn.execute(
+                "DELETE FROM service_types WHERE company_id=$1 AND service_key=$2 AND type_key = ANY($3::text[])",
+                cid, service_key, keys)
+        return len(keys)
+
+
+async def set_service_active(key: str, active: bool) -> bool:
+    async with pool.acquire() as conn:
+        r = await conn.execute("UPDATE services SET active=$3 WHERE company_id=$1 AND key=$2", _cid(), key, active)
+        return r == "UPDATE 1"
+
+
+async def service_in_use(key: str) -> bool:
+    """Есть ли заказы/позиции компании с этой услугой — тогда только «Скрыть», не удалять."""
+    cid = _cid()
+    async with pool.acquire() as conn:
+        return bool(await conn.fetchval("""
+            SELECT EXISTS(SELECT 1 FROM order_items oi JOIN orders o ON o.id = oi.order_id
+                           WHERE o.company_id=$1 AND oi.service_key=$2)
+                OR EXISTS(SELECT 1 FROM orders WHERE company_id=$1 AND service=$2)
+        """, cid, key))
 
 # ══════════════════════════════════════
 #  ЕДИНИЦЫ ИЗМЕРЕНИЯ (общая таблица с ботом)
@@ -3870,17 +4127,26 @@ async def _price_match_maps() -> tuple[dict, dict]:
     услуги из справочника (см. sifFindPriceMatch в staff.html)."""
     prices   = await get_all_prices()
     services = await get_services()
+    # Живые названия вариантов (service_types: «Стандартный», «Маленький»…) + старые
+    # зашитые («Стандарт»/«Экспресс») — старые позиции хранят старые подписи.
+    live_types: dict[tuple, dict] = {}
+    try:
+        for t in await get_service_types():
+            live_types[(t["service_key"], t["type_key"])] = t
+    except Exception:
+        pass
     ru_map, uz_map = {}, {}
     for s in services:
         svc_key = s["key"]
         if svc_key not in prices:
             continue
+        emoji = (s.get("emoji") or "").strip()
         for type_key in prices[svc_key]:
-            emoji = (s.get("emoji") or "").strip()
-            ru_label = f"{emoji} {s['name_ru']}".strip() + f" — {_TYPE_NAMES_RU.get(type_key, type_key)}"
-            uz_label = f"{emoji} {s['name_uz']}".strip() + f" — {_TYPE_NAMES_UZ.get(type_key, type_key)}"
-            ru_map[ru_label] = (svc_key, type_key)
-            uz_map[uz_label] = (svc_key, type_key)
+            lt = live_types.get((svc_key, type_key)) or {}
+            for name_ru in {_TYPE_NAMES_RU.get(type_key, type_key), lt.get("name_ru")} - {None, ""}:
+                ru_map[f"{emoji} {s['name_ru']}".strip() + f" — {name_ru}"] = (svc_key, type_key)
+            for name_uz in {_TYPE_NAMES_UZ.get(type_key, type_key), lt.get("name_uz")} - {None, ""}:
+                uz_map[f"{emoji} {s['name_uz']}".strip() + f" — {name_uz}"] = (svc_key, type_key)
     return ru_map, uz_map
 
 
@@ -6784,9 +7050,10 @@ async def _service_key_label(service_key: str, service_type: str | None) -> tupl
     if not svc:
         return None
     type_key = service_type if service_type in prices[service_key] else next(iter(prices[service_key]))
+    st = next((t for t in await get_service_types(service_key) if t["type_key"] == type_key), {})
     emoji = (svc.get("emoji") or "").strip()
-    ru = f"{emoji} {svc['name_ru']}".strip() + f" — {_TYPE_NAMES_RU.get(type_key, type_key)}"
-    uz = f"{emoji} {svc['name_uz']}".strip() + f" — {_TYPE_NAMES_UZ.get(type_key, type_key)}"
+    ru = f"{emoji} {svc['name_ru']}".strip() + f" — {st.get('name_ru') or _TYPE_NAMES_RU.get(type_key, type_key)}"
+    uz = f"{emoji} {svc['name_uz']}".strip() + f" — {st.get('name_uz') or _TYPE_NAMES_UZ.get(type_key, type_key)}"
     return type_key, ru, ru, uz
 
 
@@ -9313,7 +9580,7 @@ async def get_services_for_company(company_id: int) -> list[dict]:
     if not pool: return []
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT * FROM services WHERE company_id=$1 ORDER BY order_idx, key", company_id)
+            "SELECT * FROM services WHERE company_id=$1 AND COALESCE(active, TRUE) ORDER BY order_idx, key", company_id)
         return [dict(r) for r in rows]
 
 async def get_client_orders_by_tg(tg_id: int, company_id: int) -> list[dict]:

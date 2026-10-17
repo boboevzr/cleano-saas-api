@@ -4004,7 +4004,9 @@ async def get_prices(company_slug: str = None):
     """Возвращает актуальные цены из БД для калькулятора и прайс-листа на сайте"""
     cid = await _resolve_client_company_id(company_slug)
     db.set_request_company(cid)
-    prices = await db.get_all_prices()
+    # Публичный каталог: без скрытых услуг и без базовых standard/express у услуг
+    # с размерами — admin видит всё через /api/admin/prices (перенос из ARTEZ 2026-10-17)
+    prices = await db.get_public_prices() if await db.get_all_prices() else {}
     if not prices:
         # Дефолты на случай пустой таблицы
         prices = {
@@ -5188,15 +5190,17 @@ async def staff_get_prices(_=Depends(get_current_staff)):
     таком случае молча отдаёт прайс company_id=1 (см. фикс staffRenderItems). get_admin
     сюда не подходит — доступен только роли admin, а карточку заказа/добавление позиций
     используют и остальные роли; get_current_staff резолвит company_id из их же JWT."""
-    prices = await db.get_all_prices()
+    # каталог — публичный (без скрытых услуг и базовых вариантов у услуг с размерами), как в ARTEZ
+    prices = await db.get_public_prices()
     return {"ok": True, "prices": prices}
 
 @app.put("/api/admin/prices")
 async def admin_set_price(req: SetPriceRequest, _=Depends(get_admin)):
-    if not req.service_key.strip():
-        raise HTTPException(status_code=400, detail="Укажите ключ услуги")
-    if not req.type_key.strip():
-        raise HTTPException(status_code=400, detail="Укажите тип")
+    if req.service_key not in [s["key"] for s in await db.get_services()]:
+        raise HTTPException(status_code=400, detail=f"Неверная услуга: {req.service_key}")
+    # вариант — из живого каталога услуги (service_types), а не любой ключ
+    if req.type_key not in [t["type_key"] for t in await db.get_service_types(req.service_key)]:
+        raise HTTPException(status_code=400, detail=f"Неверный вариант для этой услуги: {req.type_key}")
     if req.price <= 0:
         raise HTTPException(status_code=400, detail="Цена должна быть > 0")
     if req.min_order is not None and req.min_order <= 0:
@@ -5209,10 +5213,10 @@ async def admin_set_price(req: SetPriceRequest, _=Depends(get_admin)):
 
 @app.get("/api/services")
 async def get_services_public(company_slug: str = None):
-    """Публичный эндпоинт — список услуг с именами RU/UZ"""
+    """Публичный эндпоинт — список услуг с именами RU/UZ (без скрытых)"""
     cid = await _resolve_client_company_id(company_slug)
     db.set_request_company(cid)
-    svcs = await db.get_services()
+    svcs = await db.get_public_services()
     return {"ok": True, "services": svcs}
 
 @app.get("/api/admin/services")
@@ -5223,8 +5227,13 @@ async def admin_get_services(_=Depends(get_admin)):
 @app.get("/api/staff/services")
 async def staff_get_services(_=Depends(get_current_staff)):
     """Company-scoped справочник услуг для не-admin ролей — см. /api/staff/prices рядом."""
-    svcs = await db.get_services()
+    svcs = await db.get_public_services()
     return {"ok": True, "services": svcs}
+
+@app.get("/api/staff/service-types")
+async def staff_get_service_types(service_key: str = None, _=Depends(get_current_staff)):
+    """Company-scoped варианты цены (публичный каталог) для staff.html."""
+    return {"ok": True, "types": await db.get_public_service_types(service_key)}
 
 @app.put("/api/admin/services")
 async def admin_upsert_service(req: ServiceRequest, _=Depends(get_admin)):
@@ -5240,9 +5249,96 @@ async def admin_upsert_service(req: ServiceRequest, _=Depends(get_admin)):
 
 @app.delete("/api/admin/services/{key}")
 async def admin_delete_service(key: str, _=Depends(get_admin)):
+    if await db.service_in_use(key):
+        raise HTTPException(status_code=409,
+                            detail="Услуга есть в заказах — удалить нельзя, можно только скрыть")
     ok = await db.delete_service(key)
     if not ok:
         raise HTTPException(status_code=404, detail="Услуга не найдена")
+    return {"ok": True}
+
+@app.patch("/api/admin/services/{key}/active")
+async def admin_set_service_active(key: str, active: bool = Body(..., embed=True), _=Depends(get_admin)):
+    """«Скрыть/Показать» услугу: пропадает с сайта, из бота и форм, история заказов цела."""
+    if not await db.set_service_active(key, active):
+        raise HTTPException(status_code=404, detail="Услуга не найдена")
+    return {"ok": True}
+
+
+async def _type_label_ru(service_key: str, type_key: str) -> str:
+    """Название варианта для комментария заявки («Стандартный — Маленький»), а не ключ."""
+    t = next((t for t in await db.get_service_types(service_key or None)
+              if t["type_key"] == type_key and t["service_key"] == service_key), None)
+    return t["name_ru"] if t else type_key
+
+
+class ServiceSizeRequest(BaseModel):
+    service_key: str
+    name_ru: str
+    name_uz: str
+    size_key: str | None = None   # None — новый размер; иначе переименование
+
+
+class ServiceTypeRequest(BaseModel):
+    service_key: str
+    type_key: str
+    name_ru: str
+    name_uz: str
+    order_idx: int = 0
+
+
+@app.put("/api/admin/service-sizes")
+async def admin_save_service_size(req: ServiceSizeRequest, _=Depends(get_admin)):
+    """Размер услуги — сразу пара вариантов «Стандартный — X» и «Быстрый — X»,
+    ключ генерируется из названия (транслитерация). Перенос из ARTEZ 2026-10-17."""
+    svc = req.service_key.strip()
+    if svc not in [s["key"] for s in await db.get_services()]:
+        raise HTTPException(status_code=400, detail="Неверная услуга")
+    if not req.name_ru.strip() or not req.name_uz.strip():
+        raise HTTPException(status_code=400, detail="Укажите название размера на RU и UZ")
+    if len(req.name_ru.strip()) > 60 or len(req.name_uz.strip()) > 60:
+        raise HTTPException(status_code=400, detail="Название размера — не длиннее 60 символов")
+    size_key = await db.save_service_size(svc, req.name_ru.strip(), req.name_uz.strip(),
+                                          (req.size_key or "").strip() or None)
+    return {"ok": True, "size_key": size_key}
+
+
+@app.delete("/api/admin/service-sizes/{service_key}/{size_key}")
+async def admin_delete_service_size(service_key: str, size_key: str, _=Depends(get_admin)):
+    if not await db.delete_service_size(service_key, size_key):
+        raise HTTPException(status_code=404, detail="Размер не найден")
+    return {"ok": True}
+
+@app.get("/api/service-types")
+async def get_service_types_public(service_key: str = None, company_slug: str = None):
+    """Публичный эндпоинт — варианты цены услуги компании (скорость, размер и т.п.).
+    Без скрытых услуг; у услуги с размерами — только варианты с размером."""
+    cid = await _resolve_client_company_id(company_slug)
+    db.set_request_company(cid)
+    return {"ok": True, "types": await db.get_public_service_types(service_key)}
+
+@app.get("/api/admin/service-types")
+async def admin_get_service_types(service_key: str = None, _=Depends(get_admin)):
+    return {"ok": True, "types": await db.get_service_types(service_key)}
+
+@app.put("/api/admin/service-types")
+async def admin_upsert_service_type(req: ServiceTypeRequest, _=Depends(get_admin)):
+    if req.service_key.strip() not in [s["key"] for s in await db.get_services()]:
+        raise HTTPException(status_code=400, detail="Неверная услуга")
+    if not req.type_key.strip() or len(req.type_key.strip()) > 50:
+        raise HTTPException(status_code=400, detail="Укажите ключ варианта (до 50 символов)")
+    if not req.name_ru.strip():
+        raise HTTPException(status_code=400, detail="Укажите название на RU")
+    if not req.name_uz.strip():
+        raise HTTPException(status_code=400, detail="Укажите название на UZ")
+    await db.upsert_service_type(req.service_key.strip(), req.type_key.strip(),
+                                  req.name_ru.strip(), req.name_uz.strip(), req.order_idx)
+    return {"ok": True}
+
+@app.delete("/api/admin/service-types/{service_key}/{type_key}")
+async def admin_delete_service_type(service_key: str, type_key: str, _=Depends(get_admin)):
+    if not await db.delete_service_type(service_key, type_key):
+        raise HTTPException(status_code=404, detail="Вариант не найден")
     return {"ok": True}
 
 @app.get("/api/units")
@@ -9654,7 +9750,7 @@ async def create_order_from_site(order: OrderRequest, user=Depends(get_optional_
         db.set_request_company(await _resolve_client_company_id(order.company_slug))
     full_name = f"{order.first_name} {order.last_name}".strip()
     note_parts = []
-    if order.service_type: note_parts.append(f"Тип: {order.service_type}")
+    if order.service_type: note_parts.append(f"Тип: {await _type_label_ru(order.service, order.service_type)}")
     if order.pickup_date:  note_parts.append(f"Дата: {order.pickup_date}")
     if order.pickup_time:  note_parts.append(f"Время: {order.pickup_time}")
     if order.is_quick:     note_parts.append("Быстрая заявка")
@@ -9777,7 +9873,7 @@ async def create_bot_lead(req: BotLeadRequest, x_bot_token: str = Header(None, a
 
     note_parts = []
     if req.is_quick:        note_parts.append("Быстрая заявка (бот)")
-    if req.service_type:    note_parts.append(f"Тип: {req.service_type}")
+    if req.service_type:    note_parts.append(f"Тип: {await _type_label_ru(req.service, req.service_type)}")
     if req.pickup_date:     note_parts.append(f"Дата: {req.pickup_date}")
     if req.pickup_time:     note_parts.append(f"Время: {req.pickup_time}")
     if req.note:            note_parts.append(req.note)

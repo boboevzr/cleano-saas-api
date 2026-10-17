@@ -266,6 +266,7 @@ T = {
         "ask_delivery_address": "📍 Введите адрес доставки:",
         "ask_service_full": "Шаг 6 из 6\n🧺 Выберите услугу:",
         "ask_service_type": "⏱ Выберите тип услуги:",
+        "ask_size": "📏 Размер:",
         "btn_type_standard": "🕓 Стандарт",
         "btn_type_express":  "⚡ Экспресс",
         "ask_date":       "📅 Выберите дату самовывоза:",
@@ -453,6 +454,7 @@ T = {
         "ask_delivery_address": "📍 Yetkazib berish manzilini kiriting:",
         "ask_service_full": "6-qadam (6 dan)\n🧺 Xizmatni tanlang:",
         "ask_service_type": "⏱ Xizmat turini tanlang:",
+        "ask_size": "📏 O'lcham:",
         "btn_type_standard": "🕓 Standart",
         "btn_type_express":  "⚡ Ekspress",
         "ask_date":       "📅 Olib ketish sanasini tanlang:",
@@ -717,6 +719,50 @@ def service_type_kb(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=t(lang, "btn_type_express"),  callback_data="of_svctype_express")],
         [InlineKeyboardButton(text=t(lang, "btn_cancel"), callback_data="cancel_order")],
     ])
+
+
+# ── Варианты цены услуги (перенос из ARTEZ 2026-10-17) ─────────────────────────
+# Живой каталог компании (admin → Цены): у услуги с размерами — в два шага, сначала
+# скорость (of_svsp_*), затем размер; иначе — плоский список вариантов. В callback —
+# индекс варианта в списке (_public_types), не ключ: ключ может быть длинным.
+async def _public_types(company_id: int, svc: str) -> list[dict]:
+    """Публичные варианты услуги, у которых есть цена — в порядке admin."""
+    try:
+        db.set_request_company(company_id)
+        prices = (await db.get_public_prices()).get(svc, {})
+        return [t for t in await db.get_public_service_types(svc) if t["type_key"] in prices]
+    except Exception as e:
+        logging.warning(f"_public_types {company_id}/{svc}: {e}")
+        return []
+
+
+def _type_label(lang: str, tp: dict) -> str:
+    return (tp.get("name_uz") if lang == "uz" else tp.get("name_ru")) or tp.get("name_ru") or tp["type_key"]
+
+
+async def _type_kb(lang: str, company_id: int, svc: str) -> InlineKeyboardMarkup:
+    types = await _public_types(company_id, svc)
+    sized = [tp for tp in types if tp.get("size_key")]
+    if sized:
+        speeds = [sp for sp in ("standard", "express") if any(tp.get("speed_key") == sp for tp in sized)]
+        rows = [[InlineKeyboardButton(text=t(lang, f"btn_type_{sp}"), callback_data=f"of_svsp_{sp}")] for sp in speeds]
+    elif types:
+        rows = [[InlineKeyboardButton(text=_type_label(lang, tp), callback_data=f"of_svti_{i}")]
+                for i, tp in enumerate(types)]
+    else:
+        return service_type_kb(lang)
+    rows.append([InlineKeyboardButton(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _size_kb(lang: str, company_id: int, svc: str, speed: str) -> InlineKeyboardMarkup:
+    types = await _public_types(company_id, svc)
+    rows = [[InlineKeyboardButton(
+                text=(tp.get("size_name_uz") if lang == "uz" else tp.get("size_name_ru")) or _type_label(lang, tp),
+                callback_data=f"of_svti_{i}")]
+            for i, tp in enumerate(types) if tp.get("size_key") and tp.get("speed_key") == speed]
+    rows.append([InlineKeyboardButton(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 _WD_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
@@ -1011,10 +1057,12 @@ async def _build_prices_text(lang: str, company_id: int) -> str:
         logging.warning(f"get_services_for_company error: {e}")
         services = []
     try:
-        prices = await db.get_all_prices()
+        db.set_request_company(company_id)
+        prices = await db.get_public_prices()
+        types_all = await db.get_public_service_types()
     except Exception as e:
-        logging.warning(f"get_all_prices error: {e}")
-        prices = {}
+        logging.warning(f"get_public_prices error: {e}")
+        prices, types_all = {}, []
 
     currency = "so'm" if lang == "uz" else "сум"
     lines = [t(lang, "prices_title"), ""]
@@ -1025,21 +1073,21 @@ async def _build_prices_text(lang: str, company_id: int) -> str:
     for s in ordered:
         key = s.get("key")
         entry = prices.get(key, {})
-        std = entry.get("standard")
-        exp = entry.get("express")
-        if not std and not exp:
+        # все публичные варианты услуги с ценой (скорость, размер…) — с подписью у числа
+        svc_types = [tp for tp in types_all if tp["service_key"] == key and tp["type_key"] in entry]
+        pairs = [(_type_label(lang, tp), entry[tp["type_key"]]) for tp in svc_types] \
+            or [(tk, info) for tk, info in entry.items()]
+        if not pairs:
             continue
         any_price = True
         name = _svc_display_name(lang, services, key)
-        unit_key = (std or exp).get("unit_key") or "m2"
+        first = pairs[0][1]
+        unit_key = first.get("unit_key") or "m2"
         unit_sym = await _unit_symbol(unit_key, lang)
-        parts = []
-        if std:
-            parts.append(f"{std['price']:,}".replace(",", " "))
-        if exp:
-            parts.append(f"{exp['price']:,}".replace(",", " "))
+        parts = [f"{_h(lbl)}: " + f"{info['price']:,}".replace(",", " ") for lbl, info in pairs]
         lines.append(f"🔹 {_h(name)}")
         lines.append(f"— {' / '.join(parts)} {currency}/{unit_sym}")
+        std = entry.get("standard") or first
         if std and std.get("min_order"):
             mo = std["min_order"]
             mo_str = int(mo) if mo == int(mo) else mo
@@ -1911,7 +1959,33 @@ async def full_service(call: CallbackQuery, company_id: int, state: FSMContext) 
     svc_key = call.data.replace("svc_", "")
     await state.update_data(service=svc_key)
     await state.set_state(OrderForm.service_type)
-    await call.message.answer(t(lang, "ask_service_type"), reply_markup=service_type_kb(lang))
+    await call.message.answer(t(lang, "ask_service_type"), reply_markup=await _type_kb(lang, company_id, svc_key))
+
+
+@router.callback_query(OrderForm.service_type, F.data.startswith("of_svsp_"))
+async def full_service_speed(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    await call.message.answer(t(lang, "ask_size"), reply_markup=await _size_kb(
+        lang, company_id, data.get("service", ""), call.data.replace("of_svsp_", "")))
+
+
+@router.callback_query(OrderForm.service_type, F.data.startswith("of_svti_"))
+async def full_service_type_idx(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    types = await _public_types(company_id, data.get("service", ""))
+    try:
+        tp = types[int(call.data.replace("of_svti_", ""))]
+    except (ValueError, IndexError):
+        await call.message.answer(t(lang, "ask_service_type"), reply_markup=await _type_kb(lang, company_id, data.get("service", "")))
+        return
+    # в заявку — название варианта по-русски (оператору), ключ — отдельно
+    await state.update_data(service_type=tp.get("name_ru") or tp["type_key"], service_type_key=tp["type_key"])
+    await state.set_state(OrderForm.date)
+    await call.message.answer(t(lang, "ask_date"), reply_markup=date_kb(lang))
 
 
 @router.callback_query(OrderForm.service_type, F.data.startswith("of_svctype_"))
@@ -2133,7 +2207,35 @@ async def calc_service(call: CallbackQuery, company_id: int, state: FSMContext) 
     svc_name = _svc_display_name(lang, services, svc_key)
     await state.update_data(calc_svc=svc_key, calc_svc_name=svc_name)
     await state.set_state(CalcForm.service_type)
-    await call.message.answer(t(lang, "ask_service_type"), reply_markup=service_type_kb(lang))
+    await call.message.answer(t(lang, "ask_service_type"), reply_markup=await _type_kb(lang, company_id, svc_key))
+
+
+@router.callback_query(CalcForm.service_type, F.data.startswith("of_svsp_"))
+async def calc_service_speed(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    await call.message.answer(t(lang, "ask_size"), reply_markup=await _size_kb(
+        lang, company_id, data.get("calc_svc", ""), call.data.replace("of_svsp_", "")))
+
+
+@router.callback_query(CalcForm.service_type, F.data.startswith("of_svti_"))
+async def calc_service_type_idx(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
+    await call.answer()
+    data = await state.get_data()
+    lang = data.get("lang", "ru")
+    types = await _public_types(company_id, data.get("calc_svc", ""))
+    try:
+        tp = types[int(call.data.replace("of_svti_", ""))]
+    except (ValueError, IndexError):
+        await call.message.answer(t(lang, "ask_service_type"), reply_markup=await _type_kb(lang, company_id, data.get("calc_svc", "")))
+        return
+    type_label = _type_label(lang, tp)
+    await state.update_data(calc_svctype=tp["type_key"], calc_svctype_label=type_label)
+    await state.set_state(CalcForm.width)
+    svc_display = f"{data.get('calc_svc_name', '')} ({type_label})".strip()
+    header = t(lang, "calc_selected_header").format(svc=svc_display)
+    await call.message.answer(header + "\n\n" + t(lang, "calc_ask_w"), reply_markup=cancel_kb(lang))
 
 
 @router.callback_query(CalcForm.service_type, F.data.startswith("of_svctype_"))
