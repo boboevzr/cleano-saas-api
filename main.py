@@ -134,6 +134,10 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.on_event("startup")
 async def startup():
     await db.init_db()
+    try:
+        _bot_inner_colors.update(await db.get_config_bool_by_company("bot_inner_button_colors", default=True))
+    except Exception as e:
+        logging.warning(f"bot_inner_button_colors load: {e}")
     await db.ensure_plans_table()
     await db.ensure_chat_tables()
     await db.ensure_chat_templates()
@@ -792,7 +796,7 @@ async def _notify_new_lead(lead: dict, staff: dict):
     keyboard = None
     if lead_id and not lead.get("assigned_to"):
         keyboard = {"inline_keyboard": [[
-            {"text": "✋ Взять лид", "callback_data": f"take_lead_{lead_id}"}
+            _tg_btn("✋ Взять лид", "ok", callback_data=f"take_lead_{lead_id}")
         ]]}
 
     try:
@@ -2178,6 +2182,22 @@ async def _is_route_closed_for_order(order_id: int) -> bool:
         """, order_id)
         return row == "done"
 
+# ── Цвета кнопок постов бота (перенос из ARTEZ 2026-10-18) ─────────────────────
+# Правило как btn_ok/btn_no/btn_pay в order_bot_handlers: 🟢 подтвердить/взять/забрал,
+# 🔴 отменить/отклонить/не забрал, 🔵 оплата; остальное — обычные. Выключатель —
+# config bot_inner_button_colors компании; пишет его только этот процесс, поэтому
+# держим в памяти {company_id: bool} (загрузка при старте, обновление при сохранении).
+_TG_BTN_STYLE = {"ok": "success", "no": "danger", "pay": "primary"}
+_bot_inner_colors: dict = {}
+
+
+def _tg_btn(text: str, kind: str | None = None, **kw) -> dict:
+    b = {"text": text, **kw}
+    if kind and _bot_inner_colors.get(db._cid(), True):
+        b["style"] = _TG_BTN_STYLE[kind]
+    return b
+
+
 def _route_pickup_kb(order_id: int, status: str, closed: bool = False) -> dict:
     """Inline-клавиатура для сообщения в канале водителей."""
     h = {"text": "📋 История", "callback_data": f"rp:{order_id}:history"}
@@ -2187,26 +2207,26 @@ def _route_pickup_kb(order_id: int, status: str, closed: bool = False) -> dict:
         return {"inline_keyboard": [[p, h, r]]}
     if status == "confirmed":
         return {"inline_keyboard": [
-            [{"text": "✅ Забрал", "callback_data": f"rp:{order_id}:take"},
+            [_tg_btn("✅ Забрал", "ok", callback_data=f"rp:{order_id}:take"),
              {"text": "⏭ Пропустить", "callback_data": f"rp:{order_id}:skip"}],
             [p, h, r],
         ]}
     elif status == "pickup":
         return {"inline_keyboard": [
-            [{"text": "🏭 Сдал в мастерскую", "callback_data": f"rp:{order_id}:deliver"}],
-            [{"text": "↩️ Не забирал", "callback_data": f"rp:{order_id}:undo"}],
+            [_tg_btn("🏭 Сдал в мастерскую", "ok", callback_data=f"rp:{order_id}:deliver")],
+            [_tg_btn("↩️ Не забирал", "no", callback_data=f"rp:{order_id}:undo")],
             [p, h, r],
         ]}
     elif status == "ready":
         return {"inline_keyboard": [
             [{"text": "🚗 Везу клиенту", "callback_data": f"rp:{order_id}:take_delivery"},
-             {"text": "❌ Не забрал", "callback_data": f"rp:{order_id}:ntaken"}],
+             _tg_btn("❌ Не забрал", "no", callback_data=f"rp:{order_id}:ntaken")],
             [p, h, r],
         ]}
     elif status == "delivery":
         return {"inline_keyboard": [
-            [{"text": "✅ Доставил клиенту", "callback_data": f"rp:{order_id}:mark_delivered"}],
-            [{"text": "💳 Оплата", "callback_data": f"rp:{order_id}:pay_init"}],
+            [_tg_btn("✅ Доставил клиенту", "ok", callback_data=f"rp:{order_id}:mark_delivered")],
+            [_tg_btn("💳 Оплата", "pay", callback_data=f"rp:{order_id}:pay_init")],
             [{"text": "🔙 Вернул в мастерскую", "callback_data": f"rp:{order_id}:retback"}],
             [p, h, r],
         ]}
@@ -2214,7 +2234,7 @@ def _route_pickup_kb(order_id: int, status: str, closed: bool = False) -> dict:
         return {"inline_keyboard": [[p, h, r]]}
     elif status == "skipped":
         return {"inline_keyboard": [
-            [{"text": "↩️ Отменить пропуск", "callback_data": f"rp:{order_id}:unskip"}],
+            [_tg_btn("↩️ Отменить пропуск", "no", callback_data=f"rp:{order_id}:unskip")],
             [p, h, r],
         ]}
     else:
@@ -6685,8 +6705,8 @@ async def staff_cash_handover(
         msg_id = await _send_tg_with_kb(
             tg_chat, dm_text,
             keyboard={"inline_keyboard": [[
-                {"text": "✅ Подтвердить", "callback_data": f"cash_confirm:{handover_id}"},
-                {"text": "❌ Отклонить",   "callback_data": f"cash_reject:{handover_id}"},
+                _tg_btn("✅ Подтвердить", "ok", callback_data=f"cash_confirm:{handover_id}"),
+                _tg_btn("❌ Отклонить", "no",   callback_data=f"cash_reject:{handover_id}"),
             ]]},
         )
         if msg_id:
@@ -6824,8 +6844,8 @@ async def admin_safe_deposit(
                 f"Сумма: {fmt_amt} сум"
                 + (f"\n📝 {note}" if note else ""))
         kb = {"inline_keyboard": [[
-            {"text": "✅ Подтвердить", "callback_data": f"safe_confirm_{handover_id}"},
-            {"text": "❌ Отклонить",   "callback_data": f"safe_reject_{handover_id}"},
+            _tg_btn("✅ Подтвердить", "ok", callback_data=f"safe_confirm_{handover_id}"),
+            _tg_btn("❌ Отклонить", "no",   callback_data=f"safe_reject_{handover_id}"),
         ]]}
         msg_id = await _send_tg_with_kb(str(tg_id), text, kb)
         if msg_id:
@@ -8914,8 +8934,8 @@ async def driver_close_with_debt(order_id: int, staff=Depends(get_current_staff)
     text = "\n".join(lines)
 
     approve_kb = {"inline_keyboard": [
-        [{"text": "✅ Разрешить закрыть в долг", "callback_data": f"debt_approve:{order_id}"}],
-        [{"text": "❌ Отказать",                 "callback_data": f"debt_reject:{order_id}"}],
+        [_tg_btn("✅ Разрешить закрыть в долг", "ok", callback_data=f"debt_approve:{order_id}")],
+        [_tg_btn("❌ Отказать", "no",                 callback_data=f"debt_reject:{order_id}")],
     ]}
     # Все approvers (с или без tg_id)
     async with db.pool.acquire() as conn:
@@ -9451,9 +9471,33 @@ SITE_SETTINGS_DEFAULTS = {
     # НЕ публичный ключ; company-scoped через db.get_config/set_config (_cid()) —
     # у каждой компании свой список (перенос из ARTEZ 2026-10-17).
     "manager_cards": "[]",
+    # Цвета кнопок главного меню бота (Bot API style) — JSON {ключ: ""|success|danger|primary};
+    # у каждой компании свои. Нормализуется _normalize_button_styles (те же умолчания,
+    # что BTN_STYLE_DEFAULTS в order_bot_handlers.py). Перенос из ARTEZ 2026-10-18.
+    "bot_button_styles": "",
+    # Цвета кнопок внутри разделов и постов бота по правилу (🟢 подтвердить, 🔴 отменить, 🔵 оплатить)
+    "bot_inner_button_colors": "true",
 }
 
 MAX_MANAGER_CARDS = 10
+
+BOT_BUTTON_STYLE_VALUES = ("", "success", "danger", "primary")
+BOT_BUTTON_STYLE_DEFAULTS = {
+    "reg_start": "success", "webapp": "primary", "order": "success", "status": "primary",
+    "prices": "", "calc": "", "profile": "", "operator": "",
+}
+
+
+def _normalize_button_styles(raw) -> dict:
+    """Всегда все ключи; не прислали / неизвестный цвет — по умолчанию; "" — обычная."""
+    try:
+        data = _json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or {})
+    except (ValueError, TypeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return {k: (data[k] if k in data and data[k] in BOT_BUTTON_STYLE_VALUES else d)
+            for k, d in BOT_BUTTON_STYLE_DEFAULTS.items()}
 
 async def _get_cfg(key: str) -> str:
     """БД → env-fallback из SITE_SETTINGS_DEFAULTS."""
@@ -9585,6 +9629,18 @@ class SiteSettings(BaseModel):
     bot_maintenance_mode:    str | None = None
     bulk_print_template:     str | None = None
     manager_cards:           str | None = None
+    bot_button_styles:       str | None = None
+    bot_inner_button_colors: str | None = None
+
+    @field_validator("bot_button_styles")
+    @classmethod
+    def _validate_bot_button_styles(cls, v):
+        return None if v is None else _json.dumps(_normalize_button_styles(v), ensure_ascii=False)
+
+    @field_validator("bot_inner_button_colors")
+    @classmethod
+    def _validate_bot_inner_button_colors(cls, v):
+        return None if v is None else ("false" if str(v).strip().lower() in ("false", "0", "off", "") else "true")
 
     @field_validator("manager_cards")
     @classmethod
@@ -9617,6 +9673,7 @@ class SiteSettings(BaseModel):
 @app.get("/api/admin/settings/site")
 async def get_admin_site_settings(_=Depends(get_admin)):
     result = {key: await _get_cfg(key) for key in SITE_SETTINGS_DEFAULTS}
+    result["bot_button_styles"] = _json.dumps(_normalize_button_styles(result.get("bot_button_styles")), ensure_ascii=False)
     return {"ok": True, "settings": result}
 
 @app.put("/api/admin/settings/site")
@@ -9624,6 +9681,15 @@ async def save_site_settings(body: SiteSettings, _=Depends(get_admin)):
     data = {k: v for k, v in body.dict().items() if v is not None}
     for key, val in data.items():
         await db.set_config(key, val)
+    if "bot_inner_button_colors" in data:
+        _bot_inner_colors[db._cid()] = data["bot_inner_button_colors"] != "false"
+    if "bot_button_styles" in data or "bot_inner_button_colors" in data:
+        # бот этого процесса (order_bot_handlers) держит кэш 60 с — сбрасываем сразу
+        try:
+            import order_bot_handlers as _obh
+            _obh._btn_ui_cache.pop(db._cid(), None)
+        except Exception:
+            pass
     return {"ok": True}
 
 @app.get("/api/staff/print-template")

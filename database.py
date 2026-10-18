@@ -3316,6 +3316,14 @@ async def get_config_for_company(key: str, company_id: int) -> str | None:
         return await conn.fetchval("SELECT value FROM config WHERE key=$1 AND company_id=$2", key, company_id)
 
 
+async def get_config_bool_by_company(key: str, default: bool = True) -> dict:
+    """{company_id: bool} для ключа-флага по всем компаниям ('false' — выкл., иначе вкл.)."""
+    if not pool: return {}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT company_id, value FROM config WHERE key=$1", key)
+    return {r["company_id"]: (r["value"] or ("true" if default else "false")) != "false" for r in rows}
+
+
 async def set_config_for_company(key: str, value: str, company_id: int):
     if not pool: return
     async with pool.acquire() as conn:

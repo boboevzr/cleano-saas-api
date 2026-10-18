@@ -51,13 +51,15 @@ import html
 import json
 import logging
 import re
+import time as _time
+from contextvars import ContextVar
 
-from aiogram import Router, F
+from aiogram import Router, F, BaseMiddleware
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, BufferedInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    ReplyKeyboardMarkup, KeyboardButton,
     InputMediaPhoto, InputMediaVideo, WebAppInfo,
 )
 from aiogram.fsm.context import FSMContext
@@ -597,24 +599,121 @@ def lang_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def menu_kb(lang: str, site_url: str, show_register: bool = False) -> InlineKeyboardMarkup:
-    """Главное меню — структура рядов как в прод-боте (menu_kb ~L719-729):
-    ссылка на сайт → «Оставить заявку» (ведёт в подменю быстрая/полная,
-    см. menu_order ниже) → статус+цены → калькулятор+профиль → оператор →
-    (если нет сайтового аккаунта) «Зарегистрироваться».
-    "Стать Агентом" — кнопка внутри «Мой профиль» (см. menu_profile), не здесь."""
-    rows = [
-        [InlineKeyboardButton(text=t(lang, "btn_webapp"), url=site_url)],
-        [InlineKeyboardButton(text=t(lang, "btn_order"), callback_data="menu_order")],
-        [InlineKeyboardButton(text=t(lang, "btn_status"), callback_data="menu_status"),
-         InlineKeyboardButton(text=t(lang, "btn_prices"), callback_data="menu_prices")],
-        [InlineKeyboardButton(text=t(lang, "btn_calc"), callback_data="menu_calc"),
-         InlineKeyboardButton(text=t(lang, "btn_profile"), callback_data="menu_profile")],
-        [InlineKeyboardButton(text=t(lang, "btn_operator"), callback_data="menu_operator")],
-    ]
+# ── Главное меню внизу + цвета кнопок (перенос из ARTEZ 2026-10-18) ─────────────
+# Bot API 9.4 (aiogram ≥3.25): style = success 🟢 | danger 🔴 | primary 🔵, не задано —
+# обычная. Настройки — у каждой компании свои (config): bot_button_styles (JSON
+# {ключ: стиль}) и bot_inner_button_colors ("true"/"false"); admin.html → Telegram ·
+# Настройки бота → «🎨 Цвета кнопок бота». Тот же нормализатор — в main.py.
+BTN_STYLE_VALUES = ("", "success", "danger", "primary")
+BTN_STYLE_DEFAULTS = {
+    "reg_start": "success", "webapp": "primary", "order": "success", "status": "primary",
+    "prices": "", "calc": "", "profile": "", "operator": "",
+}
+_BTN_STYLES_TTL = 60  # с — изменения из админки доходят до бота в течение минуты
+_btn_ui_cache: dict = {}  # company_id -> (monotonic, {"styles": ..., "inner": bool})
+
+
+def normalize_button_styles(raw) -> dict:
+    """Всегда все ключи; не задан / неизвестный цвет — по умолчанию; "" — обычная."""
+    try:
+        data = json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or {})
+    except (ValueError, TypeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return {k: (data[k] if k in data and data[k] in BTN_STYLE_VALUES else d)
+            for k, d in BTN_STYLE_DEFAULTS.items()}
+
+
+async def _bot_ui_settings(company_id: int) -> dict:
+    """Цвета меню + выключатель цветов внутри разделов компании, кэш в памяти 60 с."""
+    now = _time.monotonic()
+    hit = _btn_ui_cache.get(company_id)
+    if hit and now - hit[0] <= _BTN_STYLES_TTL:
+        return hit[1]
+    raw = inner = None
+    try:
+        raw = await db.get_config_for_company("bot_button_styles", company_id)
+        inner = await db.get_config_for_company("bot_inner_button_colors", company_id)
+    except Exception as e:
+        logging.warning(f"bot button settings read error ({company_id}): {e}")
+    val = {"styles": normalize_button_styles(raw), "inner": (inner or "true") != "false"}
+    _btn_ui_cache[company_id] = (now, val)
+    return val
+
+
+# Кнопки внутри разделов: одно правило на весь бот, цвет — там, где кнопка создаётся.
+# btn_ok 🟢 добавить/подать/подтвердить, btn_no 🔴 удалить/отклонить/отменить,
+# btn_pay 🔵 оплатить. Выключатель кладёт middleware в ContextVar на время апдейта.
+_inner_colors_on = ContextVar("inner_button_colors", default=True)
+
+
+def _styled(style: str, **kw) -> InlineKeyboardButton:
+    return InlineKeyboardButton(style=style if _inner_colors_on.get() else None, **kw)
+
+
+def btn_ok(**kw) -> InlineKeyboardButton:  return _styled("success", **kw)
+def btn_no(**kw) -> InlineKeyboardButton:  return _styled("danger", **kw)
+def btn_pay(**kw) -> InlineKeyboardButton: return _styled("primary", **kw)
+
+
+class _ButtonColorsMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        inner = True
+        try:
+            if data.get("company_id"):
+                inner = (await _bot_ui_settings(int(data["company_id"])))["inner"]
+        except Exception:
+            pass
+        token = _inner_colors_on.set(inner)
+        try:
+            return await handler(event, data)
+        finally:
+            _inner_colors_on.reset(token)
+
+router.message.outer_middleware(_ButtonColorsMiddleware())
+router.callback_query.outer_middleware(_ButtonColorsMiddleware())
+
+# Ключ кнопки → ключ перевода (тексты RU/UZ — они же ловятся хендлером menu_button_pressed)
+MENU_BTN_TEXT_KEYS = {
+    "reg_start": "btn_reg_start", "webapp": "btn_webapp", "order": "btn_order",
+    "status": "btn_status", "prices": "btn_prices", "calc": "btn_calc",
+    "profile": "btn_profile", "operator": "btn_operator",
+}
+
+
+def main_menu_kb(lang: str, site_url: str, show_register: bool = False,
+                 styles: dict | None = None) -> ReplyKeyboardMarkup:
+    """Главное меню — обычная клавиатура внизу чата (2026-10-18, как в ARTEZ).
+    «Открыть приложение» — витрина компании как Mini App (в обычной клавиатуре нет
+    url-кнопок; нужен https). «Стать Агентом» — внутри «Мой профиль»."""
+    styles = styles or BTN_STYLE_DEFAULTS
+    def b(key, **kw):
+        return KeyboardButton(text=t(lang, MENU_BTN_TEXT_KEYS[key]), style=styles.get(key) or None, **kw)
+    rows = []
     if show_register:
-        rows.append([InlineKeyboardButton(text=t(lang, "btn_reg_start"), callback_data="reg_start")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        rows.append([b("reg_start")])
+    if (site_url or "").startswith("https://"):
+        rows.append([b("webapp", web_app=WebAppInfo(url=site_url))])
+    rows += [
+        [b("order")],
+        [b("status"), b("prices")],
+        [b("calc"), b("profile")],
+        [b("operator")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+
+
+async def main_kb(lang: str, company_id: int, uid: int | None = None) -> ReplyKeyboardMarkup:
+    """Главное меню внизу с цветами компании и «Регистрацией», если аккаунта нет."""
+    registered = True
+    if uid is not None:
+        try:
+            registered = bool(await db.get_user_by_tg_id(uid, company_id))
+        except Exception as e:
+            logging.warning(f"get_user_by_tg_id error: {e}")
+    styles = (await _bot_ui_settings(company_id))["styles"]
+    return main_menu_kb(lang, await _site_url(company_id), show_register=not registered, styles=styles)
 
 
 def status_menu_kb(lang: str, counts: dict) -> InlineKeyboardMarkup:
@@ -636,7 +735,7 @@ def back_to_status_kb(lang: str) -> InlineKeyboardMarkup:
 
 def cancel_kb(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=t(lang, "btn_cancel"), callback_data="cancel_order"),
+        btn_no(text=t(lang, "btn_cancel"), callback_data="cancel_order"),
     ]])
 
 
@@ -659,7 +758,7 @@ def service_kb(lang: str, services: list[dict]) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(
             text=("🧺 Химчистка" if lang == "ru" else "🧺 Kimyoviy tozalash"),
             callback_data="svc_default")])
-    rows.append([InlineKeyboardButton(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
+    rows.append([btn_no(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -676,7 +775,7 @@ def phone_kb(lang: str) -> ReplyKeyboardMarkup:
 def phone2_choice_kb(lang: str) -> InlineKeyboardMarkup:
     """«Оставите запасной номер?» ➕ Указать / ⏭ Пропустить (перенос из прод)."""
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=t(lang, "btn_add_phone2"), callback_data="phone2_add"),
+        btn_ok(text=t(lang, "btn_add_phone2"), callback_data="phone2_add"),
         InlineKeyboardButton(text=t(lang, "btn_skip_phone2"), callback_data="phone2_skip"),
     ]])
 
@@ -709,7 +808,7 @@ def branch_kb(lang: str, branches: list[dict]) -> InlineKeyboardMarkup:
     for b in branches:
         name = b.get(f"name_{lang}") or b.get("name_ru") or b.get("slug", "")
         rows.append([InlineKeyboardButton(text=name, callback_data=f"of_branch_{b['slug']}")])
-    rows.append([InlineKeyboardButton(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
+    rows.append([btn_no(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -717,7 +816,7 @@ def service_type_kb(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=t(lang, "btn_type_standard"), callback_data="of_svctype_standard")],
         [InlineKeyboardButton(text=t(lang, "btn_type_express"),  callback_data="of_svctype_express")],
-        [InlineKeyboardButton(text=t(lang, "btn_cancel"), callback_data="cancel_order")],
+        [btn_no(text=t(lang, "btn_cancel"), callback_data="cancel_order")],
     ])
 
 
@@ -751,7 +850,7 @@ async def _type_kb(lang: str, company_id: int, svc: str) -> InlineKeyboardMarkup
                 for i, tp in enumerate(types)]
     else:
         return service_type_kb(lang)
-    rows.append([InlineKeyboardButton(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
+    rows.append([btn_no(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -761,7 +860,7 @@ async def _size_kb(lang: str, company_id: int, svc: str, speed: str) -> InlineKe
                 text=(tp.get("size_name_uz") if lang == "uz" else tp.get("size_name_ru")) or _type_label(lang, tp),
                 callback_data=f"of_svti_{i}")]
             for i, tp in enumerate(types) if tp.get("size_key") and tp.get("speed_key") == speed]
-    rows.append([InlineKeyboardButton(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
+    rows.append([btn_no(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -789,7 +888,7 @@ def date_kb(lang: str) -> InlineKeyboardMarkup:
     if row:
         rows.append(row)
     rows.append([InlineKeyboardButton(text=t(lang, "btn_pick_date"), callback_data="of_date_pick")])
-    rows.append([InlineKeyboardButton(text=t(lang, "btn_cancel"),    callback_data="cancel_order")])
+    rows.append([btn_no(text=t(lang, "btn_cancel"),    callback_data="cancel_order")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -798,7 +897,7 @@ def time_kb(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=t(lang, "btn_morning"),     callback_data="of_time_morning")],
         [InlineKeyboardButton(text=t(lang, "btn_evening"),     callback_data="of_time_evening")],
         [InlineKeyboardButton(text=t(lang, "btn_custom_time"), callback_data="of_time_custom")],
-        [InlineKeyboardButton(text=t(lang, "btn_cancel"),      callback_data="cancel_order")],
+        [btn_no(text=t(lang, "btn_cancel"),      callback_data="cancel_order")],
     ])
 
 
@@ -810,7 +909,7 @@ def time_from_kb(lang: str) -> InlineKeyboardMarkup:
     for i in range(0, 12, 3):
         rows.append([InlineKeyboardButton(text=_TIME_SLOTS[j], callback_data=f"of_tslot_from_{j+8}")
                      for j in range(i, i + 3)])
-    rows.append([InlineKeyboardButton(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
+    rows.append([btn_no(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -823,7 +922,7 @@ def time_to_kb(lang: str, from_h: int) -> InlineKeyboardMarkup:
             rows.append(row); row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
+    rows.append([btn_no(text=t(lang, "btn_cancel"), callback_data="cancel_order")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1044,7 +1143,8 @@ async def _show_menu(target, lang: str, company_id: int, uid: int | None = None)
             registered = True  # при сбое лучше не показывать лишнюю кнопку
     header = await _build_menu_text(lang, company_id, registered)
     site_url = await _site_url(company_id)
-    await target.answer(header, reply_markup=menu_kb(lang, site_url, show_register=not registered))
+    styles = (await _bot_ui_settings(company_id))["styles"]
+    await target.answer(header, reply_markup=main_menu_kb(lang, site_url, show_register=not registered, styles=styles))
 
 
 async def _build_prices_text(lang: str, company_id: int) -> str:
@@ -1124,6 +1224,55 @@ async def _resolve_operator_group_id(company_id: int) -> str | None:
 # ══════════════════════════════════════
 #  /start и язык
 # ══════════════════════════════════════
+# ── Нажатия кнопок главного меню (обычная клавиатура присылает ТЕКСТ кнопки) ──
+# Зарегистрирован раньше хендлеров форм: кнопка меню, нажатая посреди формы, открывает
+# раздел и сбрасывает форму, а не уходит как ответ. Разделы — те же хендлеры, что у
+# старого inline-меню (их кнопки остались в старых сообщениях), через «нажатие» _MenuPress.
+def _menu_key_by_text(text) -> str | None:
+    if not text:
+        return None
+    for key, tkey in MENU_BTN_TEXT_KEYS.items():
+        if key != "webapp" and text in (T["ru"].get(tkey), T["uz"].get(tkey)):
+            return key
+    return None
+
+
+class _MenuPress:
+    """Нажатие кнопки меню в виде CallbackQuery для хендлеров разделов."""
+    def __init__(self, message: Message, data: str):
+        self.from_user, self.message, self.data = message.from_user, message, data
+    async def answer(self, *args, **kwargs):
+        return None
+
+
+@router.message(F.text.func(lambda s: _menu_key_by_text(s) is not None))
+async def menu_button_pressed(message: Message, company_id: int, state: FSMContext) -> None:
+    key = _menu_key_by_text(message.text)
+    lang = await _resolve_lang(message.from_user.id, company_id, state) \
+        or ("uz" if message.text == T["uz"].get(MENU_BTN_TEXT_KEYS[key]) else "ru")
+    await state.clear()
+    await state.update_data(lang=lang)
+    press = _MenuPress(message, f"menu_{key}")
+    if key == "reg_start":
+        await register_start(press, state)
+        return
+    handler = {"order": menu_order, "status": menu_status, "prices": menu_prices,
+               "calc": menu_calc, "profile": menu_profile, "operator": menu_operator}[key]
+    await handler(press, company_id, state)
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message, company_id: int, state: FSMContext) -> None:
+    uid = message.from_user.id
+    lang = await _resolve_lang(uid, company_id, state)
+    await state.clear()
+    if not lang:
+        await message.answer(t("ru", "hello"), reply_markup=lang_kb())
+        return
+    await state.update_data(lang=lang)
+    await _show_menu(message, lang, company_id, uid)
+
+
 @router.message(CommandStart())
 async def start(message: Message, company_id: int, state: FSMContext) -> None:
     await state.clear()
@@ -1194,8 +1343,7 @@ async def cancel_order(call: CallbackQuery, company_id: int, state: FSMContext) 
     lang = data.get("lang", "ru")
     await state.clear()
     await state.update_data(lang=lang)
-    site_url = await _site_url(company_id)
-    await call.message.answer(t(lang, "cancelled"), reply_markup=menu_kb(lang, site_url))
+    await call.message.answer(t(lang, "cancelled"), reply_markup=await main_kb(lang, company_id, call.from_user.id))
 
 
 # ══════════════════════════════════════
@@ -1264,19 +1412,19 @@ async def register_contact_received(message: Message, company_id: int, state: FS
     data = await state.get_data()
     lang = data.get("lang", "ru")
     if message.contact.user_id and int(message.contact.user_id) != uid:
-        await message.answer(t(lang, "reg_own_phone_only"), reply_markup=ReplyKeyboardRemove())
+        await message.answer(t(lang, "reg_own_phone_only"), reply_markup=await main_kb(lang, company_id, message.from_user.id))
         return
 
     phone = normalize_phone_bot(message.contact.phone_number or "")
     if not phone:
-        await message.answer(t(lang, "phone_invalid"), reply_markup=ReplyKeyboardRemove())
+        await message.answer(t(lang, "phone_invalid"), reply_markup=await main_kb(lang, company_id, message.from_user.id))
         return
 
     name = (data.get("name") or message.from_user.first_name or "").strip()
     await state.clear()
     await state.update_data(lang=lang)
 
-    await message.answer("⏳", reply_markup=ReplyKeyboardRemove())
+    await message.answer("⏳", reply_markup=await main_kb(lang, company_id, message.from_user.id))
 
     try:
         await db.upsert_bot_client(
@@ -1339,7 +1487,7 @@ async def menu_order(call: CallbackQuery, company_id: int, state: FSMContext) ->
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=t(lang, "btn_order_quick"), callback_data="order_type_quick")],
         [InlineKeyboardButton(text=t(lang, "btn_order_full"), callback_data="order_type_full")],
-        [InlineKeyboardButton(text=t(lang, "btn_cancel"), callback_data="cancel_order")],
+        [btn_no(text=t(lang, "btn_cancel"), callback_data="cancel_order")],
     ])
     await call.message.answer(t(lang, "ask_order_type"), reply_markup=kb)
 
@@ -1391,7 +1539,7 @@ async def _finish_phone_step(message: Message, company_id: int, state: FSMContex
         )
     except Exception as e:
         logging.warning(f"upsert_bot_client (phone) error: {e}")
-    await message.answer("✅", reply_markup=ReplyKeyboardRemove())
+    await message.answer("✅", reply_markup=await main_kb(lang, company_id, message.from_user.id))
     await state.set_state(QuickForm.phone2)
     await message.answer(t(lang, "ask_phone2"), reply_markup=phone2_choice_kb(lang))
 
@@ -1435,7 +1583,7 @@ async def quick_phone2_contact(message: Message, company_id: int, state: FSMCont
         await message.answer(t(lang, "phone_invalid"), reply_markup=phone_kb(lang))
         return
     await state.update_data(phone2=norm)
-    await message.answer("✅", reply_markup=ReplyKeyboardRemove())
+    await message.answer("✅", reply_markup=await main_kb(lang, company_id, message.from_user.id))
     await _advance_after_quick_phone2(message, company_id, state)
 
 
@@ -1449,7 +1597,7 @@ async def quick_phone2_text(message: Message, company_id: int, state: FSMContext
         await message.answer(t(lang, "phone_invalid"), reply_markup=phone_kb(lang))
         return
     await state.update_data(phone2=norm)
-    await message.answer("✅", reply_markup=ReplyKeyboardRemove())
+    await message.answer("✅", reply_markup=await main_kb(lang, company_id, message.from_user.id))
     await _advance_after_quick_phone2(message, company_id, state)
 
 
@@ -1654,7 +1802,7 @@ async def _advance_after_phone(message: Message, company_id: int, state: FSMCont
             )
         except Exception as e:
             logging.warning(f"upsert_bot_client (phone) error: {e}")
-    await message.answer("✅", reply_markup=ReplyKeyboardRemove())
+    await message.answer("✅", reply_markup=await main_kb(lang, company_id, message.from_user.id))
     await state.set_state(OrderForm.phone2)
     await message.answer(t(lang, "ask_phone2"), reply_markup=phone2_choice_kb(lang))
 
@@ -1738,7 +1886,7 @@ async def full_phone2_contact(message: Message, company_id: int, state: FSMConte
         await message.answer(t(lang, "phone_invalid"), reply_markup=phone_kb(lang))
         return
     await state.update_data(phone2=norm)
-    await message.answer("✅", reply_markup=ReplyKeyboardRemove())
+    await message.answer("✅", reply_markup=await main_kb(lang, company_id, message.from_user.id))
     await _advance_after_phone2(message, company_id, state)
 
 
@@ -1752,7 +1900,7 @@ async def full_phone2_text(message: Message, company_id: int, state: FSMContext)
         await message.answer(t(lang, "phone_invalid"), reply_markup=phone_kb(lang))
         return
     await state.update_data(phone2=norm)
-    await message.answer("✅", reply_markup=ReplyKeyboardRemove())
+    await message.answer("✅", reply_markup=await main_kb(lang, company_id, message.from_user.id))
     await _advance_after_phone2(message, company_id, state)
 
 
@@ -1842,7 +1990,7 @@ async def _advance_after_location(message: Message, company_id: int, state: FSMC
 async def full_location_geo(message: Message, company_id: int, state: FSMContext) -> None:
     lat, lon = message.location.latitude, message.location.longitude
     await state.update_data(location=f"{lat:.5f},{lon:.5f}", location_address="")
-    await message.answer("📍 ✅", reply_markup=ReplyKeyboardRemove())
+    await message.answer("📍 ✅", reply_markup=await main_kb((await state.get_data()).get("lang", "ru"), company_id, message.from_user.id))
     await _advance_after_location(message, company_id, state)
 
 
@@ -1858,14 +2006,14 @@ async def full_location_webapp(message: Message, company_id: int, state: FSMCont
         logging.warning(f"WebApp location parse error: {e}")
         await state.update_data(location="", location_address="")
         text = "📍 ✅"
-    await message.answer(text, reply_markup=ReplyKeyboardRemove())
+    await message.answer(text, reply_markup=await main_kb((await state.get_data()).get("lang", "ru"), company_id, message.from_user.id))
     await _advance_after_location(message, company_id, state)
 
 
 @router.message(OrderForm.location, F.text)
 async def full_location_skip(message: Message, company_id: int, state: FSMContext) -> None:
     await state.update_data(location="", location_address="")
-    await message.answer("⏭", reply_markup=ReplyKeyboardRemove())
+    await message.answer("⏭", reply_markup=await main_kb((await state.get_data()).get("lang", "ru"), company_id, message.from_user.id))
     await _advance_after_location(message, company_id, state)
 
 
@@ -1924,7 +2072,7 @@ async def full_delivery_address(message: Message, company_id: int, state: FSMCon
 async def full_delivery_location_geo(message: Message, company_id: int, state: FSMContext) -> None:
     lat, lon = message.location.latitude, message.location.longitude
     await state.update_data(delivery_location=f"{lat:.5f},{lon:.5f}", delivery_location_address="")
-    await message.answer("📍 ✅", reply_markup=ReplyKeyboardRemove())
+    await message.answer("📍 ✅", reply_markup=await main_kb((await state.get_data()).get("lang", "ru"), company_id, message.from_user.id))
     await _ask_service_step(message, company_id, state)
 
 
@@ -1940,14 +2088,14 @@ async def full_delivery_location_webapp(message: Message, company_id: int, state
         logging.warning(f"WebApp delivery location parse error: {e}")
         await state.update_data(delivery_location="", delivery_location_address="")
         text = "📍 ✅"
-    await message.answer(text, reply_markup=ReplyKeyboardRemove())
+    await message.answer(text, reply_markup=await main_kb((await state.get_data()).get("lang", "ru"), company_id, message.from_user.id))
     await _ask_service_step(message, company_id, state)
 
 
 @router.message(OrderForm.delivery_location, F.text)
 async def full_delivery_location_skip(message: Message, company_id: int, state: FSMContext) -> None:
     await state.update_data(delivery_location="", delivery_location_address="")
-    await message.answer("⏭", reply_markup=ReplyKeyboardRemove())
+    await message.answer("⏭", reply_markup=await main_kb((await state.get_data()).get("lang", "ru"), company_id, message.from_user.id))
     await _ask_service_step(message, company_id, state)
 
 
@@ -2376,7 +2524,7 @@ async def menu_status(call: CallbackQuery, company_id: int, state: FSMContext) -
 
     if not leads and not orders:
         kb_empty = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=t(lang, "btn_order"), callback_data="menu_order")],
+            [btn_ok(text=t(lang, "btn_order"), callback_data="menu_order")],
             [InlineKeyboardButton(text=t(lang, "btn_menu"), callback_data="go_menu")],
         ])
         await call.message.answer(t(lang, "status_empty"), reply_markup=kb_empty)
@@ -2898,7 +3046,7 @@ async def _do_agent_check(uid: int, company_id: int, phone: str | None, lang: st
         await message.answer(
             t(lang, "agent_not_found").format(phone=_h(phone)),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=t(lang, "btn_register_site"), url=await _site_url(company_id))],
+                [btn_ok(text=t(lang, "btn_register_site"), url=await _site_url(company_id))],
                 [InlineKeyboardButton(text=t(lang, "btn_menu"), callback_data="go_menu")],
             ]))
     else:
@@ -2915,8 +3063,8 @@ async def menu_agent(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     lang = data.get("lang", "ru")
     await call.message.answer(t(lang, "agent_info_text"), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t(lang, "btn_agent_confirm"), callback_data="agent_confirm")],
-        [InlineKeyboardButton(text=t(lang, "btn_cancel"), callback_data="go_menu")],
+        [btn_ok(text=t(lang, "btn_agent_confirm"), callback_data="agent_confirm")],
+        [btn_no(text=t(lang, "btn_cancel"), callback_data="go_menu")],
     ]))
 
 
@@ -2947,7 +3095,7 @@ async def agent_contact_received(message: Message, company_id: int, state: FSMCo
     await state.clear()
     await state.update_data(lang=lang)
     uid = message.from_user.id
-    await message.answer(t(lang, "agent_checking"), reply_markup=ReplyKeyboardRemove())
+    await message.answer(t(lang, "agent_checking"), reply_markup=await main_kb(lang, company_id, message.from_user.id))
 
     # Клиент мог переслать ЧУЖОЙ контакт — считаем верифицированным (и сохраняем
     # как tg_phone) ТОЛЬКО если это его собственный номер (см. security-фикс
@@ -3052,7 +3200,7 @@ async def admin_reply_start(call: CallbackQuery, company_id: int, state: FSMCont
     await call.message.answer(
         f"✏️ Напишите ответ клиенту {client_id}:\n(следующее сообщение будет отправлено ему)",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_admin_reply"),
+            btn_no(text="❌ Отмена", callback_data="cancel_admin_reply"),
         ]]),
     )
 
@@ -3186,9 +3334,9 @@ async def _format_route_stop(lang: str, stop: dict) -> str:
 def _route_stop_kb(lang: str, order_id: int, order_status: str, stop_status: str) -> InlineKeyboardMarkup | None:
     rows = []
     if order_status == "ready":
-        rows.append([InlineKeyboardButton(text=t(lang, "btn_route_take"), callback_data=f"drv_take_{order_id}")])
+        rows.append([btn_ok(text=t(lang, "btn_route_take"), callback_data=f"drv_take_{order_id}")])
     if stop_status != "done" and order_status in ("ready", "delivery"):
-        rows.append([InlineKeyboardButton(text=t(lang, "btn_route_deliver"), callback_data=f"drv_deliver_{order_id}")])
+        rows.append([btn_ok(text=t(lang, "btn_route_deliver"), callback_data=f"drv_deliver_{order_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
@@ -3278,9 +3426,9 @@ async def drv_deliver(call: CallbackQuery, company_id: int, state: FSMContext) -
         logging.warning(f"get_order_debt_amount error: {e}")
         expected = 0
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t(lang, "btn_pay_cash"), callback_data=f"drv_paym_cash_{order_id}"),
-         InlineKeyboardButton(text=t(lang, "btn_pay_card"), callback_data=f"drv_paym_card_{order_id}")],
-        [InlineKeyboardButton(text=t(lang, "btn_pay_transfer"), callback_data=f"drv_paym_transfer_{order_id}"),
+        [btn_pay(text=t(lang, "btn_pay_cash"), callback_data=f"drv_paym_cash_{order_id}"),
+         btn_pay(text=t(lang, "btn_pay_card"), callback_data=f"drv_paym_card_{order_id}")],
+        [btn_pay(text=t(lang, "btn_pay_transfer"), callback_data=f"drv_paym_transfer_{order_id}"),
          InlineKeyboardButton(text=t(lang, "btn_pay_none"), callback_data=f"drv_paym_none_{order_id}")],
     ])
     await call.message.answer(t(lang, "pay_ask_method").format(expected=_fmt_sum(expected)), reply_markup=kb)
