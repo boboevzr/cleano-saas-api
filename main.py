@@ -12758,13 +12758,14 @@ def _cleano_lang_kb() -> dict:
 
 def _cleano_share_kb(lang: str) -> dict:
     return {
-        "keyboard": [[{"text": _CLN_T[lang]["share_btn"], "request_contact": True}]],
+        "keyboard": [[{"text": _CLN_T[lang]["share_btn"], "request_contact": True, "style": "success"}]],
         "resize_keyboard": True, "one_time_keyboard": True,
     }
 
 
 def _cleano_main_menu_kb(company: dict | None, lang: str, phone: str | None = None) -> dict:
-    """Главное меню @cleanouz_bot — инлайн-кнопки. 'Поделиться номером' у Telegram работает
+    """Главное меню @cleanouz_bot — инлайн-кнопки. Цвета (Bot API style, 2026-10-18) — то же правило,
+    что у ботов компаний: 🔵 Админ-панель, 🟢 регистрация/подтверждение номера, остальное обычное. 'Поделиться номером' у Telegram работает
     только через reply-кнопку (request_contact), инлайн-кнопки этого не умеют — поэтому
     подтверждение/перепривязка (cln_relink) в ответ шлёт ОТДЕЛЬНОЕ сообщение с
     reply-клавиатурой (см. _cleano_share_kb). phone — уже подтверждённый через бота номер
@@ -12773,7 +12774,7 @@ def _cleano_main_menu_kb(company: dict | None, lang: str, phone: str | None = No
     t = _CLN_T[lang]
     if company:
         rows = [
-            [{"text": t["btn_admin"], "url": f"https://cleano.uz/admin.html?company_slug={company['slug']}&fresh=1"}],
+            [{"text": t["btn_admin"], "url": f"https://cleano.uz/admin.html?company_slug={company['slug']}&fresh=1", "style": "primary"}],
             [{"text": t["btn_company"], "callback_data": "cln_company"}],
             [{"text": t["btn_support"], "callback_data": "cln_support"}],
             [{"text": t["btn_settings"], "callback_data": "cln_settings"}],
@@ -12784,14 +12785,14 @@ def _cleano_main_menu_kb(company: dict | None, lang: str, phone: str | None = No
         import urllib.parse
         reg_url = f"https://cleano.uz/cleano-landing.html?phone={urllib.parse.quote(phone)}"
         rows = [
-            [{"text": t["btn_register"], "url": reg_url}],
+            [{"text": t["btn_register"], "url": reg_url, "style": "success"}],
             [{"text": t["btn_support"], "callback_data": "cln_support"}],
         ]
     else:
         # Номер ещё не подтверждён — регистрацию предлагать рано (пока некуда привязать
         # созданную компанию), только подтверждение номера + поддержка.
         rows = [
-            [{"text": t["btn_confirm_phone"], "callback_data": "cln_relink"}],
+            [{"text": t["btn_confirm_phone"], "callback_data": "cln_relink", "style": "success"}],
             [{"text": t["btn_support"], "callback_data": "cln_support"}],
         ]
     return {"inline_keyboard": rows}
