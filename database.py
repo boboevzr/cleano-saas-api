@@ -7090,9 +7090,26 @@ async def create_empty_items_by_service(order_id: int, service_counts: dict,
     С 2026-10-10 (перенос из ARTEZ): ключ услуги -> подпись, цена по прайсу и снимок сразу."""
     if not pool: return []
     result = []
-    for service, count in service_counts.items():
+    speed = "express" if str(service_type or "").startswith("express") else "standard"
+    for raw_key, count in service_counts.items():
+        # 'услуга:размер' — счётчики «по услугам» в staff (перенос из ARTEZ 2026-10-19,
+        # строка на размер). Вариант = размер нужной скорости заказа. У услуги с размерами
+        # без указания размера — первый размер этой скорости, а не скрытый базовый
+        # standard/express (он мог быть в м² — позиция шла с Ш×Д вместо шт).
+        service, _, size_key = str(raw_key).partition(":")
+        type_for_item = service_type
+        try:
+            sized = [t for t in await get_service_types(service) if t.get("size_key")]
+        except Exception:
+            sized = []
+        if sized:
+            pool_ = [t for t in sized if t["size_key"] == size_key] or (sized if not size_key else [])
+            pick = next((t for t in pool_ if (t.get("speed_key") or "standard") == speed), None) \
+                or (pool_[0] if pool_ else None)
+            if pick:
+                type_for_item = pick["type_key"]
         label, extra = service, {}
-        keyed = await _service_key_label(service, service_type)
+        keyed = await _service_key_label(service, type_for_item)
         if keyed:
             type_key, label, ru, uz = keyed
             snap = await resolve_price_snapshot(service, type_key) or {}
