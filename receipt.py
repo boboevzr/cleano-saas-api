@@ -195,17 +195,26 @@ def generate_receipt_jpeg(order: dict, items: list[dict], branch_contacts: list[
     grand = grand_total if grand_total is not None else sum(float(it.get("total_sum") or 0) for it in items)
     y += 8
     y += _right_text(draw, y, f"ИТОГО: {fmt_n(grand)} сум", f["total"]) + 16
-    # Скидка клиента (реклама 2026-10-17): 5% заявка через бот/сайт, 10% пенсионер/инвалид.
+    # Все скидки заказа — отдельной строкой каждая, затем «К ОПЛАТЕ» (2026-10-20: раньше в
+    # чеке была только скидка клиента 5%/10%; самовывоз, доставка и ручная скидка в чек
+    # не попадали, хотя сумму уменьшали). Та же формула «к оплате», что в карточке заказа.
     client_disc = float(order.get("client_discount") or 0)
-    if client_disc > 0:
-        kind_label = {"online": "Заявка через бот/сайт", "pensioner": "Скидка пенсионеру",
-                      "disabled": "Скидка (инвалидность)"}.get(order.get("client_discount_kind"), "Скидка")
-        pct = float(order.get("client_discount_pct") or 0)
-        y += _right_text(draw, y, f"{kind_label} -{pct:g}%: -{fmt_n(client_disc)} сум", f["item_sub"]) + 8
-        all_disc = (client_disc + float(order.get("discount_sum") or 0)
-                    + float(order.get("delivery_discount") or 0) + float(order.get("manual_discount") or 0))
+    client_label = {"online": "Заявка через бот/сайт", "pensioner": "Скидка пенсионеру",
+                    "disabled": "Скидка (инвалидность)"}.get(order.get("client_discount_kind"), "Скидка клиента")
+    client_pct = float(order.get("client_discount_pct") or 0)
+    disc_lines = [
+        (f"{client_label} -{client_pct:g}%" if client_pct else client_label, client_disc),
+        ("Скидка за самовывоз", float(order.get("discount_sum") or 0)),
+        ("Скидка за доставку", float(order.get("delivery_discount") or 0)),
+        ("Скидка", float(order.get("manual_discount") or 0)),
+    ]
+    all_disc = sum(v for _, v in disc_lines if v > 0)
+    if all_disc > 0:
+        for label, val in disc_lines:
+            if val > 0:
+                y += _right_text(draw, y, f"{label}: -{fmt_n(val)} сум", f["item_sub"]) + 8
         net = max(0.0, grand - all_disc)
-        net -= net % 1000  # та же формула «к оплате», что в карточке заказа
+        net -= net % 1000
         y += _right_text(draw, y, f"К ОПЛАТЕ: {fmt_n(net)} сум", f["total"]) + 16
     _dashed_line(draw, y); y += 20
 

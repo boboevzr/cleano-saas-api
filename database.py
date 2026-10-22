@@ -112,6 +112,11 @@ async def init_db():
         await recalc_route_statuses()
     except Exception as e:
         logging.warning(f"recalc_route_statuses at startup: {e}")
+    # Разово при старте: скидка «бот/сайт» заказам из лидов, оформленным через «Стал заказом» (перенос из ARTEZ 2026-10-22)
+    try:
+        await backfill_online_discount_from_leads()
+    except Exception as e:
+        logging.warning(f"backfill_online_discount_from_leads at startup: {e}")
     logging.info("✅ API: Database connected")
 
 
@@ -926,6 +931,16 @@ async def create_tables():
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS postponed_until DATE DEFAULT NULL",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS postpone_reason TEXT DEFAULT NULL",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS postponed_by INTEGER REFERENCES staff(id) ON DELETE SET NULL DEFAULT NULL",
+        # Согласованная с клиентом доставка (перенос из ARTEZ 2026-10-22): день + окно + примечание.
+        # База общая с прод ARTEZ — те же колонки, IF NOT EXISTS.
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_date DATE DEFAULT NULL",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_from TIME DEFAULT NULL",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_to TIME DEFAULT NULL",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_note TEXT DEFAULT NULL",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_set_by INTEGER REFERENCES staff(id) ON DELETE SET NULL DEFAULT NULL",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_set_at TIMESTAMPTZ DEFAULT NULL",
+        # Получать ли TG-сводку доставок; NULL = по роли (admin/manager/logistics/callcenter)
+        "ALTER TABLE staff ADD COLUMN IF NOT EXISTS notify_delivery_digest BOOLEAN DEFAULT NULL",
         # Видео-инструкция бота — отправляется один раз каждому новому клиенту
         # после выбора языка, флаг переживает рестарт бота (не in-memory)
         "ALTER TABLE clients ADD COLUMN IF NOT EXISTS welcome_video_sent BOOLEAN DEFAULT FALSE",
@@ -6996,6 +7011,70 @@ async def set_order_postpone(order_id: int, until_date, reason: str, staff_id: i
         """, order_id, until_date, reason, staff_id, cid)
         return dict(row) if row else {}
 
+_DELIVERY_SLOT_STATUSES = ("packing", "ready", "delivery")
+
+async def set_order_delivery_slot(order_id: int, day, t_from, t_to, note: str, staff_id: int) -> dict:
+    """Согласованная доставка: день + окно. Снимает отсрочку — клиент назвал дату.
+    Только заказ своей компании (_cid)."""
+    if not pool: return {}
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE orders SET delivery_date=$2, delivery_from=$3, delivery_to=$4,
+                   delivery_note=$5, delivery_set_by=$6, delivery_set_at=NOW(),
+                   postponed_until=NULL, postpone_reason=NULL, postponed_by=NULL
+            WHERE id=$1 AND company_id=$8 AND status = ANY($7::text[]) RETURNING *
+        """, order_id, day, t_from, t_to, note or None, staff_id, list(_DELIVERY_SLOT_STATUSES), _cid())
+        return dict(row) if row else {}
+
+async def clear_order_delivery_slot(order_id: int) -> dict:
+    if not pool: return {}
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            UPDATE orders SET delivery_date=NULL, delivery_from=NULL, delivery_to=NULL,
+                   delivery_note=NULL, delivery_set_by=NULL, delivery_set_at=NULL
+            WHERE id=$1 AND company_id=$2 RETURNING *
+        """, order_id, _cid())
+        return dict(row) if row else {}
+
+async def get_delivery_digest_orders() -> list:
+    """Заказы «Готов»/«Доставка» всех компаний, КРОМЕ 1 (ARTEZ — сводку шлёт прод artez_api,
+    база общая): с согласованной датой ≤ завтра (просроченные тоже) и «Готов» без даты/
+    отсрочки (не согласовано). in_route — в активном маршруте. Даты — по Ташкенту."""
+    if not pool: return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT o.id, o.company_id, o.order_num, o.branch, o.status, o.client_first_name, o.client_last_name,
+                   o.short_address, o.address, o.delivery_short_address,
+                   o.delivery_date, o.delivery_from, o.delivery_to, o.delivery_note,
+                   o.postponed_until,
+                   (SELECT EXTRACT(EPOCH FROM NOW() - MAX(h.created_at)) / 86400
+                      FROM order_status_history h
+                     WHERE h.order_num = o.order_num AND h.new_status = 'ready') AS ready_days,
+                   EXISTS (SELECT 1 FROM route_orders ro JOIN routes r ON r.id = ro.route_id
+                            WHERE ro.order_id = o.id AND r.status NOT IN ('done','cancelled')) AS in_route
+            FROM orders o
+            WHERE o.status IN ('ready','delivery')
+              AND COALESCE(o.company_id, 1) <> 1
+              AND (o.delivery_date <= (NOW() AT TIME ZONE 'Asia/Tashkent')::date + 1
+                   OR (o.status = 'ready' AND o.delivery_date IS NULL AND o.postponed_until IS NULL))
+            ORDER BY o.delivery_date NULLS LAST, o.delivery_from NULLS LAST, o.id
+        """)
+        return [dict(r) for r in rows]
+
+async def get_delivery_digest_recipients() -> list:
+    """Кому слать сводку доставок (компании кроме 1): активные с TG; флаг
+    notify_delivery_digest, а если не задан — по роли (admin/manager/logistics/callcenter)."""
+    if not pool: return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, company_id, role, branch, tg_id FROM staff
+            WHERE active = TRUE AND tg_id IS NOT NULL
+              AND COALESCE(company_id, 1) <> 1
+              AND COALESCE(notify_delivery_digest,
+                           role IN ('admin','manager','logistics','callcenter'))
+        """)
+        return [dict(r) for r in rows]
+
 async def get_orders_for_postpone_reminder() -> list:
     """Заказы всех компаний, у которых отсрочка доставки истекает завтра — для
     ежедневного напоминания администраторам/менеджерам созвониться с клиентом."""
@@ -7006,6 +7085,7 @@ async def get_orders_for_postpone_reminder() -> list:
             FROM orders o
             LEFT JOIN staff s ON s.id = o.postponed_by
             WHERE o.status='ready' AND o.postponed_until = (CURRENT_DATE + INTERVAL '1 day')::date
+              AND COALESCE(o.company_id, 1) <> 1   -- компанию 1 (ARTEZ) напоминает прод artez_api, база общая
         """)
         return [dict(r) for r in rows]
 
@@ -7285,6 +7365,43 @@ async def recalc_client_discount(order_id: int) -> dict | None:
             order_id, amount, pct, kind)
         await _recalc_payment_status(conn, order_id)
     return {"kind": kind, "pct": pct, "amount": amount}
+
+
+async def mark_order_online_from_lead(lead_source: str | None, order_num: str | None) -> None:
+    """Заказ из лида с бота/сайта — скидка «заявка через бот/сайт» (если включена в компании,
+    см. recalc_client_discount). Заказ создаёт оператор (source='staff'), канал — из лида.
+    Вызывается при ЛЮБОМ оформлении лида в заказ: /convert и «Стал заказом» с номером
+    (перенос из ARTEZ 2026-10-22). Только заказ СВОЕЙ компании (_cid)."""
+    if not pool or not order_num or lead_source not in ("site", "bot"):
+        return
+    async with pool.acquire() as conn:
+        oid = await conn.fetchval(
+            "UPDATE orders SET client_discount_online=TRUE WHERE order_num=$1 AND company_id=$2 RETURNING id",
+            order_num, _cid())
+    if oid:
+        await recalc_client_discount(oid)
+
+
+async def backfill_online_discount_from_leads() -> int:
+    """Разово при старте: заказы из лидов бота/сайта, оформленные «Стал заказом» до
+    исправления (флаг не ставился). Лид и заказ — одной компании; только новые заказы
+    (client_discount_enabled), не доставленные/не отменённые; повторный запуск ничего не меняет."""
+    if not pool:
+        return 0
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            UPDATE orders o SET client_discount_online=TRUE
+              FROM leads l
+             WHERE l.converted_order = o.order_num AND l.company_id = o.company_id
+               AND l.source IN ('site','bot')
+               AND o.client_discount_enabled AND NOT COALESCE(o.client_discount_online, FALSE)
+               AND o.status NOT IN ('delivered','cancelled')
+            RETURNING o.id, o.order_num""")
+    for r in rows:
+        await recalc_client_discount(r["id"])
+    if rows:
+        logging.info(f"online discount backfill: {[r['order_num'] for r in rows]}")
+    return len(rows)
 
 async def confirm_item_measure(item_id: int) -> dict:
     if not pool: return {}
@@ -8318,6 +8435,7 @@ async def get_route(route_id: int) -> dict | None:
                    ro.driver_confirmed,
                    o.service, o.branch,
                    o.pickup_date, o.deadline,
+                   o.delivery_date, o.delivery_from, o.delivery_to, o.delivery_note,
                    o.total_price, o.prepaid_amount, o.payment_status,
                    o.discount_sum, o.delivery_discount, o.manual_discount, o.client_discount,
                    COALESCE((SELECT SUM(COALESCE(price_per_sqm,0)*COALESCE(sqm,0))
@@ -9965,6 +10083,7 @@ async def get_routes_today(company_id: int, branch: str | None = None) -> list:
                    o.address, o.short_address, o.location, o.location_address,
                    o.delivery_address, o.delivery_short_address,
                    o.delivery_location, o.delivery_location_address,
+                   o.delivery_date, o.delivery_from, o.delivery_to, o.delivery_note,
                    COALESCE(o.total_price,0) AS total_price,
                    COALESCE(o.discount_sum,0)+COALESCE(o.delivery_discount,0)+COALESCE(o.manual_discount,0)+COALESCE(o.client_discount,0) AS total_discount,
                    COALESCE((SELECT SUM(amount) FROM order_payments WHERE order_id=o.id
@@ -10007,6 +10126,11 @@ async def get_routes_today(company_id: int, branch: str | None = None) -> list:
                 "delivery_short_address": row.get("delivery_short_address"),
                 "delivery_location":         row.get("delivery_location"),
                 "delivery_location_address": row.get("delivery_location_address"),
+                # согласованное с клиентом окно доставки (перенос из ARTEZ 2026-10-22)
+                "delivery_date":  row.get("delivery_date"),
+                "delivery_from":  row.get("delivery_from"),
+                "delivery_to":    row.get("delivery_to"),
+                "delivery_note":  row.get("delivery_note"),
                 "total_price":    float(row["total_price"]),
                 "total_discount": float(row["total_discount"]),
                 "paid_amount":    float(row["paid_amount"]),
