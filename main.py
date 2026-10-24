@@ -482,7 +482,7 @@ async def _postpone_reminder_worker():
 # не в маршруте / завтра / не согласовано); 11:00 и 16:00 — контроль: окно сегодня
 # уже прошло или закончится в ближайшие 2 часа, а заказ ещё не доставлен.
 # Получатели — get_delivery_digest_recipients (тумблер в карточке сотрудника). Перенос из ARTEZ 2026-10-22,
-# по компаниям; компания 1 (ARTEZ) — у прод artez_api (база общая).
+# по компаниям (у прод ARTEZ своя отдельная база).
 _DELIVERY_DIGEST_TIMES = ((8, 30, "digest"), (11, 0, "control"), (16, 0, "control"))
 _DIGEST_LIST_MAX = 15
 _NOT_AGREED_DAYS = 2
@@ -563,7 +563,7 @@ def _build_delivery_digest(orders: list, now, kind: str) -> str:
 
 async def _send_delivery_digest(kind: str):
     """По компаниям: каждому получателю — заказы его компании (админ/без филиала — все
-    филиалы, остальные — свой). Компанию 1 (ARTEZ) обслуживает прод artez_api — общая база."""
+    филиалы, остальные — свой)."""
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
     now = _dt.now(_tz(_td(hours=5)))
     orders = await db.get_delivery_digest_orders()

@@ -7037,8 +7037,8 @@ async def clear_order_delivery_slot(order_id: int) -> dict:
         return dict(row) if row else {}
 
 async def get_delivery_digest_orders() -> list:
-    """Заказы «Готов»/«Доставка» всех компаний, КРОМЕ 1 (ARTEZ — сводку шлёт прод artez_api,
-    база общая): с согласованной датой ≤ завтра (просроченные тоже) и «Готов» без даты/
+    """Заказы «Готов»/«Доставка» всех компаний (company_id — для раскладки по получателям):
+    с согласованной датой ≤ завтра (просроченные тоже) и «Готов» без даты/
     отсрочки (не согласовано). in_route — в активном маршруте. Даты — по Ташкенту."""
     if not pool: return []
     async with pool.acquire() as conn:
@@ -7054,7 +7054,6 @@ async def get_delivery_digest_orders() -> list:
                             WHERE ro.order_id = o.id AND r.status NOT IN ('done','cancelled')) AS in_route
             FROM orders o
             WHERE o.status IN ('ready','delivery')
-              AND COALESCE(o.company_id, 1) <> 1
               AND (o.delivery_date <= (NOW() AT TIME ZONE 'Asia/Tashkent')::date + 1
                    OR (o.status = 'ready' AND o.delivery_date IS NULL AND o.postponed_until IS NULL))
             ORDER BY o.delivery_date NULLS LAST, o.delivery_from NULLS LAST, o.id
@@ -7062,14 +7061,13 @@ async def get_delivery_digest_orders() -> list:
         return [dict(r) for r in rows]
 
 async def get_delivery_digest_recipients() -> list:
-    """Кому слать сводку доставок (компании кроме 1): активные с TG; флаг
+    """Кому слать сводку доставок (по компаниям): активные с TG; флаг
     notify_delivery_digest, а если не задан — по роли (admin/manager/logistics/callcenter)."""
     if not pool: return []
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, company_id, role, branch, tg_id FROM staff
             WHERE active = TRUE AND tg_id IS NOT NULL
-              AND COALESCE(company_id, 1) <> 1
               AND COALESCE(notify_delivery_digest,
                            role IN ('admin','manager','logistics','callcenter'))
         """)
@@ -7085,7 +7083,6 @@ async def get_orders_for_postpone_reminder() -> list:
             FROM orders o
             LEFT JOIN staff s ON s.id = o.postponed_by
             WHERE o.status='ready' AND o.postponed_until = (CURRENT_DATE + INTERVAL '1 day')::date
-              AND COALESCE(o.company_id, 1) <> 1   -- компанию 1 (ARTEZ) напоминает прод artez_api, база общая
         """)
         return [dict(r) for r in rows]
 
