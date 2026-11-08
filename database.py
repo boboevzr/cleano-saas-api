@@ -3393,7 +3393,7 @@ async def cancel_order_by_phone(order_num: str, phone: str, company_id: int):
         row = await conn.fetchrow("""
             UPDATE orders SET status='cancelled'
             WHERE order_num=$1 AND client_phone=$2 AND company_id=$3 AND status='new'
-            RETURNING order_num, client_first_name, client_last_name, client_phone, service, branch
+            RETURNING order_num, client_first_name, client_last_name, client_phone, service, branch, company_id
         """, order_num, phone, company_id)
         if not row:
             return None
@@ -6134,6 +6134,9 @@ async def get_pending_tg_reminders():
     async with pool.acquire() as conn:
         return await conn.fetch("""
             SELECT r.*, l.client_name, l.client_phone, l.lead_code,
+                   -- компания и филиал лида — воркер работает вне запроса (_cid()=1),
+                   -- без них fallback-сообщение некуда маршрутизировать внутри компании
+                   l.company_id AS lead_company_id, l.branch AS lead_branch,
                    -- целевой получатель: assigned_to имеет приоритет
                    COALESCE(l.assigned_to, r.staff_id) AS target_staff_id,
                    tgt.tg_id AS staff_tg_id,

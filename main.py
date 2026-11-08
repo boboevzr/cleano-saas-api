@@ -41,11 +41,10 @@ VAPID_PRIVATE  = os.getenv("VAPID_PRIVATE", "")
 VAPID_PUBLIC   = os.getenv("VAPID_PUBLIC", "")
 
 BOT_TOKEN          = os.getenv("BOT_TOKEN", "")
-GROUP_ID              = os.getenv("GROUP_ID", "")
-GROUP_ID_ZARAFSHAN    = os.getenv("GROUP_ID_ZARAFSHAN", "")
-LEADS_GROUP_ID        = os.getenv("LEADS_GROUP_ID", "-1004486597965")
-GROUP_NEW_CLIENTS_ID  = os.getenv("GROUP_NEW_CLIENTS_ID", "-1003768571929")
-GROUP_ID_NAVOI     = os.getenv("GROUP_ID_NAVOI", "")
+# Глобальные группы (GROUP_ID, LEADS_GROUP_ID, GROUP_ID_ZARAFSHAN/NAVOI,
+# GROUP_NEW_CLIENTS_ID) удалены 08.11.2026: в SaaS одна общая группа = утечка
+# данных клиентов между компаниями. Группы берутся из карточки филиала /
+# config компании — см. _company_leads_group_id.
 MEDIA_CHANNEL_ID   = os.getenv("MEDIA_CHANNEL_ID", "-1004453880659")
 APP_URL            = os.getenv("APP_URL", "https://web-production-eef2a.up.railway.app")
 
@@ -215,11 +214,16 @@ async def _tg_reminder_worker():
                                 f"💬 {msg}")
                         await send_tg(tg_id, text)
                     else:
-                        text = (f"⏰ Напоминание ({staff_name})\n\n"
-                                f"Лид {lead_code} — {client}\n"
-                                f"📞 {r['client_phone']}\n"
-                                f"💬 {msg}")
-                        await send_tg(LEADS_GROUP_ID, text)
+                        # У получателя нет tg_id → в группу лидов ЕГО компании (через её бот).
+                        # Раньше — глобальный LEADS_GROUP_ID: напоминания всех компаний SaaS
+                        # (имя/телефон клиента) падали в одну чужую группу.
+                        import html as _html
+                        h = lambda v: _html.escape(str(v)) if v else "—"
+                        text = (f"⏰ Напоминание ({h(staff_name)})\n\n"
+                                f"Лид {h(lead_code)} — {h(client)}\n"
+                                f"📞 {h(r['client_phone'])}\n"
+                                f"💬 {h(msg)}")
+                        await _send_company_leads_group(r.get("lead_company_id"), r.get("lead_branch"), text)
                     # Web Push + уведомление — только тому, кто взял лид (target_staff_id)
                     target_id = r.get("target_staff_id") or r.get("staff_id")
                     if target_id:
@@ -370,6 +374,45 @@ async def _send_company_tg(company_id: int, tg_id: int, text: str) -> bool:
     except Exception as e:
         logging.warning(f"_send_company_tg error: {e}")
         return False
+
+
+async def _company_leads_group_id(company_id: int, branch_slug: str | None) -> str | None:
+    """Группа лидов КОНКРЕТНОЙ компании — тот же порядок, что в _notify_new_lead:
+    карточка филиала (tg_leads_group_id) → legacy-ключи филиала → leads_group_id.
+    company_id передаётся явно (не через _cid()), чтобы работало и из фоновых
+    воркеров. Никакого глобального fallback (env GROUP_ID/LEADS_GROUP_ID) —
+    иначе данные клиентов одной компании уходят в группу другой."""
+    if not company_id:
+        return None
+    slug = (branch_slug or "").strip()
+    if slug:
+        row = await db.get_branch_by_slug(company_id, slug)
+        if row and row.get("tg_leads_group_id"):
+            return str(row["tg_leads_group_id"])
+        b = slug.lower().replace("📍", "").strip()
+        legacy_key = ("leads_group_zarafshan" if b in ("zarafshan", "зарафшан", "zarafshon")
+                      else "leads_group_navoi" if b in ("navoi", "навои", "navoiy") else None)
+        if legacy_key:
+            val = await db.get_config_for_company(legacy_key, company_id)
+            if val:
+                return str(val)
+    val = await db.get_config_for_company("leads_group_id", company_id)
+    return str(val) if val else None
+
+
+async def _send_company_leads_group(company_id: int, branch_slug: str | None, text: str) -> bool:
+    """Шлёт HTML-текст в группу лидов компании через её собственный бот.
+    Уважает флаг leads_group_enabled, как _notify_new_lead. Нет группы/бота — молча False."""
+    enabled = await db.get_config_for_company("leads_group_enabled", company_id) if company_id else None
+    if enabled not in ("1", "true"):
+        return False
+    group_id = await _company_leads_group_id(company_id, branch_slug)
+    if not group_id:
+        return False
+    ok = await _send_company_tg(company_id, group_id, text)
+    if not ok:
+        logging.warning(f"_send_company_leads_group: не доставлено company_id={company_id} chat_id={group_id}")
+    return ok
 
 
 async def _send_debt_reminders():
@@ -4702,21 +4745,26 @@ async def my_order_item_media(order_num: str, item_id: int, user = Depends(get_c
 
 
 async def notify_group_client_cancel(order: dict):
-    if not BOT_TOKEN or not GROUP_ID:
+    """Отмена заказа клиентом → группа лидов СВОЕЙ компании через её бот.
+    Раньше слалось глобальным BOT_TOKEN в env GROUP_ID — одна группа на все
+    компании SaaS, т.е. имя/телефон клиента утекали чужому бизнесу."""
+    import html as _html
+    h = lambda v: _html.escape(str(v)) if v else "—"
+    company_id = order.get("company_id")
+    if not company_id:
+        logging.warning(f"Cancel notify: нет company_id у заказа {order.get('order_num')} — пропуск")
         return
     text = (
-        f"🚫 Заявка {order['order_num']} отменена клиентом\n"
+        f"🚫 Заявка {h(order.get('order_num'))} отменена клиентом\n"
         f"━━━━━━━━━━\n"
-        f"👤 {order.get('client_name') or '—'}\n"
-        f"📞 {order.get('client_phone') or '—'}\n"
-        f"🧺 {order.get('service') or '—'}\n"
-        f"🏢 {branch_ru(order.get('branch') or '')}\n"
+        f"👤 {h(order.get('client_name'))}\n"
+        f"📞 {h(order.get('client_phone'))}\n"
+        f"🧺 {h(order.get('service'))}\n"
+        f"🏢 {h(branch_ru(order.get('branch') or ''))}\n"
         f"━━━━━━━━━━"
     )
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        async with aiohttp.ClientSession() as session:
-            await session.post(url, json={"chat_id": GROUP_ID, "text": text})
+        await _send_company_leads_group(company_id, order.get("branch"), text)
     except Exception as e:
         logging.warning(f"Cancel notify error: {e}")
 
