@@ -8,6 +8,7 @@ import asyncio
 import time
 import random
 import string
+import html
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -413,6 +414,88 @@ async def _send_company_leads_group(company_id: int, branch_slug: str | None, te
     if not ok:
         logging.warning(f"_send_company_leads_group: не доставлено company_id={company_id} chat_id={group_id}")
     return ok
+
+
+async def _tg_post(token: str, method: str, *, json_: dict | None = None,
+                   data=None, timeout: int = 8) -> dict:
+    """Один вызов Bot API. Никогда не бросает — ошибка возвращается как {"ok": False, ...}."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"https://api.telegram.org/bot{token}/{method}", json=json_, data=data,
+                              timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                return await r.json(content_type=None)
+    except Exception as e:
+        return {"ok": False, "description": f"{type(e).__name__}: {e}"}
+
+
+async def _client_bot_tokens(company_id: int | None) -> list[tuple[str, str]]:
+    """Боты, которыми можно писать КЛИЕНТУ компании, в порядке приоритета:
+    1) собственный бот компании (order_bot_token из админки) — клиент видит бренд компании;
+    2) @cleanouz_bot (env BOT_TOKEN) — запасной: клиенты, которые раньше общались
+       только с ботом платформы и ни разу не нажимали /start у бота компании
+       (tg_id в Telegram общий, но бот может писать только тем, кто его запускал)."""
+    out: list[tuple[str, str]] = []
+    ctoken = (await db.get_config_for_company("order_bot_token", company_id) or "").strip() if company_id else ""
+    if ctoken:
+        out.append(("company", ctoken))
+    if BOT_TOKEN and BOT_TOKEN != ctoken:
+        out.append(("platform", BOT_TOKEN))
+    return out
+
+
+async def _send_client_tg(company_id: int | None, chat_id, text: str | None = None, *,
+                          photo: bytes | None = None, photo_name: str = "photo.jpg",
+                          silent: bool = False) -> dict:
+    """Сообщение/фото клиенту: сначала ботом компании, при ошибке — ботом платформы.
+    Текст всегда HTML (экранируйте пользовательские данные!).
+    Возвращает {"ok", "via": "company"|"platform"|None, "message_id", "error"}."""
+    last_err = "не настроен ни один бот"
+    if not chat_id:
+        return {"ok": False, "via": None, "message_id": None, "error": "нет tg_id"}
+    for via, token in await _client_bot_tokens(company_id):
+        if photo is not None:
+            form = aiohttp.FormData()   # FormData одноразовая — собираем заново на каждую попытку
+            form.add_field("chat_id", str(chat_id))
+            form.add_field("photo", photo, filename=photo_name, content_type="image/jpeg")
+            if text:
+                form.add_field("caption", text)
+                form.add_field("parse_mode", "HTML")
+            form.add_field("disable_notification", "true" if silent else "false")
+            res = await _tg_post(token, "sendPhoto", data=form, timeout=15)
+        else:
+            res = await _tg_post(token, "sendMessage", json_={
+                "chat_id": str(chat_id), "text": text or "", "parse_mode": "HTML",
+                "disable_web_page_preview": True, "disable_notification": silent})
+        if res.get("ok"):
+            return {"ok": True, "via": via,
+                    "message_id": (res.get("result") or {}).get("message_id"), "error": None}
+        last_err = res.get("description") or "unknown"
+        logging.info(f"_send_client_tg: {via}-бот не доставил company={company_id} chat={chat_id}: {last_err}")
+    logging.warning(f"_send_client_tg: не доставлено company={company_id} chat={chat_id}: {last_err}")
+    return {"ok": False, "via": None, "message_id": None, "error": last_err}
+
+
+async def _delete_client_tg(company_id: int | None, chat_id, message_id) -> bool:
+    """Удаляет сообщение клиенту — не знаем, каким ботом оно было отправлено
+    (до 08.11.2026 всё слал @cleanouz_bot), поэтому пробуем все по очереди."""
+    for _via, token in await _client_bot_tokens(company_id):
+        res = await _tg_post(token, "deleteMessage",
+                             json_={"chat_id": chat_id, "message_id": message_id})
+        if res.get("ok"):
+            return True
+    return False
+
+
+async def _company_brand(company_id: int | None) -> tuple[str, str]:
+    """(название компании, домен сайта) для текстов клиентам — вместо зашитых «ARTEZ»/artez.uz."""
+    name = ""
+    try:
+        comp = await db.get_company(company_id) if company_id else None
+        name = (comp["name"] if comp else "") or ""
+    except Exception as e:
+        logging.warning(f"_company_brand({company_id}): {e}")
+    domain = await _company_site_domain(company_id)
+    return (name or "Cleano"), domain
 
 
 async def _send_debt_reminders():
@@ -4285,12 +4368,20 @@ async def register(req: RegisterRequest):
                 "Telegram не привязан. Сначала напишите боту /start и поделитесь номером."
                 if not uz else
                 "Telegram bog'lanmagan. Botga /start yozing va raqamingizni ulashing."))
+        brand, _site = await _company_brand(cid)
+        b = html.escape(brand)
         code_text = (
-            f"🔐 <b>ARTEZ</b> — код подтверждения регистрации:\n\n<code>{code}</code>\n\n⏱ Действителен 5 минут."
+            f"🔐 <b>{b}</b> — код подтверждения регистрации:\n\n<code>{code}</code>\n\n⏱ Действителен 5 минут."
             if not uz else
-            f"🔐 <b>ARTEZ</b> — ro'yxatdan o'tish tasdiqlash kodi:\n\n<code>{code}</code>\n\n⏱ 5 daqiqa davomida amal qiladi."
+            f"🔐 <b>{b}</b> — ro'yxatdan o'tish tasdiqlash kodi:\n\n<code>{code}</code>\n\n⏱ 5 daqiqa davomida amal qiladi."
         )
-        await send_tg(tg_id, code_text)
+        res = await _send_client_tg(cid, tg_id, code_text)
+        if not res["ok"]:
+            # Раньше ошибка глоталась и клиент ждал код, который не придёт
+            raise HTTPException(status_code=502, detail=(
+                "Не удалось отправить код в Telegram. Нажмите /start в боте и попробуйте снова."
+                if not uz else
+                "Kodni Telegramga yuborib bo'lmadi. Botda /start bosing va qayta urinib ko'ring."))
         return {"ok": True, "via_tg": True, "message": "Код отправлен в Telegram", "phone": req.phone}
 
     await send_sms(req.phone, await sms_text(code, "register"))
@@ -4345,9 +4436,12 @@ async def resend_code(req: ResendCodeRequest):
     if req.via_tg:
         tg_id = await db.get_tg_id_by_phone(req.phone)
         if tg_id:
-            await send_tg(tg_id,
-                f"🔐 <b>ARTEZ</b> — код подтверждения:\n\n<code>{code}</code>\n\n⏱ Действителен 5 минут.")
-            return {"ok": True, "message": "Код отправлен в Telegram"}
+            brand, _site = await _company_brand(cid)
+            res = await _send_client_tg(cid, tg_id,
+                f"🔐 <b>{html.escape(brand)}</b> — код подтверждения:\n\n<code>{code}</code>\n\n⏱ Действителен 5 минут.")
+            if res["ok"]:
+                return {"ok": True, "message": "Код отправлен в Telegram"}
+            # не доставили в Telegram — ниже уходит SMS, как и при отсутствии tg_id
     await send_sms(req.phone, await sms_text(code, req.purpose))
     return {"ok": True, "message": "Код отправлен повторно"}
 
@@ -5059,7 +5153,8 @@ async def agent_apply(req: AgentApplyRequest, user=Depends(get_current_user)):
     if not staff_id:
         return {"ok": True, "already": True, "message": "Аккаунт агента уже существует"}
 
-    return {"ok": True, "already": False, "message": "Вы зарегистрированы как агент! Войдите через artez.uz/staff.html"}
+    _brand, _site = await _company_brand(user.get("company_id") or 1)
+    return {"ok": True, "already": False, "message": f"Вы зарегистрированы как агент! Войдите через {_site}/staff.html"}
 
 class ApplyByTgRequest(BaseModel):
     tg_id: int
@@ -5147,7 +5242,9 @@ async def agent_apply_by_tg(req: ApplyByTgRequest):
 async def agent_reset_password(body: dict):
     """Сброс пароля агента — отправляет временный пароль через Telegram."""
     phone = normalize_phone(body.get("phone", ""))
-    staff = await db.get_staff_by_login(phone)
+    # Раньше без company_id → искали только в компании 1, агенты других компаний не могли сбросить пароль
+    cid = await _resolve_client_company_id(body.get("company_slug"))
+    staff = await db.get_staff_by_login(phone, cid)
     if not staff or staff["role"] != "agent":
         # Не раскрываем что аккаунта нет
         return {"ok": True, "message": "Если аккаунт агента найден — пароль отправлен в Telegram"}
@@ -5162,14 +5259,14 @@ async def agent_reset_password(body: dict):
     hashed  = pwd_context.hash(temp_pw)
     await db.set_staff_temp_password(staff["id"], hashed, expires)
 
-    text = (f"🔑 Временный пароль для входа в систему ARTEZ:\n\n"
+    brand, site = await _company_brand(staff["company_id"])
+    text = (f"🔑 Временный пароль для входа в кабинет агента {html.escape(brand)}:\n\n"
             f"<b>{temp_pw}</b>\n\n"
             f"⏰ Действует 10 минут.\n"
-            f"После входа сразу смените пароль.")
-    tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    async with aiohttp.ClientSession() as s:
-        await s.post(tg_url, json={"chat_id": staff["tg_id"], "text": text, "parse_mode": "HTML"},
-                     timeout=aiohttp.ClientTimeout(total=8))
+            f"Войдите на {site} и сразу смените пароль.")
+    res = await _send_client_tg(staff["company_id"], staff["tg_id"], text)
+    if not res["ok"]:
+        raise HTTPException(502, "Не удалось отправить пароль в Telegram. Нажмите /start в боте компании и повторите.")
 
     return {"ok": True, "message": "Временный пароль отправлен в Telegram"}
 
@@ -5203,14 +5300,12 @@ async def agent_reset_password_by_tg(req: ResetByTgRequest):
     expires = datetime.now(timezone.utc) + timedelta(minutes=10)
     hashed  = pwd_context.hash(temp_pw)
     await db.set_staff_temp_password(staff["id"], hashed, expires)
-    text = (f"🔑 Временный пароль для входа в систему ARTEZ:\n\n"
+    brand, site = await _company_brand(staff["company_id"])
+    text = (f"🔑 Временный пароль для входа в кабинет агента {html.escape(brand)}:\n\n"
             f"<b>{temp_pw}</b>\n\n"
             f"⏰ Действует 10 минут.\n"
-            f"Войдите на artez.uz/staff.html и сразу смените пароль.")
-    tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    async with aiohttp.ClientSession() as s:
-        await s.post(tg_url, json={"chat_id": req.tg_id, "text": text, "parse_mode": "HTML"},
-                     timeout=aiohttp.ClientTimeout(total=8))
+            f"Войдите на {site} и сразу смените пароль.")
+    await _send_client_tg(staff["company_id"], req.tg_id, text)
     return {"ok": True}
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5247,26 +5342,22 @@ async def admin_reset_site_user_password(user_id: int, body: dict, cid: int = De
     send_tg = bool(body.get("send_tg", False))
     hashed = pwd_context.hash(new_password[:72])
     await db.update_user_password(user_id, hashed)
-    if send_tg and BOT_TOKEN:
+    tg_sent = False
+    if send_tg:
         user = await db.get_user_by_id(user_id)
         tg_id = user.get("tg_id") if user else None
         if tg_id:
+            brand, site = await _company_brand(cid)
             text = (
-                f"🔑 <b>ARTEZ</b> — ваш пароль изменён администратором.\n\n"
-                f"📱 Логин: <code>{user['phone']}</code>\n"
-                f"🔑 Новый пароль: <code>{new_password}</code>\n\n"
+                f"🔑 <b>{html.escape(brand)}</b> — ваш пароль изменён администратором.\n\n"
+                f"📱 Логин: <code>{html.escape(str(user['phone']))}</code>\n"
+                f"🔑 Новый пароль: <code>{html.escape(new_password)}</code>\n"
+                f"🌐 {site}\n\n"
                 f"Не передавайте пароль третьим лицам."
             )
-            try:
-                async with aiohttp.ClientSession() as _s:
-                    await _s.post(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                        json={"chat_id": str(tg_id), "text": text, "parse_mode": "HTML"},
-                        timeout=aiohttp.ClientTimeout(total=5)
-                    )
-            except Exception:
-                pass
-    return {"ok": True, "tg_sent": send_tg and bool(body.get("send_tg"))}
+            tg_sent = (await _send_client_tg(cid, tg_id, text))["ok"]
+    # Раньше tg_sent=True возвращался всегда, даже если сообщение не ушло
+    return {"ok": True, "tg_sent": tg_sent}
 
 
 @app.post("/api/register-via-tg")
@@ -5304,22 +5395,23 @@ async def register_via_tg(body: dict):
     asyncio.create_task(db.update_user_last_login(user["id"]))
     token = create_token(user["id"], user["phone"], cid)
 
-    # Отправляем данные аккаунта в Telegram
-    if BOT_TOKEN:
-        text = (
-            f"🎉 <b>ARTEZ</b> — регистрация завершена!\n\n"
-            f"👤 Имя: <b>{first_name}</b>\n"
-            f"📱 Номер / Логин: <code>{phone}</code>\n"
-            f"🔑 Пароль: <code>{password}</code>\n\n"
-            f"Используйте эти данные для входа на сайте artez.uz"
-        ) if not uz else (
-            f"🎉 <b>ARTEZ</b> — ro'yxatdan o'tdingiz!\n\n"
-            f"👤 Ism: <b>{first_name}</b>\n"
-            f"📱 Raqam / Login: <code>{phone}</code>\n"
-            f"🔑 Parol: <code>{password}</code>\n\n"
-            f"artez.uz saytiga kirish uchun ushbu ma'lumotlardan foydalaning."
-        )
-        asyncio.create_task(_send_tg_safe(tg_id, text))
+    # Отправляем данные аккаунта в Telegram — ботом компании, бренд и сайт компании
+    brand, site = await _company_brand(cid)
+    e = html.escape
+    text = (
+        f"🎉 <b>{e(brand)}</b> — регистрация завершена!\n\n"
+        f"👤 Имя: <b>{e(first_name)}</b>\n"
+        f"📱 Номер / Логин: <code>{e(phone)}</code>\n"
+        f"🔑 Пароль: <code>{e(password)}</code>\n\n"
+        f"Используйте эти данные для входа на сайте {site}"
+    ) if not uz else (
+        f"🎉 <b>{e(brand)}</b> — ro'yxatdan o'tdingiz!\n\n"
+        f"👤 Ism: <b>{e(first_name)}</b>\n"
+        f"📱 Raqam / Login: <code>{e(phone)}</code>\n"
+        f"🔑 Parol: <code>{e(password)}</code>\n\n"
+        f"{site} saytiga kirish uchun ushbu ma'lumotlardan foydalaning."
+    )
+    asyncio.create_task(_send_client_tg(cid, tg_id, text))
 
     asyncio.create_task(_notify_new_site_user(first_name, phone, "tg", cid))
 
@@ -5336,15 +5428,6 @@ async def register_via_tg(body: dict):
     }
 
 
-async def _send_tg_safe(tg_id: int, text: str):
-    try:
-        async with aiohttp.ClientSession() as s:
-            await s.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": str(tg_id), "text": text, "parse_mode": "HTML"},
-                timeout=aiohttp.ClientTimeout(total=5))
-    except Exception:
-        pass
 
 
 async def _notify_new_site_user(first_name: str, phone: str, method: str, company_id: int):
@@ -5813,16 +5896,19 @@ async def admin_change_order_status(order_id: int, staff=Depends(get_current_sta
 
     # ── Telegram уведомление клиенту ──────────────────────────────────────
     tg_id = order.get("client_tg_id")
-    if tg_id and BOT_TOKEN:
+    order_cid = order.get("company_id") or staff.get("company_id")
+    if tg_id:
         try:
             tmpl = await db.get_tg_status_message(status)
             if tmpl and tmpl.get("enabled"):
-                # Определяем язык клиента — пробуем найти в таблице clients
+                # Язык клиента — только в рамках ЕГО компании (раньше искали по tg_id
+                # во всех компаниях: один человек в двух компаниях получал чужой язык)
                 lang = "ru"
                 try:
                     async with db.pool.acquire() as _c:
                         row = await _c.fetchrow(
-                            "SELECT language FROM clients WHERE tg_id=$1", int(tg_id))
+                            "SELECT language FROM clients WHERE tg_id=$1 AND company_id=$2",
+                            int(tg_id), order_cid)
                         if row and row["language"] in ("uz", "ru"):
                             lang = row["language"]
                 except Exception:
@@ -5851,15 +5937,16 @@ async def admin_change_order_status(order_id: int, staff=Depends(get_current_sta
                         pickup_date  = str(order.get("pickup_date", "") or ""),
                         phone        = order.get("client_phone", ""),
                     )
-                    async with aiohttp.ClientSession() as session:
-                        await session.post(
-                            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                            json={"chat_id": tg_id, "text": text, "parse_mode": "HTML"},
-                            timeout=aiohttp.ClientTimeout(total=8),
-                        )
+                    res = await _send_client_tg(order_cid, tg_id, text)
                     try:
+                        # В историю — по факту доставки (раньше «отправлено» писалось всегда)
+                        if res["ok"]:
+                            via = " ботом платформы" if res["via"] == "platform" else ""
+                            act_type, act_text = "tg_sent", f"🔔 TG-уведомление ({lang.upper()}){via}: {text[:150]}"
+                        else:
+                            act_type, act_text = "tg_failed", f"TG-уведомление не доставлено: {res['error'][:120]}"
                         await db.add_order_activity(order_id, staff.get("id"), staff.get("login", ""),
-                                                      "tg_sent", f"🔔 TG-уведомление ({lang.upper()}): {text[:150]}")
+                                                      act_type, act_text)
                     except Exception as _ae:
                         logging.warning(f"add_order_activity (tg) failed: {_ae}")
         except Exception as e:
@@ -6089,28 +6176,13 @@ async def admin_send_order_receipt(order_id: int, staff=Depends(get_current_staf
         logging.error(f"send-receipt render failed order={order_id}: {e}")
         raise HTTPException(status_code=500, detail="Не удалось сформировать чек")
 
-    if not BOT_TOKEN:
-        raise HTTPException(status_code=502, detail="BOT_TOKEN не настроен")
-
-    try:
-        form = aiohttp.FormData()
-        form.add_field("chat_id", str(tg_id))
-        form.add_field("photo", jpeg_bytes, filename="receipt.jpg", content_type="image/jpeg")
-        form.add_field("disable_notification", "true" if silent else "false")
-        async with aiohttp.ClientSession() as session:
-            resp = await session.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                data=form, timeout=aiohttp.ClientTimeout(total=10))
-            resp_json = await resp.json()
-        if resp.status != 200 or not resp_json.get("ok"):
-            logging.error(f"send-receipt TG error order={order_id}: {resp_json}")
-            raise HTTPException(status_code=502, detail=resp_json.get("description") or "Ошибка отправки в Telegram")
-        new_message_id = resp_json.get("result", {}).get("message_id")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"send-receipt TG request failed order={order_id}: {e}")
-        raise HTTPException(status_code=502, detail="Ошибка отправки в Telegram")
+    order_cid = order.get("company_id") or staff.get("company_id")
+    # Ботом компании, при неудаче — ботом платформы (см. _send_client_tg)
+    res = await _send_client_tg(order_cid, tg_id, photo=jpeg_bytes, photo_name="receipt.jpg", silent=silent)
+    if not res["ok"]:
+        logging.error(f"send-receipt TG error order={order_id}: {res['error']}")
+        raise HTTPException(status_code=502, detail=res["error"] or "Ошибка отправки в Telegram")
+    new_message_id = res["message_id"]
 
     try:
         prior_msgs = await db.get_prior_receipt_messages(order_id)
@@ -6124,19 +6196,13 @@ async def admin_send_order_receipt(order_id: int, staff=Depends(get_current_staf
     except Exception as e:
         logging.warning(f"receipt send log failed order={order_id}: {e}")
 
-    if prior_msgs:
+    for m in prior_msgs or []:
         try:
-            async with aiohttp.ClientSession() as session:
-                for m in prior_msgs:
-                    try:
-                        await session.post(
-                            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage",
-                            json={"chat_id": m["tg_chat_id"], "message_id": m["tg_message_id"]},
-                            timeout=aiohttp.ClientTimeout(total=8))
-                    except Exception as e:
-                        logging.warning(f"receipt delete failed order={order_id} msg={m}: {e}")
+            # Старый чек мог отправить любой из ботов — _delete_client_tg пробует оба
+            if not await _delete_client_tg(order_cid, m["tg_chat_id"], m["tg_message_id"]):
+                logging.warning(f"receipt delete failed order={order_id} msg={m}")
         except Exception as e:
-            logging.warning(f"receipt cleanup failed order={order_id}: {e}")
+            logging.warning(f"receipt delete failed order={order_id} msg={m}: {e}")
 
     return {"ok": True}
 
