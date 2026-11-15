@@ -24,6 +24,7 @@ from jose import jwt, JWTError
 
 import database as db
 import receipt
+import pay  # онлайн-оплата PLUM + заявки на рассрочку (перенос Э3 ARTEZ, 2026-11-15)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -66,6 +67,7 @@ _eskiz_tokens: dict[int, str] = {}  # кэш токена в памяти, per-c
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 app = FastAPI(title="ARTEZ API")
+app.include_router(pay.router)
 
 def bi(ru: str, uz: str) -> str:
     """Двуязычное сообщение для ошибок, видимых пользователю."""
@@ -158,6 +160,11 @@ async def startup():
     await db.ensure_saas_schema()
     asyncio.create_task(_sms_dispatch_worker())
     asyncio.create_task(_subscription_reminder_worker())
+    try:
+        await pay.init()
+        asyncio.create_task(pay.worker())
+    except Exception as e:
+        logging.error(f"pay init: {type(e).__name__}: {e}")
     # Webhook не нужен — бот работает в режиме polling (ARTEZ-BOT сервис на Railway)
     # if BOT_TOKEN and APP_URL:
     #     asyncio.create_task(_set_tg_webhook())
@@ -6598,6 +6605,8 @@ async def edit_order_payment(
         existing = await conn.fetchrow("SELECT * FROM order_payments WHERE id=$1 AND order_id=$2", payment_id, order_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Платёж не найден")
+    if str(existing["method"] or "").startswith("online"):  # онлайн-оплата PLUM — только возвратом в «💳 Оплаты» (pay.py)
+        raise HTTPException(status_code=400, detail="Онлайн-оплату нельзя изменить или удалить — оформите возврат в разделе «💳 Оплаты»")
     can_edit = (staff.get("sub") == "admin"
                 or staff.get("can_manage_cash")
                 or existing.get("created_by_staff_id") == staff.get("id"))
@@ -8047,6 +8056,8 @@ async def delete_order_payment(
         existing = await conn.fetchrow("SELECT * FROM order_payments WHERE id=$1 AND order_id=$2", payment_id, order_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Платёж не найден")
+    if str(existing["method"] or "").startswith("online"):  # онлайн-оплата PLUM — только возвратом в «💳 Оплаты» (pay.py)
+        raise HTTPException(status_code=400, detail="Онлайн-оплату нельзя изменить или удалить — оформите возврат в разделе «💳 Оплаты»")
     can_delete = (staff.get("sub") == "admin"
                   or staff.get("can_manage_cash")
                   or existing.get("created_by_staff_id") == staff.get("id"))
