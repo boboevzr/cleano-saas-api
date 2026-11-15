@@ -66,6 +66,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 import database as db
+from translit import to_cyrl
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 
 router = Router(name="order_bot")
 
@@ -269,8 +271,8 @@ T = {
         "ask_service_full": "Шаг 6 из 6\n🧺 Выберите услугу:",
         "ask_service_type": "⏱ Выберите тип услуги:",
         "ask_size": "📏 Размер:",
-        "btn_type_standard": "🕓 Стандарт",
-        "btn_type_express":  "⚡ Экспресс",
+        "btn_type_standard": "🕓 Стандартный",
+        "btn_type_express":  "⚡ Быстрый",
         "ask_date":       "📅 Выберите дату самовывоза:",
         "btn_today":      "Сегодня",
         "btn_tomorrow":   "Завтра",
@@ -458,7 +460,7 @@ T = {
         "ask_service_type": "⏱ Xizmat turini tanlang:",
         "ask_size": "📏 O'lcham:",
         "btn_type_standard": "🕓 Standart",
-        "btn_type_express":  "⚡ Ekspress",
+        "btn_type_express":  "⚡ Tezkor",
         "ask_date":       "📅 Olib ketish sanasini tanlang:",
         "btn_today":      "Bugun",
         "btn_tomorrow":   "Ertaga",
@@ -595,7 +597,8 @@ def t(lang: str, key: str) -> str:
 def lang_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇷🇺 Русский язык", callback_data="lang_ru")],
-        [InlineKeyboardButton(text="🇺🇿 O'zbek tili",  callback_data="lang_uz")],
+        [InlineKeyboardButton(text="🇺🇿 Oʻzbekcha · lotin",  callback_data="lang_uz")],
+        [InlineKeyboardButton(text="🇺🇿 Ўзбекча · кирилл",  callback_data="lang_uz_cyrl")],
     ])
 
 
@@ -673,6 +676,122 @@ class _ButtonColorsMiddleware(BaseMiddleware):
 
 router.message.outer_middleware(_ButtonColorsMiddleware())
 router.callback_query.outer_middleware(_ButtonColorsMiddleware())
+
+
+# ── Ўзбекча (кирилл) — перенос из ARTEZ (15.11.2026) ─────────────────────────
+# Выбор «Ўзбекча · кирилл» хранится в clients.lang как "uzc" (влезает в VARCHAR(5)),
+# а вся логика бота видит обычный "uz": тексты собираются латиницей, и перехватчик
+# запросов (_CyrlRequestMiddleware, вешается на Bot компании при первом апдейте)
+# переводит в кириллицу всё, что уходит такому клиенту. Нажатая кириллическая кнопка
+# обычной клавиатуры переводится обратно в латиницу (сравнения с T["uz"] работают).
+CYRL_DB = "uzc"
+_cyrl_users: dict = {}        # (company_id, tg_id) -> bool  (кэш clients.lang == "uzc")
+_cyrl_chats: dict = {}        # (bot_id, chat_id) -> bool   (для перехватчика отправки)
+_cur_uid = ContextVar("cyrl_cur_uid", default=None)
+_cur_cyrl = ContextVar("cyrl_cur_update", default=False)
+_cyr2lat: dict = {}
+_cyr2lat_built = False
+
+
+def _remember_btn(lat: str) -> str:
+    cyr = to_cyrl(lat)
+    if cyr != lat:
+        _cyr2lat[cyr] = lat
+    return cyr
+
+
+def _db_lang(lang: str | None) -> str:
+    """Язык для записи в clients.lang: "uz" клиента с кириллицей сохраняется как "uzc"."""
+    lang = lang or "ru"
+    return CYRL_DB if (lang == "uz" and _cur_cyrl.get()) else lang
+
+
+def _set_cyrl(company_id: int, bot_id: int | None, uid: int, on: bool) -> None:
+    _cyrl_users[(company_id, uid)] = on
+    if bot_id:
+        _cyrl_chats[(bot_id, uid)] = on
+    _cur_cyrl.set(on)
+
+
+class _CyrlIncomingMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        global _cyr2lat_built
+        user = getattr(event, "from_user", None)
+        bot_ = data.get("bot")
+        cid = data.get("company_id")
+        cyrl = False
+        if user and cid:
+            key = (int(cid), user.id)
+            if key not in _cyrl_users:
+                try:
+                    _cyrl_users[key] = (await db.get_bot_client_lang(user.id, int(cid))) == CYRL_DB
+                except Exception:
+                    _cyrl_users[key] = False
+            cyrl = _cyrl_users[key]
+            if bot_ is not None:
+                _cyrl_chats[(bot_.id, user.id)] = cyrl
+                if not getattr(bot_, "_cyrl_mw", False):
+                    bot_.session.middleware(_CyrlRequestMiddleware())
+                    try:
+                        setattr(bot_, "_cyrl_mw", True)
+                    except Exception:
+                        pass
+        t_uid = _cur_uid.set(user.id if user else None)
+        t_cy = _cur_cyrl.set(cyrl)
+        try:
+            if isinstance(event, Message) and event.text:
+                if not _cyr2lat_built:
+                    _cyr2lat_built = True
+                    for v in T["uz"].values():
+                        if isinstance(v, str) and len(v) < 80:
+                            _remember_btn(v)
+                lat = _cyr2lat.get(event.text)
+                if lat:
+                    event = event.model_copy(update={"text": lat})
+            return await handler(event, data)
+        finally:
+            _cur_cyrl.reset(t_cy)
+            _cur_uid.reset(t_uid)
+
+router.message.outer_middleware(_CyrlIncomingMiddleware())
+router.callback_query.outer_middleware(_CyrlIncomingMiddleware())
+
+
+def _cyrl_markup(mk):
+    if isinstance(mk, InlineKeyboardMarkup):
+        return mk.model_copy(update={"inline_keyboard": [
+            [b if (b.callback_data or "").startswith("lang_") else b.model_copy(update={"text": to_cyrl(b.text)})
+             for b in row] for row in mk.inline_keyboard]})
+    if isinstance(mk, ReplyKeyboardMarkup):
+        upd = {"keyboard": [[b.model_copy(update={"text": _remember_btn(b.text)}) for b in row]
+                            for row in mk.keyboard]}
+        if mk.input_field_placeholder:
+            upd["input_field_placeholder"] = to_cyrl(mk.input_field_placeholder)
+        return mk.model_copy(update=upd)
+    return mk
+
+
+class _CyrlRequestMiddleware(BaseRequestMiddleware):
+    async def __call__(self, make_request, bot_, method):
+        try:
+            target = getattr(method, "chat_id", None)
+            if target is None:
+                target = _cur_uid.get()
+            if isinstance(target, int) and _cyrl_chats.get((bot_.id, target)):
+                for f in ("text", "caption"):
+                    v = getattr(method, f, None)
+                    if isinstance(v, str):
+                        setattr(method, f, to_cyrl(v))
+                mk = getattr(method, "reply_markup", None)
+                if mk is not None:
+                    method.reply_markup = _cyrl_markup(mk)
+                media = getattr(method, "media", None)
+                if isinstance(media, list):
+                    method.media = [m.model_copy(update={"caption": to_cyrl(m.caption)})
+                                    if getattr(m, "caption", None) else m for m in media]
+        except Exception as e:
+            logging.warning(f"cyrl translit error: {e}")
+        return await make_request(bot_, method)
 
 # Ключ кнопки → ключ перевода (тексты RU/UZ — они же ловятся хендлером menu_button_pressed)
 MENU_BTN_TEXT_KEYS = {
@@ -951,6 +1070,8 @@ async def _resolve_lang(tg_id: int, company_id: int, state: FSMContext) -> str |
     except Exception as e:
         logging.warning(f"get_bot_client_lang error: {e}")
         lang = None
+    if lang == CYRL_DB:          # Ўзбекча (кирилл) — для логики это "uz"
+        return "uz"
     return lang if lang in ("ru", "uz") else None
 
 
@@ -1202,7 +1323,6 @@ async def _build_prices_text(lang: str, company_id: int) -> str:
         lines.append(t(lang, "prices_min_order_title"))
         for (mo_str, unit_sym), svc_names in min_groups.items():
             lines.append(t(lang, "prices_min_order_line").format(min_order=mo_str, unit=unit_sym, services=", ".join(svc_names)))
-    lines.append(t(lang, "prices_footer_types"))
     lines.append(t(lang, "prices_footer_delivery"))
 
     return "\n".join(lines)
@@ -1285,7 +1405,7 @@ async def start(message: Message, company_id: int, state: FSMContext) -> None:
             username=message.from_user.username,
             first_name=message.from_user.first_name,
             last_name=message.from_user.last_name,
-            lang=lang or "ru",
+            lang=_db_lang(lang),
         )
     except Exception as e:
         logging.warning(f"upsert_bot_client error: {e}")
@@ -1297,14 +1417,15 @@ async def start(message: Message, company_id: int, state: FSMContext) -> None:
         await message.answer(t("ru", "hello"), reply_markup=lang_kb())
 
 
-@router.callback_query(F.data.in_({"lang_ru", "lang_uz"}))
+@router.callback_query(F.data.in_({"lang_ru", "lang_uz", "lang_uz_cyrl"}))
 async def set_language(call: CallbackQuery, company_id: int, state: FSMContext) -> None:
     await call.answer()
     uid = call.from_user.id
     lang = "ru" if call.data == "lang_ru" else "uz"
+    _set_cyrl(company_id, call.bot.id if call.bot else None, uid, call.data == "lang_uz_cyrl")
     await state.update_data(lang=lang)
     try:
-        await db.set_bot_client_lang(uid, lang, company_id)
+        await db.set_bot_client_lang(uid, _db_lang(lang), company_id)
     except Exception as e:
         logging.warning(f"set_bot_client_lang error: {e}")
     await call.message.edit_text(t(lang, "lang_set"))
@@ -1432,7 +1553,7 @@ async def register_contact_received(message: Message, company_id: int, state: FS
             username=message.from_user.username,
             first_name=message.from_user.first_name,
             last_name=message.from_user.last_name,
-            phone=phone, lang=lang,
+            phone=phone, lang=_db_lang(lang),
             tg_phone=phone,
         )
     except Exception as e:
@@ -1534,7 +1655,7 @@ async def _finish_phone_step(message: Message, company_id: int, state: FSMContex
             username=message.from_user.username,
             first_name=message.from_user.first_name,
             last_name=message.from_user.last_name,
-            phone=phone, lang=lang,
+            phone=phone, lang=_db_lang(lang),
             tg_phone=phone if verified else None,
         )
     except Exception as e:
@@ -1797,7 +1918,7 @@ async def _advance_after_phone(message: Message, company_id: int, state: FSMCont
                 username=message.from_user.username,
                 first_name=message.from_user.first_name,
                 last_name=message.from_user.last_name,
-                phone=phone, lang=lang,
+                phone=phone, lang=_db_lang(lang),
                 tg_phone=phone if verified else None,
             )
         except Exception as e:
@@ -2668,7 +2789,8 @@ def _item_meta_str(lang: str, item: dict) -> str:
     if item.get("sqm"):
         parts.append(f"{item['sqm']} {unit_m2}")
     if item.get("price_per_sqm"):
-        parts.append(f"{item['price_per_sqm']} {unit_sum}/{unit_m2}")
+        per = ("dona" if lang == "uz" else "шт") if item.get("unit_key_snap") == "pcs" else unit_m2
+        parts.append(f"{item['price_per_sqm']} {unit_sum}/{per}")
     if item.get("total_sum"):
         parts.append(f"= {item['total_sum']} {unit_sum}")
     return " · ".join(str(p) for p in parts)
@@ -3113,7 +3235,7 @@ async def agent_contact_received(message: Message, company_id: int, state: FSMCo
             username=message.from_user.username,
             first_name=message.from_user.first_name,
             last_name=message.from_user.last_name,
-            phone=norm, lang=lang, tg_phone=norm,
+            phone=norm, lang=_db_lang(lang), tg_phone=norm,
         )
     except Exception as e:
         logging.warning(f"upsert_bot_client (agent contact) error: {e}")
