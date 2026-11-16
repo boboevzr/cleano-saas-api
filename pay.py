@@ -1060,10 +1060,15 @@ async def _due_pushes() -> None:
                 continue
             ru = f"К оплате {_fmt(m['due'])} сум — можно оплатить картой в приложении"
             uz = f"To'lov uchun {_fmt(m['due'])} so'm — ilovada karta bilan to'lash mumkin"
+            try:  # язык токена ru | uz | uzc (кириллица — транслит) — общий помощник приложения
+                import app_api
+                lt = app_api._lang_text
+            except Exception:
+                lt = lambda code, r, u: r if code == "ru" else u  # noqa: E731
             await main._expo_send([{
                 "to": t["token"], "sound": "default", "priority": "high", "channelId": "default",
-                "title": f"Заказ №{o['order_num']}" if t["lang"] == "ru" else f"Buyurtma №{o['order_num']}",
-                "body": ru if t["lang"] == "ru" else uz,
+                "title": lt(t["lang"], f"Заказ №{o['order_num']}", f"Buyurtma №{o['order_num']}"),
+                "body": lt(t["lang"], ru, uz),
                 "data": {"kind": "pay_due", "order_num": o["order_num"], "amount": m["due"]},
             } for t in tokens])
         except Exception as e:
