@@ -217,6 +217,7 @@ CREATE TABLE IF NOT EXISTS pay_log (
     details    TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE staff ADD COLUMN IF NOT EXISTS can_refund_prepay BOOLEAN DEFAULT FALSE;
 CREATE TABLE IF NOT EXISTS pay_fake_state (
     id         INTEGER PRIMARY KEY,
     state      JSONB,
@@ -1534,3 +1535,86 @@ async def delete_all_cards(company_id: int, user_id: int) -> None:
                     await plum.delete_card(k["plum_binding_id"])
                 except plum.PlumError:
                     pass
+
+
+# ══════════════════════════════════════
+#  Возврат предоплаты из staff.html (право can_refund_prepay) — перенос из ARTEZ (16.11)
+# ══════════════════════════════════════
+def _tash_day(dt: datetime) -> str:
+    return (dt.astimezone(timezone.utc) + timedelta(hours=5)).strftime("%Y-%m-%d")
+
+
+async def _refund_staff(authorization: str = Header(None)) -> dict:
+    """Сотрудник компании с правом возврата предоплаты (или админ компании)."""
+    import main
+    staff = await main.get_current_staff(authorization)
+    if not (staff.get("role") == "admin" or staff.get("sub") == "admin" or staff.get("can_refund_prepay")):
+        raise HTTPException(403, "Нет права на возврат предоплаты — включается в карточке сотрудника")
+    name = " ".join(filter(None, [staff.get("first_name"), staff.get("last_name")])) or staff.get("login") or "сотрудник"
+    return {"name": name, "id": staff.get("id"), "cid": int(staff.get("company_id") or 1)}
+
+
+@router.get("/api/pay/staff/prepay")
+async def staff_prepay(lead_id: int = 0, order_id: int = 0, s=Depends(_refund_staff)):
+    if not (lead_id or order_id):
+        raise HTTPException(400, "lead_id или order_id")
+    q = ("SELECT * FROM pay_tx WHERE kind='pay' AND purpose='prepay' AND status IN ('paid','refunded') AND company_id=$2 AND "
+         + ("order_id=$1" if order_id else "lead_id=$1") + " ORDER BY id")
+    async with db.pool.acquire() as c:
+        rows = await c.fetch(q, order_id or lead_id, s["cid"])
+        out = []
+        for t in rows:
+            back = await c.fetchval("SELECT COALESCE(SUM(amount),0) FROM pay_tx WHERE refund_of=$1 AND kind='refund' "
+                                    "AND status IN ('paid','manual','pending')", t["id"])
+            left = int(t["amount"]) - int(back or 0)
+            out.append({"id": t["id"], "amount": t["amount"], "left": left, "card_mask": t["card_mask"], "is_test": t["is_test"],
+                        "created_at": t["created_at"].isoformat(),
+                        "can_reverse": bool(t["plum_tx_id"]) and t["status"] == "paid" and int(back or 0) == 0
+                                       and _tash_day(t["created_at"]) == _tash_day(_now())})
+    return {"ok": True, "tx": out}
+
+
+async def _staff_tx(tx_id: int, cid: int) -> dict:
+    async with db.pool.acquire() as c:
+        t = await c.fetchrow("SELECT * FROM pay_tx WHERE id=$1 AND company_id=$2 AND kind='pay' AND purpose='prepay'", tx_id, cid)
+    if not t:
+        raise HTTPException(404, "Предоплата не найдена")
+    return dict(t)
+
+
+@router.post("/api/pay/staff/tx/{tx_id}/reverse")
+async def staff_reverse(tx_id: int, s=Depends(_refund_staff)):
+    await _staff_tx(tx_id, s["cid"])
+    try:
+        r = await reverse_tx(tx_id, actor=s["name"], reason="staff", cid=s["cid"])
+    except PayError as e:
+        raise _http(e) from None
+    await notify(s["cid"], f"↩️ Предоплата возвращена на карту — {s['name']}")
+    return r
+
+
+@router.post("/api/pay/staff/tx/{tx_id}/manual-refund")
+async def staff_manual_refund(tx_id: int, body: dict = Body({}), s=Depends(_refund_staff)):
+    await _staff_tx(tx_id, s["cid"])
+    try:
+        amount = int(float(body.get("amount") or 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Сумма — число")
+    try:
+        r = await manual_refund(s["cid"], tx_id, amount, str(body.get("note") or "")[:300], s["name"])
+    except PayError as e:
+        raise _http(e) from None
+    await notify(s["cid"], f"↩️ Предоплата {amount:,} сум отмечена «вернули вручную» — {s['name']}".replace(",", " "))
+    return r
+
+
+@router.put("/api/pay/admin/staff/{staff_id}/refund-perm")
+async def adm_refund_perm(staff_id: int, body: dict = Body({}), a=Depends(_admin)):
+    _need_admin(a)
+    on = bool(body.get("value"))
+    async with db.pool.acquire() as c:
+        ok = await c.fetchval("UPDATE staff SET can_refund_prepay=$2 WHERE id=$1 AND company_id=$3 RETURNING id", staff_id, on, a["cid"])
+    if not ok:
+        raise HTTPException(404, "Сотрудник не найден")
+    await _log(a["cid"], a["name"], "refund_perm", f"staff {staff_id} → {on}")
+    return {"ok": True, "value": on}

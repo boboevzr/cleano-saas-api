@@ -1977,6 +1977,7 @@ def _staff_public(s: dict) -> dict:
         "can_edit_price":      s.get("can_edit_price", False),
         "can_accept_payment":  s.get("can_accept_payment", False),
         "can_manage_cash":     s.get("can_manage_cash", False),
+        "can_refund_prepay":   bool(s.get("can_refund_prepay", False)),  # pay.py: возврат онлайн-предоплаты из staff
         "can_approve_debt":    s.get("can_approve_debt", False),
         "can_drive":           s.get("can_drive", False),
         "notify_new_users":    s.get("notify_new_users", False),
