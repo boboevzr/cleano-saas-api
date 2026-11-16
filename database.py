@@ -9236,15 +9236,18 @@ async def ensure_chat_tables():
         ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS last_client_msg_at TIMESTAMPTZ;
         ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS warned_at TIMESTAMPTZ;
         ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS lang VARCHAR(5) DEFAULT 'uz';
+        -- откуда клиент пишет: 'site' (виджет сайта) | 'app' (приложение) — 16.11.2026
+        ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS source VARCHAR(10) DEFAULT 'site';
         """)
 
-async def create_chat_session(code: str, client_phone: str = '', client_name: str = '', branch: str = '', lang: str = 'uz') -> dict:
+async def create_chat_session(code: str, client_phone: str = '', client_name: str = '', branch: str = '', lang: str = 'uz',
+                              source: str = 'site') -> dict:
     if not pool: return None
     cid = _cid()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "INSERT INTO chat_sessions (code, client_phone, client_name, branch, lang, company_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *",
-            code, client_phone, client_name, branch, lang, cid
+            "INSERT INTO chat_sessions (code, client_phone, client_name, branch, lang, company_id, source) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
+            code, client_phone, client_name, branch, lang, cid, source
         )
         return dict(row) if row else None
 
@@ -9273,6 +9276,19 @@ async def is_first_client_message(session_id: int) -> bool:
             session_id
         )
         return count == 0
+
+async def get_active_app_chat_by_phone(phone: str) -> dict:
+    """Открытый чат ИЗ ПРИЛОЖЕНИЯ этого номера в своей компании. Чаты сайта сюда не попадают: там номер вводит
+    кто угодно и он не проверен — иначе чужой чат «с моим номером» подхватился бы в моём приложении."""
+    if not pool or not phone: return None
+    cid = _cid()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM chat_sessions WHERE client_phone=$1 AND company_id=$2 AND source='app' "
+            "AND status IN ('pending','active') ORDER BY created_at DESC LIMIT 1",
+            phone.strip(), cid
+        )
+        return dict(row) if row else None
 
 async def get_active_chat_by_phone(phone: str) -> dict:
     """Найти активный/pending чат клиента (своей компании) по номеру телефона."""

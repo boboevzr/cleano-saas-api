@@ -10963,6 +10963,31 @@ def _gen_chat_code() -> str:
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
 
+def _chat_clean_site_name(name: str) -> str:
+    """Имя из виджета сайта (не проверено). Пометку чата из приложения ставит сервер: «📱» В НАЧАЛЕ имени
+    (_chat_staff_name). Из имени с сайта убираем всё, чем её можно подделать: длину режем до и после NFKC
+    (эндпоинт без входа), служебные/невидимые символы (Cf), эмодзи и значки (So/Sk, вариационные селекторы),
+    затем «из приложения» — в цикле, пока строка меняется. Перенос из ARTEZ 3e4dedb/03bf15f/3ed2bc1."""
+    import unicodedata
+    n = unicodedata.normalize("NFKC", (name or "")[:200])[:200]
+    n = "".join(ch for ch in n
+                if unicodedata.category(ch) not in ("Cf", "Cc", "Co", "Cs", "So", "Sk")
+                and not (0xFE00 <= ord(ch) <= 0xFE0F))
+    while True:
+        m2 = re.sub(r"[·\-–—,.\s]*из\s*прил[оo]жени[яe]", "", n, flags=re.IGNORECASE)
+        if m2 == n:
+            break
+        n = m2
+    return re.sub(r"\s+", " ", n).strip()[:100]
+
+
+def _chat_staff_name(s: dict) -> str:
+    """Имя клиента для сотрудников: чат из приложения — «📱 … · из приложения» (16.11.2026).
+    В базе имя как есть — шаблоны {name} в приветствиях клиенту не меняются."""
+    name = (s.get('client_name') or s.get('client_phone') or 'Клиент')
+    return f"📱 {name} · из приложения" if s.get('source') == 'app' else name
+
+
 def _msg_json(msg: dict) -> dict:
     m = dict(msg)
     if hasattr(m.get('created_at'), 'isoformat'):
@@ -10973,7 +10998,7 @@ def _msg_json(msg: dict) -> dict:
 @app.post("/api/chat/start")
 async def chat_start(body: dict = Body(...)):
     client_phone = (body.get("client_phone") or "").strip()
-    client_name  = (body.get("client_name")  or "").strip()
+    client_name  = _chat_clean_site_name(body.get("client_name") or "")
     branch       = (body.get("branch")       or "").strip()
     lang         = (body.get("lang")         or "uz").strip().lower()[:5]
     cid = await _resolve_client_company_id(body.get("company_slug"))
@@ -11043,6 +11068,7 @@ async def chat_sessions(staff=Depends(_chat_staff)):
         s2 = {k: (v.isoformat() if hasattr(v, 'isoformat') else v) for k, v in s.items()}
         s2['message_count'] = len(msgs)
         s2['last_text'] = msgs[-1]['text'] if msgs else ''
+        s2['client_name'] = _chat_staff_name(s)
         result.append(s2)
     return result
 
@@ -11054,6 +11080,7 @@ async def chat_get_messages(code: str, staff=Depends(_chat_staff)):
         raise HTTPException(404, "Сессия не найдена")
     msgs = await db.get_chat_messages(session['id'])
     s = {k: (v.isoformat() if hasattr(v, 'isoformat') else v) for k, v in session.items()}
+    s['client_name'] = _chat_staff_name(session)
     return {"session": s, "messages": [_msg_json(m) for m in msgs]}
 
 
@@ -11122,6 +11149,8 @@ async def chat_history(limit: int = 50, offset: int = 0, filter: str = "own",
     for r in rows:
         for k, v in r.items():
             if hasattr(v, 'isoformat'): r[k] = v.isoformat()
+        if 'client_name' in r:
+            r['client_name'] = _chat_staff_name(r)
     return {"rows": rows, "can_see_all": can_see_all}
 
 @app.get("/api/chat/templates")
@@ -11293,6 +11322,8 @@ async def ws_chat_staff(websocket: WebSocket, token: str):
             payload = {"type": "message", "code": code, "msg": _msg_json(msg)}
             await _chat.send_client(code, {"type": "message", "msg": _msg_json(msg)})
             await _chat.broadcast_staff(payload, exclude=staff_id, company_id=staff_company_id)
+            if session.get('source') == 'app':   # чат из приложения — push клиенту (токены этой компании)
+                asyncio.create_task(app_api.push_chat(staff_company_id, session, sname, text))
     except (WebSocketDisconnect, Exception):
         pass
     finally:
