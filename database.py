@@ -1877,6 +1877,8 @@ async def create_tables():
         await c.execute("""
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS pickup_date VARCHAR(20)  DEFAULT '';
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS pickup_time VARCHAR(100) DEFAULT '';
+        -- 16.11.2026 (из ARTEZ d85db99): несколько услуг в заявке [{service_key,type_key,qty,name_ru,type_ru}]
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS services_json JSONB DEFAULT NULL;
         """)
 
     # ── Шаг 15b: tg_id водителя в платежах ──────────────────────────────
@@ -3360,6 +3362,30 @@ async def get_company_id_by_order_bot_secret(secret: str) -> int | None:
 # ══════════════════════════════════════
 #  ЗАКАЗЫ КЛИЕНТА (для личного кабинета)
 # ══════════════════════════════════════
+async def get_client_leads(phone: str, company_id: int):
+    """Заявки клиента своей компании, ещё не ставшие заказом (16.11.2026, из ARTEZ 1fe71b8): «менеджер работает».
+    Оформленные (converted) не возвращаем — вместо них заказ; отменённые — только 3 дня.
+    Без note/звонков: там внутренние пометки сотрудников. id — для pay.add_prepaid, наружу не отдаётся."""
+    if not pool: return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, lead_code, status, created_at, updated_at, service, services_json, city, address,
+                   delivery_address, location, delivery_location, pickup_date, pickup_time
+            FROM leads
+            WHERE client_phone=$1 AND company_id=$2 AND status <> 'converted'
+              AND created_at > NOW() - INTERVAL '30 days'
+              AND (status <> 'lost' OR updated_at > NOW() - INTERVAL '3 days')
+            ORDER BY created_at DESC LIMIT 20
+        """, phone, company_id)
+        out = []
+        for r in rows:
+            d = dict(r)
+            sj = d.get("services_json")
+            d["services"] = json.loads(sj) if isinstance(sj, str) else (sj or [])
+            d.pop("services_json", None)
+            out.append(d)
+        return out
+
 async def get_orders_by_phone(phone: str, company_id: int):
     if not pool: return []
     async with pool.acquire() as conn:
@@ -5906,6 +5932,9 @@ async def create_lead(data: dict, company_id: int | None = None) -> dict:
             "UPDATE leads SET lead_num=$1, lead_code=$2 WHERE id=$3",
             lead_num, lead_code, rid
         )
+        if data.get("services_json"):
+            await conn.execute("UPDATE leads SET services_json=$1::jsonb WHERE id=$2 AND company_id=$3",
+                               json.dumps(data["services_json"], ensure_ascii=False), rid, cid)
         return dict(row) | {"lead_num": lead_num, "lead_code": lead_code}
 
 async def get_leads(status: str = None, branch: str = None,

@@ -101,9 +101,11 @@ async def company_id_middleware(request: Request, call_next):
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     logging.error(f"422 on {request.method} {request.url.path}: {exc.errors()}")
+    # ctx.error — объект ValueError из field_validator, в JSON не превращается (раньше → 500 вместо 422)
+    errors = [{k: v for k, v in e.items() if k != "ctx"} for e in exc.errors()]
     return JSONResponse(
         status_code=422,
-        content={"detail": exc.errors()},
+        content={"detail": errors},
         headers={"Access-Control-Allow-Origin": "*"},
     )
 
@@ -1196,6 +1198,31 @@ async def _resolve_client_company_id(company_slug: str | None) -> int:
 class AgentApplyRequest(BaseModel):
     branch: str = ""
 
+class OrderServiceLine(BaseModel):
+    service_key: str
+    type_key: str = ""
+    qty: int = 1
+
+    @field_validator("qty")
+    @classmethod
+    def validate_qty(cls, v):
+        return max(1, min(int(v or 1), 99))
+
+
+_LATLON_RE = re.compile(r"^\s*(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*$")
+
+
+def _clean_latlon(s: str) -> str:
+    """Координаты из приложения → «lat,lon» (5 знаков) или \"\" если мусор/вне диапазона."""
+    m = _LATLON_RE.match(s or "")
+    if not m:
+        return ""
+    la, lo = float(m.group(1)), float(m.group(2))
+    if not (-90 <= la <= 90 and -180 <= lo <= 180):
+        return ""
+    return f"{la:.5f},{lo:.5f}"
+
+
 class OrderRequest(BaseModel):
     first_name: str
     last_name: str = ""
@@ -1216,9 +1243,18 @@ class OrderRequest(BaseModel):
     pickup_time: str = ""
     is_quick: bool = False
     total_price: int | None = None
-    source: str = "site"  # "site" or "bot"
+    source: str = "site"  # "site", "bot" или "app" (приложение — в лидах хранится как "site")
     client_tg_id: int | None = None
     company_slug: str | None = None
+    # 16.11.2026 (из ARTEZ d85db99): несколько услуг сразу (аддитивно; сайт и бот шлют одну service/service_type)
+    services: list[OrderServiceLine] = []
+
+    @field_validator("services")
+    @classmethod
+    def validate_services(cls, v):
+        if len(v) > 20:
+            raise ValueError("Слишком много услуг в одной заявке")
+        return v
 
     @field_validator("phone")
     @classmethod
@@ -3039,24 +3075,28 @@ async def assign_lead(lead_id: int, body: dict = Body({}),
     is_admin = role in ("admin", "manager")
     async with db.pool.acquire() as conn:
         if take:
-            row = await conn.fetchrow("SELECT assigned_to FROM leads WHERE id=$1", lead_id)
+            # только лид своей компании (раньше без company_id — можно было взять чужой по id)
+            row = await conn.fetchrow("SELECT assigned_to, status FROM leads WHERE id=$1 AND company_id=$2", lead_id, db._cid())
             if not row:
                 raise HTTPException(status_code=404, detail="Лид не найден")
+            # закрытую заявку (клиент отменил / «Потерян») и оформленную в работу не берут (из ARTEZ 79e757d)
+            if row["status"] in ("lost", "converted"):
+                raise HTTPException(status_code=409, detail="Заявка закрыта — взять в работу нельзя")
             # Обычный сотрудник не может взять лид занятый другим; admin/manager могут
             if row["assigned_to"] and row["assigned_to"] != staff_id and not is_admin:
                 raise HTTPException(status_code=409, detail="Лид уже взят другим сотрудником")
-            await conn.execute("UPDATE leads SET assigned_to=$1 WHERE id=$2", staff_id, lead_id)
+            await conn.execute("UPDATE leads SET assigned_to=$1 WHERE id=$2 AND company_id=$3", staff_id, lead_id, db._cid())
             note = f"Лид взят: {staff.get('first_name','')} {staff.get('last_name','')}".strip()
             staff_name = f"{staff.get('first_name','')} {staff.get('last_name','')}".strip() or staff.get('login','')
             asyncio.create_task(_tg_mark_lead_taken(lead_id, staff_name, staff.get("gender", "")))
         else:
-            row = await conn.fetchrow("SELECT assigned_to FROM leads WHERE id=$1", lead_id)
+            row = await conn.fetchrow("SELECT assigned_to FROM leads WHERE id=$1 AND company_id=$2", lead_id, db._cid())
             if not row:
                 raise HTTPException(status_code=404, detail="Лид не найден")
             # Освободить можно свой лид, или admin/manager любой
             if row["assigned_to"] != staff_id and not is_admin:
                 raise HTTPException(status_code=403, detail="Можно освободить только свой лид")
-            await conn.execute("UPDATE leads SET assigned_to=NULL WHERE id=$1", lead_id)
+            await conn.execute("UPDATE leads SET assigned_to=NULL WHERE id=$1 AND company_id=$2", lead_id, db._cid())
             note = f"Лид освобождён: {staff.get('first_name','')} {staff.get('last_name','')}".strip()
         await db.add_lead_call(lead_id, staff_id, action="note", note=note)
     lead = await db.get_lead_by_id(lead_id)
@@ -3083,7 +3123,10 @@ async def update_lead_status(lead_id: int, body: dict,
         scheduled_at_pre = body.get("scheduled_at")
         from datetime import datetime as _dt
         sched_pre = _dt.fromisoformat(scheduled_at_pre) if scheduled_at_pre and status == "callback" else None
+        _old = await db.get_lead_by_id(lead_id)
         await db.update_lead_status(lead_id, status, scheduled_at=sched_pre)
+        if _old and _old.get("status") != status and status != "lost":   # тот же статус ещё раз — клиенту не повторяем
+            asyncio.create_task(_tg_lead_status(db._cid(), lead_id, status))
     if status in ("converted", "lost"):
         await db.cancel_pending_lead_reminders(lead_id)
     # лог
@@ -3105,7 +3148,15 @@ async def update_lead_status(lead_id: int, body: dict,
                                    message=f"Перезвонить клиенту — лид {lead_id}")
     # Уведомить агента если лид агентский
     asyncio.create_task(_notify_agent_status(lead_id, status, note))
-    return {"ok": True}
+    # «Потерян» по заявке с онлайн-предоплатой — деньги клиенту назад полностью (курьер ещё не выезжал).
+    # _old есть: «lost» идёт веткой else выше. Оформленную (converted) не трогаем — её деньги уже в заказе.
+    refund = {"auto": 0, "pending": 0}
+    if status == "lost" and _old and _old.get("status") not in ("lost", "converted"):
+        who = f"{staff.get('first_name') or ''} {staff.get('last_name') or ''}".strip() or str(staff.get("sub") or "staff")
+        refund = await _refund_prepay(cid=db._cid(), lead_id=lead_id, actor=who,
+                                      why=f"менеджер закрыл заявку {_old.get('lead_code') or lead_id} как «Потерян»")
+        asyncio.create_task(_tg_lead_status(db._cid(), lead_id, "lost", refund))
+    return {"ok": True, "refund": refund}
 
 @app.get("/api/staff/my-notifications")
 async def get_my_notifications(staff=Depends(get_current_staff)):
@@ -3373,9 +3424,14 @@ async def bulk_status_leads(body: dict, staff=Depends(require_perm("leads"))):
         raise HTTPException(status_code=400, detail="Нет ID лидов")
     operator_id = None if staff.get("sub") == "admin" else staff.get("id")
     for lead_id in ids:
+        _was = await db.get_lead_by_id(int(lead_id)) if status == "lost" else None   # только своя компания
         await db.update_lead_status(int(lead_id), status)
         await db.add_lead_call(int(lead_id), operator_id, action=f"status_{status}",
                                note=f"Массовая смена статуса")
+        if _was and _was.get("status") not in ("lost", "converted"):   # предоплата по заявке — назад
+            _rf = await _refund_prepay(cid=db._cid(), lead_id=int(lead_id), actor="bulk",
+                                       why=f"заявка {_was.get('lead_code') or lead_id} закрыта как «Потерян» (массово)")
+            asyncio.create_task(_tg_lead_status(db._cid(), int(lead_id), "lost", _rf))   # пишет, только если были деньги
     return {"ok": True, "updated": len(ids)}
 
 @app.post("/api/staff/orders/bulk-status")
@@ -4788,7 +4844,169 @@ async def cancel_order(order_num: str, user = Depends(get_current_user)):
     if not order:
         raise HTTPException(status_code=400, detail="Заказ не найден или уже нельзя отменить")
     asyncio.create_task(notify_group_client_cancel(order))
-    return {"ok": True}
+    # заказ отменён до выезда курьера (статус «Новый») — онлайн-предоплата возвращается полностью
+    cid = user.get("company_id") or 1
+    oid = await db.pool.fetchval("SELECT id FROM orders WHERE order_num=$1 AND company_id=$2", order_num, cid) if db.pool else None
+    refund = await _refund_prepay(cid=cid, order_id=oid, actor="client", why=f"клиент отменил заказ {order_num}") if oid else {"auto": 0, "pending": 0}
+    return {"ok": True, "refund": refund}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Заявки клиента до оформления заказа, отказ и возврат предоплаты, Telegram по заявке
+#  (16.11.2026, перенос из ARTEZ 1fe71b8 / e746c0a / 7a90158 / 27ae187 / 6d05e60).
+#  Всё — в рамках компании клиента (users.company_id) или компании сотрудника (_cid()).
+# ══════════════════════════════════════════════════════════════════════
+
+from translit import to_cyrl as _to_cyrl_lead
+
+
+@app.get("/api/my/leads")
+async def my_leads(user = Depends(get_current_user)):
+    """Заявки клиента, по которым менеджер ещё не оформил заказ (приложение «Мои заказы», кабинет сайта)."""
+    cid = user.get("company_id") or 1
+    leads = await db.get_client_leads(user["phone"], cid)
+    db.set_request_company(cid)
+    leads = await pay.add_prepaid(leads)   # prepaid — оплаченная онлайн-предоплата (считает по id)
+    for l in leads:
+        l.pop("id", None)                  # id наружу не отдаём — клиенту хватает lead_code
+    return {"leads": leads}
+
+
+def _tash_date(dt) -> str:
+    return (dt + timedelta(hours=5)).strftime("%Y-%m-%d") if dt else ""
+
+
+async def _refund_prepay(*, cid: int, lead_id: int | None = None, order_id: int | None = None,
+                         actor: str = "system", why: str = "") -> dict:
+    """Предоплата при отказе до выезда курьера — полностью (решение владельца 16.11.2026). Оплачено сегодня —
+    сразу на карту (pay.reverse_tx); банк не ответил — «в обработке» (воркер pay доведёт); иначе — «Кому вернуть»
+    в админке компании + уведомление в её группу заявок."""
+    out = {"auto": 0, "pending": 0, "processing": 0}
+    if not db.pool or not cid or not (lead_id or order_id):
+        return out
+    try:
+        async with db.pool.acquire() as c:
+            if lead_id:
+                txs = await c.fetch("SELECT id, amount, created_at, plum_tx_id FROM pay_tx WHERE kind='pay' AND purpose='prepay' "
+                                    "AND status='paid' AND company_id=$2 AND lead_id=$1 AND order_id IS NULL ORDER BY id", lead_id, cid)
+            else:
+                txs = await c.fetch("SELECT id, amount, created_at, plum_tx_id FROM pay_tx WHERE kind='pay' AND purpose='prepay' "
+                                    "AND status='paid' AND company_id=$2 AND order_id=$1 ORDER BY id", order_id, cid)
+        today = _tash_date(datetime.now(timezone.utc))
+        for t in txs:
+            where = "pending"
+            if t["plum_tx_id"] and _tash_date(t["created_at"]) == today:
+                try:
+                    await pay.reverse_tx(t["id"], actor=actor, reason=f"auto: {why}"[:200], cid=cid)
+                    where = "auto"
+                except Exception as e:  # банк отказал / возврат уже начат — вернут вручную
+                    if getattr(e, "code", "") == "plum_unavailable":
+                        where = "processing"
+                    logging.warning(f"_refund_prepay tx={t['id']}: {type(e).__name__}: {e}")
+            amt = int(t["amount"] or 0)
+            if where == "processing":
+                out["processing"] += amt
+                out["auto"] += amt   # клиенту — «вернётся на карту»: деньги уже в пути
+            else:
+                out[where] += amt
+        done = out["auto"] - out["processing"]
+        if done:
+            await pay.notify(cid, f"↩️ Предоплата {done:,} сум возвращена на карту автоматически — {why}".replace(",", " "))
+        if out["processing"]:
+            await pay.notify(cid, f"↩️ Возврат предоплаты {out['processing']:,} сум отправлен в банк, ответ ждём — {why}. "
+                                  f"Проверьте через 5 минут: «💳 Оплаты» → Журнал. Вручную НЕ возвращать.".replace(",", " "))
+        if out["pending"]:
+            await pay.notify(cid, f"↩️ НУЖНО ВЕРНУТЬ предоплату {out['pending']:,} сум — {why}. "
+                                  f"Админка → Оплата → «Кому вернуть деньги» → «Вернули вручную».".replace(",", " "))
+    except Exception as e:
+        logging.warning(f"_refund_prepay cid={cid} lead={lead_id} order={order_id}: {type(e).__name__}: {e}")
+    return out
+
+
+_CLIENT_CANCELABLE_LEAD = ("new", "contacted", "callback", "no_answer")
+
+
+@app.post("/api/my/leads/{code}/cancel")
+async def my_lead_cancel(code: str, user = Depends(get_current_user)):
+    """Клиент сам отменяет заявку (до оформления в заказ): «Потерян», предоплата — назад полностью."""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="База недоступна")
+    cid = user.get("company_id") or 1
+    # проверка и смена статуса — одним UPDATE: параллельное оформление в заказ / повторная отмена не пройдут
+    lead = await db.pool.fetchrow(
+        "UPDATE leads SET status='lost', callback_at=NULL, updated_at=NOW() WHERE lead_code=$1 AND client_phone=$2 "
+        "AND company_id=$4 AND status = ANY($3::text[]) AND converted_order IS NULL RETURNING id, lead_code",
+        code, user["phone"], list(_CLIENT_CANCELABLE_LEAD), cid)
+    if not lead:
+        raise HTTPException(status_code=400, detail="Заявку уже нельзя отменить — позвоните нам")
+    db.set_request_company(cid)
+    await db.cancel_pending_lead_reminders(lead["id"])
+    await db.add_lead_call(lead["id"], None, action="status_lost", note="Клиент сам отменил заявку (сайт/приложение)")
+    refund = await _refund_prepay(cid=cid, lead_id=lead["id"], actor="client", why=f"клиент отменил заявку {code}")
+    return {"ok": True, "refund": refund}
+
+
+# Тексты клиенту при смене статуса заявки менеджером (Telegram; push — когда появится вход приложения)
+APP_PUSH_LEAD = {
+    "contacted": ("Менеджер работает над вашей заявкой", "Menejer arizangiz ustida ishlamoqda"),
+    "callback":  ("Менеджер перезвонит вам в удобное время", "Menejer sizga qulay vaqtda qo'ng'iroq qiladi"),
+    "no_answer": ("Не смогли до вас дозвониться — перезвоните нам", "Sizga qo'ng'iroq qila olmadik — bizga qo'ng'iroq qiling"),
+}
+
+
+async def _lead_client_tg(lead: dict, cid: int) -> tuple[int | None, str]:
+    """Telegram клиента по заявке (в рамках компании): client_tg_id → users.tg_id → crm_clients.tg_id; язык — clients.lang."""
+    tg = lead.get("client_tg_id")
+    phone = lead.get("client_phone") or ""
+    async with db.pool.acquire() as c:
+        if not tg and phone:
+            tg = await c.fetchval("SELECT tg_id FROM users WHERE phone=$1 AND company_id=$2 AND tg_id IS NOT NULL LIMIT 1", phone, cid)
+        if not tg and phone:
+            tg = await c.fetchval("SELECT tg_id FROM crm_clients WHERE phone=$1 AND company_id=$2 AND tg_id IS NOT NULL LIMIT 1", phone, cid)
+        lang = "ru"
+        if tg:
+            try:
+                lang = await c.fetchval("SELECT COALESCE(NULLIF(lang,''), language) FROM clients WHERE tg_id=$1 AND company_id=$2",
+                                        int(tg), cid) or "ru"
+            except Exception:
+                lang = "ru"
+    try:
+        return (int(tg) if tg else None), {"uzc": "uz_cyrl"}.get(lang, lang) if lang in ("ru", "uz", "uz_cyrl", "uzc") else "ru"
+    except (TypeError, ValueError):
+        return None, "ru"
+
+
+async def _tg_lead_status(cid: int, lead_id: int, status: str, refund: dict | None = None):
+    """Сообщение клиенту в Telegram (ботом компании) при смене статуса заявки менеджером.
+    «Потерян» — только если по заявке была предоплата (что с деньгами)."""
+    try:
+        db.set_request_company(cid)
+        lead = await db.get_lead_by_id(lead_id)
+        if not lead:
+            return
+        if status == "lost":
+            rf = refund or {}
+            if not (rf.get("auto") or rf.get("pending")):
+                return   # закрыта без денег — не пишем (часто спам/дубль)
+            if rf.get("auto"):
+                text = (f"Заявка закрыта. Предоплата {rf['auto']:,} сум возвращена на вашу карту".replace(",", " "),
+                        f"Ariza yopildi. {rf['auto']:,} so'm oldindan to'lov kartangizga qaytarildi".replace(",", " "))
+            else:
+                text = (f"Заявка закрыта. Предоплату {rf['pending']:,} сум вернём — менеджер свяжется с вами".replace(",", " "),
+                        f"Ariza yopildi. {rf['pending']:,} so'm oldindan to'lovni qaytaramiz — menejer siz bilan bog'lanadi".replace(",", " "))
+        else:
+            text = APP_PUSH_LEAD.get(status)
+            if not text:
+                return
+        tg, lang = await _lead_client_tg(dict(lead), cid)
+        if not tg:
+            return
+        code = lead.get("lead_code") or ""
+        body = text[0] if lang == "ru" else (_to_cyrl_lead(text[1]) if lang == "uz_cyrl" else text[1])
+        head = f"Заявка {code}" if lang == "ru" else (_to_cyrl_lead(f"Ariza {code}") if lang == "uz_cyrl" else f"Ariza {code}")
+        await _send_client_tg(cid, tg, f"<b>{html.escape(head)}</b>\n{html.escape(body)}")
+    except Exception as e:
+        logging.warning(f"_tg_lead_status {lead_id}: {type(e).__name__}: {e}")
 
 
 @app.get("/api/orders/{order_num}/items")
@@ -10198,6 +10416,34 @@ async def create_order_from_site(order: OrderRequest, user=Depends(get_optional_
         db.set_request_company(await _resolve_client_company_id(order.company_slug))
     full_name = f"{order.first_name} {order.last_name}".strip()
     note_parts = []
+    if order.source == "app":
+        note_parts.append("📱 Из приложения")
+        # координаты из приложения — строго «lat,lon»; мусор не сохраняем
+        order.location = _clean_latlon(order.location)
+        order.delivery_location = _clean_latlon(order.delivery_location)
+    services_json = None
+    if order.services:
+        # несколько услуг (приложение): названия — только из таблицы услуг/вариантов ЭТОЙ компании, ключи проверяем
+        svc_rows = {s["key"]: s for s in await db.get_services()}
+        type_rows = {(t["service_key"], t["type_key"]): t for t in await db.get_service_types()}
+        services_json, short, full = [], [], []
+        for ln in order.services:
+            s = svc_rows.get(ln.service_key)
+            if not s:
+                raise HTTPException(status_code=400, detail="Неверная услуга")
+            t = type_rows.get((ln.service_key, ln.type_key)) if ln.type_key else None
+            if ln.type_key and not t:
+                raise HTTPException(status_code=400, detail="Неверный вариант услуги")
+            name = f"{(s.get('emoji') or '').strip()} {s['name_ru']}".strip()
+            services_json.append({"service_key": ln.service_key, "type_key": ln.type_key or "", "qty": ln.qty,
+                                  "name_ru": s["name_ru"], "type_ru": t["name_ru"] if t else ""})
+            short.append(f"{s['name_ru']} ×{ln.qty}")
+            full.append(f"{name} ×{ln.qty}" + (f" ({t['name_ru']})" if t else ""))
+        summary = ", ".join(short)
+        # leads.service — VARCHAR(100): краткая сводка; полный список — в примечании и services_json
+        order.service = summary if len(summary) <= 100 else summary[:97] + "…"
+        order.service_type = ""
+        note_parts.append("Услуги: " + "; ".join(full))
     if order.service_type: note_parts.append(f"Тип: {await _type_label_ru(order.service, order.service_type)}")
     if order.pickup_date:  note_parts.append(f"Дата: {order.pickup_date}")
     if order.pickup_time:  note_parts.append(f"Время: {order.pickup_time}")
@@ -10240,6 +10486,7 @@ async def create_order_from_site(order: OrderRequest, user=Depends(get_optional_
         "client_tg_id":  order.client_tg_id,
         "pickup_date":   order.pickup_date or "",
         "pickup_time":   order.pickup_time or "",
+        "services_json": services_json,
     })
     lead_code = (lead or {}).get("lead_code") or f"#{(lead or {}).get('id','?')}"
     if lead:
