@@ -1489,3 +1489,23 @@ async def adm_log(a=Depends(_admin)):
     async with db.pool.acquire() as c:
         rows = await c.fetch("SELECT * FROM pay_log WHERE company_id=$1 ORDER BY id DESC LIMIT 200", a["cid"])
     return {"ok": True, "log": [dict(r) for r in rows]}
+
+
+# ══════════════════════════════════════
+#  Предоплата по заявкам — поле prepaid в списках лидов (перенос ARTEZ, 16.11)
+# ══════════════════════════════════════
+async def add_prepaid(leads: list[dict]) -> list[dict]:
+    """Дописывает в каждую заявку prepaid — сумму оплаченных онлайн-предоплат (возвращённые не считаются)."""
+    try:
+        ids = [int(l["id"]) for l in leads if l.get("id")]
+        m: dict = {}
+        if ids and db.pool:
+            async with db.pool.acquire() as c:
+                rows = await c.fetch("SELECT lead_id, SUM(amount)::int AS s FROM pay_tx WHERE kind='pay' AND purpose='prepay' "
+                                     "AND status='paid' AND lead_id = ANY($1::int[]) GROUP BY lead_id", ids)
+            m = {r["lead_id"]: r["s"] for r in rows}
+        for l in leads:
+            l["prepaid"] = m.get(l.get("id"), 0)
+    except Exception as e:  # метка не должна ломать список заявок
+        log.warning("add_prepaid: %s", type(e).__name__)
+    return leads
