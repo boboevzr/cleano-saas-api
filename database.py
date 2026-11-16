@@ -1231,7 +1231,7 @@ async def create_tables():
         "ALTER TABLE companies ADD COLUMN IF NOT EXISTS contact_tg_id BIGINT DEFAULT NULL",
         "ALTER TABLE sms_codes DROP CONSTRAINT IF EXISTS sms_codes_purpose_check",
         "ALTER TABLE sms_codes ADD CONSTRAINT sms_codes_purpose_check "
-        "CHECK (purpose IN ('register','login','reset','cleano_register'))",
+        "CHECK (purpose IN ('register','login','reset','cleano_register','app_login','app_attempt'))",  # + коды входа в приложение (16.11.2026)
         """CREATE TABLE IF NOT EXISTS cleano_tg_links (
             phone      VARCHAR(20) PRIMARY KEY,
             tg_id      BIGINT      NOT NULL,
@@ -1263,7 +1263,7 @@ async def create_tables():
         "ALTER TABLE sms_codes ALTER COLUMN code TYPE VARCHAR(20)",
         "ALTER TABLE sms_codes DROP CONSTRAINT IF EXISTS sms_codes_purpose_check",
         "ALTER TABLE sms_codes ADD CONSTRAINT sms_codes_purpose_check "
-        "CHECK (purpose IN ('register','login','reset','cleano_register','reset_attempt'))",
+        "CHECK (purpose IN ('register','login','reset','cleano_register','reset_attempt','app_login','app_attempt'))",  # + коды входа в приложение (16.11.2026)
         # База знаний (kb.html) — общая для всех компаний документация по admin.html,
         # редактируется в superadmin.html. body_ru/body_uz — JSON-массив блоков
         # [{type:'heading'|'text'|'image'|'video', text?, file_id?}], тот же приём,
@@ -3150,8 +3150,10 @@ async def update_user_password(user_id: int, password_hash: str):
         await conn.execute("""
             UPDATE users SET password_hash=$2, must_change_password=FALSE, updated_at=NOW() WHERE id=$1
         """, user_id, password_hash)
-    # Пароль сменили/сбросили — входы по Face ID на сайте больше не действуют (ARTEZ 3fb6596)
-    await passkeys_revoke_user(user_id)
+    # Пароль сменили/сбросили — входы в приложение (сессии, PIN/Face ID телефона) и Face ID на сайте
+    # больше не действуют (ARTEZ cad5f53/3fb6596)
+    import app_api
+    await app_api.revoke_subject("client", user_id)
 
 async def get_all_site_users(search: str = "", limit: int = 500):
     if not pool: return []
@@ -5193,7 +5195,18 @@ async def revoke_staff_sessions(staff_id: int, reason: str, sid: int | None = No
             "WHERE staff_id=$1 AND revoked_at IS NULL "
             "AND ($3::int IS NULL OR id=$3) AND ($4::int IS NULL OR id<>$4)",
             staff_id, reason, sid, except_sid)
-        return int(res.split()[-1]) if res else 0
+        n = int(res.split()[-1]) if res else 0
+        # Закрыли ВСЕ сессии сотрудника (уволен/«завершить все»/смена пароля) — и вход по PIN/Face ID
+        # в приложении тоже: иначе PIN выдал бы новую сессию в обход отзыва (как в ARTEZ cad5f53)
+        if sid is None and except_sid is None:
+            try:
+                await conn.execute("UPDATE app_devices SET revoked_at=NOW() WHERE kind='staff' AND subject_id=$1 "
+                                   "AND revoked_at IS NULL", staff_id)
+                await conn.execute("UPDATE app_sessions SET revoked_at=NOW() WHERE kind='staff' AND subject_id=$1 "
+                                   "AND revoked_at IS NULL", staff_id)
+            except Exception:
+                pass   # таблиц приложения ещё нет
+        return n
 
 
 async def update_staff_password(staff_id: int, password_hash: str, plain: str = None):

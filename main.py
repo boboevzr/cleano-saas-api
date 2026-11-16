@@ -25,6 +25,8 @@ from jose import jwt, JWTError
 import database as db
 import receipt
 import pay  # онлайн-оплата PLUM + заявки на рассрочку (перенос Э3 ARTEZ, 2026-11-15)
+import app_api  # мобильное приложение — одно на все компании: вход, PIN, push (16.11.2026)
+_expo_send = app_api.expo_send   # pay._due_pushes («К оплате») шлёт через main._expo_send
 
 logging.basicConfig(level=logging.INFO)
 
@@ -68,6 +70,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 app = FastAPI(title="ARTEZ API")
 app.include_router(pay.router)
+app.include_router(app_api.router)
 
 def bi(ru: str, uz: str) -> str:
     """Двуязычное сообщение для ошибок, видимых пользователю."""
@@ -168,6 +171,11 @@ async def startup():
         asyncio.create_task(pay.worker())
     except Exception as e:
         logging.error(f"pay init: {type(e).__name__}: {e}")
+    try:
+        await app_api.ensure_tables()
+        asyncio.create_task(app_api.push_worker())
+    except Exception as e:
+        logging.error(f"app_api init: {type(e).__name__}: {e}")
     # Webhook не нужен — бот работает в режиме polling (ARTEZ-BOT сервис на Railway)
     # if BOT_TOKEN and APP_URL:
     #     asyncio.create_task(_set_tg_webhook())
@@ -3128,6 +3136,7 @@ async def update_lead_status(lead_id: int, body: dict,
         await db.update_lead_status(lead_id, status, scheduled_at=sched_pre)
         if _old and _old.get("status") != status and status != "lost":   # тот же статус ещё раз — клиенту не повторяем
             asyncio.create_task(_tg_lead_status(db._cid(), lead_id, status))
+            asyncio.create_task(app_api.push_lead(db._cid(), lead_id, status))
     if status in ("converted", "lost"):
         await db.cancel_pending_lead_reminders(lead_id)
     # лог
