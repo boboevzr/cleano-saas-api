@@ -3096,6 +3096,10 @@ async def assign_lead(lead_id: int, body: dict = Body({}),
             if row["assigned_to"] and row["assigned_to"] != staff_id and not is_admin:
                 raise HTTPException(status_code=409, detail="Лид уже взят другим сотрудником")
             await conn.execute("UPDATE leads SET assigned_to=$1 WHERE id=$2 AND company_id=$3", staff_id, lead_id, db._cid())
+            # впервые взята в работу — клиенту push и Telegram «Менеджер взял вашу заявку» (без имени; из ARTEZ 4b057f2)
+            if not row["assigned_to"]:
+                asyncio.create_task(_tg_lead_status(db._cid(), lead_id, "taken"))
+                asyncio.create_task(app_api.push_lead(db._cid(), lead_id, "taken"))
             note = f"Лид взят: {staff.get('first_name','')} {staff.get('last_name','')}".strip()
             staff_name = f"{staff.get('first_name','')} {staff.get('last_name','')}".strip() or staff.get('login','')
             asyncio.create_task(_tg_mark_lead_taken(lead_id, staff_name, staff.get("gender", "")))
@@ -4955,6 +4959,7 @@ async def my_lead_cancel(code: str, user = Depends(get_current_user)):
 
 # Тексты клиенту при смене статуса заявки менеджером (Telegram; push — когда появится вход приложения)
 APP_PUSH_LEAD = {
+    "taken":     ("Менеджер взял вашу заявку и скоро позвонит", "Menejer arizangizni oldi va tez orada qo'ng'iroq qiladi"),
     "contacted": ("Менеджер работает над вашей заявкой", "Menejer arizangiz ustida ishlamoqda"),
     "callback":  ("Менеджер перезвонит вам в удобное время", "Menejer sizga qulay vaqtda qo'ng'iroq qiladi"),
     "no_answer": ("Не смогли до вас дозвониться — перезвоните нам", "Sizga qo'ng'iroq qila olmadik — bizga qo'ng'iroq qiling"),

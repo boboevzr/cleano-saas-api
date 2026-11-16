@@ -722,6 +722,7 @@ APP_PUSH_STATUS = {   # сушка/упаковка — без уведомле�
     "cancelled": ("Заказ отменён", "Buyurtma bekor qilindi"),
 }
 APP_PUSH_LEAD = {
+    "taken":     ("Менеджер взял вашу заявку и скоро позвонит", "Menejer arizangizni oldi va tez orada qo'ng'iroq qiladi"),
     "contacted": ("Менеджер работает над вашей заявкой", "Menejer arizangiz ustida ishlamoqda"),
     "callback":  ("Менеджер перезвонит вам в удобное время", "Menejer sizga qulay vaqtda qo'ng'iroq qiladi"),
     "no_answer": ("Не смогли до вас дозвониться — перезвоните нам", "Sizga qo'ng'iroq qila olmadik — bizga qo'ng'iroq qiling"),

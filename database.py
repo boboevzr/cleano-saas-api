@@ -3374,7 +3374,8 @@ async def get_client_leads(phone: str, company_id: int):
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, lead_code, status, created_at, updated_at, service, services_json, city, address,
-                   delivery_address, location, delivery_location, pickup_date, pickup_time
+                   delivery_address, location, delivery_location, pickup_date, pickup_time,
+                   (assigned_to IS NOT NULL) AS taken   -- менеджер взял заявку (кто — клиенту не показываем; из ARTEZ 4b057f2)
             FROM leads
             WHERE client_phone=$1 AND company_id=$2 AND status <> 'converted'
               AND created_at > NOW() - INTERVAL '30 days'
