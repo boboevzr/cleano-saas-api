@@ -4363,14 +4363,10 @@ async def get_prices(company_slug: str = None):
     # с размерами — admin видит всё через /api/admin/prices (перенос из ARTEZ 2026-10-17)
     prices = await db.get_public_prices() if await db.get_all_prices() else {}
     if not prices:
-        # Дефолты на случай пустой таблицы
-        prices = {
-            "carpet":      {"standard": {"price": 13000, "unit_key": "m2", "min_order": 10}, "express": {"price": 18000, "unit_key": "m2", "min_order": 10}},
-            "carpet_home": {"standard": {"price": 15000, "unit_key": "m2", "min_order": 10}, "express": {"price": 20000, "unit_key": "m2", "min_order": 10}},
-            "sofa":        {"standard": {"price": 100000, "unit_key": "m2", "min_order": None}, "express": {"price": 150000, "unit_key": "m2", "min_order": None}},
-            "mattress":    {"standard": {"price": 30000, "unit_key": "m2", "min_order": None}, "express": {"price": 40000, "unit_key": "m2", "min_order": None}},
-            "curtains":    {"standard": {"price": 5000,  "unit_key": "m2", "min_order": None}, "express": {"price": 8000,  "unit_key": "m2", "min_order": None}},
-        }
+        # Раньше здесь отдавались «запасные» цены ARTEZ (13 000, 100 000…) — сайт ЛЮБОЙ компании без прайса
+        # показывал их как настоящие. Цены — только из таблицы прайса компании; нет — честно «недоступно»
+        # (перенос из ARTEZ 606fd22, 2026-11-16).
+        raise HTTPException(status_code=503, detail=bi("Прайс временно недоступен", "Narxlar vaqtincha mavjud emas"))
     units = await db.get_all_units()
     units_dict = {u["key"]: dict(u) for u in units}
     return {"ok": True, "prices": prices, "units": units_dict}
@@ -5028,6 +5024,8 @@ async def my_order_items(order_num: str, user = Depends(get_current_user)):
         # Цена по прайсу — клиенту видна его скидка (перенос из ARTEZ 2026-10-10); причина
         # скидки и кто её поставил — внутренние, наружу не отдаются
         "list_price": it.get("list_price"),
+        # единица из снимка прайса: «шт» у дивана/подушки, «м²» у ковра (кабинет, приложение) — из ARTEZ 606fd22
+        "unit_key": it.get("unit_key_snap") or "m2",
     } for it in billing["items"]]
     return {"ok": True, "items": safe, "groups": billing["groups"], "order_total": billing["order_total"]}
 
@@ -10051,6 +10049,20 @@ async def _get_cfg(key: str) -> str:
         return val
     return SITE_SETTINGS_DEFAULTS.get(key, "")
 
+async def _fill_carpet_price(text: str) -> str:
+    """{carpet_price} / {carpet_min_sum} → «15 000» / «150 000» из прайса «Чистка ковра, стандарт» текущей компании."""
+    try:
+        row = (await db.get_public_prices()).get("carpet", {}).get("standard") or {}
+        price = int(row.get("price") or 0)
+        min_total = float(row.get("min_order_total") or 10)
+    except Exception:
+        return text
+    if not price:
+        return text
+    fmt = lambda n: f"{int(round(n)):,}".replace(",", " ")
+    return text.replace("{carpet_price}", fmt(price)).replace("{carpet_min_sum}", fmt(price * min_total))
+
+
 @app.get("/api/settings/site")
 async def get_site_settings(company_slug: str = None):
     # Публичный эндпоинт — соцсети, контакты и ключ карты (не секреты)
@@ -10076,6 +10088,9 @@ async def get_site_settings(company_slug: str = None):
     result = {}
     for key in PUBLIC_KEYS:
         result[key] = await _get_cfg(key)
+    # Цена ковра в правилах приёма — из прайса компании, а не вписана текстом (из ARTEZ 606fd22)
+    if result.get("order_rules") and "{carpet_" in result["order_rules"]:
+        result["order_rules"] = await _fill_carpet_price(result["order_rules"])
 
     # Доступность SMS-регистрации на сайте: ручной тогл + реально настроен Eskiz
     # + на балансе хватает хотя бы на 1 SMS (~1000 сум). Сам баланс/логин/пароль

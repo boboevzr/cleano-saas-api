@@ -157,7 +157,9 @@ def generate_receipt_jpeg(order: dict, items: list[dict], branch_contacts: list[
             draw.text((PAD + 14, y), dims_line, font=f["item_sub"], fill=BLACK)
             y += _measure(draw, dims_line, f["item_sub"])[1] + 6
 
-        price_line = f"{fmt_n(price)} сум/м²" if price else ""
+        # Единица — из снимка прайса позиции: штучные (диван, подушка…) — «сум/шт», не «/м²» (из ARTEZ 606fd22)
+        per = "шт" if (it.get("unit_key_snap") or "m2") == "pcs" else "м²"
+        price_line = f"{fmt_n(price)} сум/{per}" if price else ""
 
         if price_line and total:
             total_line = f"{fmt_n(total)} сум"
