@@ -28,7 +28,7 @@ FIX = {
 }
 
 # Не транслитерируем (как есть)
-_KEEP_WORDS = r"ARTEZ|Artez|Telegram|WhatsApp|Instagram|Click|Payme|Uzum|PLUM|Plum|SmartBill|Face ID|Touch ID|PIN|SMS|ID|OK|QR|GPS|Wi-Fi|Expo|Excel|PDF|Yandex|Google"
+_KEEP_WORDS = r"ARTEZ|Artez|Telegram|WhatsApp|Instagram|Click|Payme|Uzum|PLUM|Plum|SmartBill|Face ID|Touch ID|PIN|SMS|ID|OK|QR|GPS|Wi-Fi|Expo|Excel|PDF|Yandex|Google|Uzcard|UzCard|UZCARD|Humo|HUMO|Visa|VISA|Mastercard|MasterCard"
 _PROTECT = re.compile(
     r"`[^`]*`"                       # Markdown-код
     r"|<code>.*?</code>|<pre>.*?</pre>"
@@ -50,6 +50,7 @@ _MULTI = [("Tsiya", "Ция"), ("tsiya", "ция"), ("tsiy", "ций"), ("ansiya
           ("YA", "Я"), ("Ya", "Я"), ("ya", "я"), ("YE", "Е"), ("Ye", "Е"), ("ye", "е"), ("ʼ", "ъ")]
 _ONE = dict(zip("ABDEFGHIJKLMNOPQRSTUVXYZabdefghijklmnopqrstuvxyz",
                 "АБДЕФГҲИЖКЛМНОПҚРСТУВХЙЗабдефгҳижклмнопқрстувхйз"))
+_ONE.update({"C": "К", "c": "к"})   # «c» в узбекской латинице нет (кроме ch): Call-markaz → Калл-марказ
 _LAT = "A-Za-zʻʼ"
 _WORD = re.compile(rf"[{_LAT}]+")
 
