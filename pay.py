@@ -44,10 +44,12 @@ STALE_PENDING = timedelta(minutes=30)
 OTP_WINDOW = timedelta(minutes=20)
 REVIEW_AFTER = timedelta(hours=24)
 CARD_BRANDS = {"8600": "uzcard", "5614": "uzcard", "9860": "humo"}
-PREPAY_STATUSES = ("new", "confirmed", "pickup", "received")
+# предоплата и в стирке/сушке/упаковке, пока замер не принят (перенос ARTEZ a961cc3)
+PREPAY_STATUSES = ("new", "confirmed", "pickup", "received", "washing", "drying", "packing")
 BALANCE_OPEN_STATUSES = ("received", "washing", "drying", "packing", "ready", "delivery", "delivered")
 MEASURED_OK = ("approved", "confirmed")
 DEFAULTS = {"pay_mode": "off", "pay_prepay_amount": "100000", "pay_otpless_limit": "500000", "pay_notify": "group",
+            "pay_prepay_min": "50000", "pay_prepay_max": "1000000",
             "pay_plum_base_url": "", "pay_plum_login": "", "pay_plum_password": "", "pay_plum_proxy_key": "",
             "pay_plum_prefix": ""}
 SECRET_KEYS = ("pay_plum_password", "pay_plum_proxy_key")
@@ -66,6 +68,7 @@ MSG: dict[str, tuple[str, str]] = {
     "payment_not_waiting": ("Код уже не нужен — обновите экран", "Kod endi kerak emas — sahifani yangilang"),
     "too_many": ("Слишком часто — попробуйте позже", "Juda tez-tez — keyinroq urinib ko'ring"),
     "resend_wait": ("Новый код можно запросить через 2 минуты", "Yangi kodni 2 daqiqadan keyin so'rash mumkin"),
+    "prepay_amount_invalid": ("Сумма предоплаты вне допустимых пределов", "Oldindan to'lov summasi ruxsat etilgan chegaradan tashqarida"),
     "installment_exists": ("Заявка на рассрочку уже отправлена", "Muddatli to'lov arizasi allaqachon yuborilgan"),
     "installment_closed": ("Для этого заказа рассрочка недоступна", "Bu buyurtma uchun muddatli to'lov mavjud emas"),
     "plum_otp_invalid": ("Неверный код из SMS", "SMS kodi noto'g'ri"),
@@ -204,6 +207,11 @@ CREATE TABLE IF NOT EXISTS pay_installments (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_pay_installments_open ON pay_installments(order_id)
     WHERE status IN ('new','in_work');
+CREATE TABLE IF NOT EXISTS pay_net_notice (
+    order_id    INTEGER PRIMARY KEY,
+    net         INTEGER NOT NULL,
+    notified_at TIMESTAMPTZ DEFAULT NOW()
+);
 CREATE TABLE IF NOT EXISTS pay_due_push (
     order_id  INTEGER PRIMARY KEY,
     amount    INTEGER NOT NULL,
@@ -271,6 +279,33 @@ async def prepay_amount(cid: int) -> int:
         return max(1000, int(float(await setting(cid, "pay_prepay_amount"))))
     except ValueError:
         return int(DEFAULTS["pay_prepay_amount"])
+
+
+async def prepay_limits(cid: int) -> tuple[int, int, int]:
+    """(мин, макс, по умолчанию) предоплаты компании — клиент выбирает сумму сам в этих пределах."""
+    def num(v, d):
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return int(d)
+    lo = max(1000, num(await setting(cid, "pay_prepay_min"), DEFAULTS["pay_prepay_min"]))
+    hi = max(lo, num(await setting(cid, "pay_prepay_max"), DEFAULTS["pay_prepay_max"]))
+    return lo, hi, min(max(await prepay_amount(cid), lo), hi)
+
+
+async def prepay_pick(cid: int, requested) -> int:
+    """Сумма предоплаты клиента: пусто — по умолчанию; иначе в пределах компании, кратно 1000 (вниз)."""
+    lo, hi, default = await prepay_limits(cid)
+    if requested in (None, "", 0, "0"):
+        return default
+    try:
+        v = int(float(str(requested).replace(" ", "")))
+    except ValueError:
+        raise PayError("prepay_amount_invalid", 422)
+    v -= v % 1000
+    if v < lo or v > hi:
+        raise PayError("prepay_amount_invalid", 422)
+    return v
 
 
 async def plum_conf(cid: int) -> dict:
@@ -451,8 +486,22 @@ async def order_pay_info(order: dict, user) -> dict:
     async with db.pool.acquire() as c:
         inst = await c.fetchrow("SELECT id, status FROM pay_installments WHERE order_id=$1 AND company_id=$2 "
                                 "ORDER BY id DESC LIMIT 1", order["id"], cid)
+        prow = await c.fetch(
+            "SELECT amount, method, purpose, created_at FROM order_payments WHERE order_id=$1 "
+            "AND NOT (confirmed=FALSE AND confirmed_at IS NOT NULL) ORDER BY created_at, id", order["id"])
+    method_pub = {"cash": "cash", "card": "card", "transfer": "transfer", "online": "online", "online_test": "online"}
+    payments = [{"amount": int(float(p["amount"] or 0)), "method": method_pub.get(p["method"] or "", "other"),
+                 "kind": "refund" if float(p["amount"] or 0) < 0 else ("prepay" if p["purpose"] == "prepayment" else "balance"),
+                 "created_at": p["created_at"].isoformat() if p["created_at"] else None} for p in prow]
+    discounts = {k: int(float(order.get(k) or 0)) for k in ("client_discount", "discount_sum", "delivery_discount", "manual_discount")}
+    discounts["client_discount_pct"] = float(order.get("client_discount_pct") or 0)
+    discounts["client_discount_kind"] = order.get("client_discount_kind")
+    lo, hi, _d = await prepay_limits(cid)
     return {
         "ok": True, "order_num": order["order_num"], "status": st,
+        "over": (max(0, m["paid"]) if st == "cancelled"
+                 else max(0, m["paid"] - m["net"]) if (m["measured"] or st in ("ready", "delivery", "delivered")) else 0),
+        "discounts": discounts, "payments": payments, "prepay_min": lo, "prepay_max": hi,
         "enabled": bank is not None, "test_bank": bank == "test",
         "net": m["net"], "paid": m["paid"], "due": m["due"], "measured": m["measured"],
         "can_pay": bool(bank) and can_balance, "can_prepay": bool(bank) and can_prepay, "prepay_amount": pre,
@@ -475,16 +524,16 @@ async def _rate(cid: int, user_id: int) -> None:
 
 
 async def start(user, *, order: dict | None = None, lead: dict | None = None, purpose: str,
-                card: dict | None = None, card_id: int | None = None, lang: str = "ru") -> dict:
+                card: dict | None = None, card_id: int | None = None, lang: str = "ru", amount_req=None) -> dict:
     bank, conf = await bank_for(user)
     if not bank:
         raise PayError("payments_disabled", 403)
     with plum.using(conf, bank == "test"):
         return await _start(user, order=order, lead=lead, purpose=purpose, card=card, card_id=card_id,
-                            lang=lang, is_test=bank == "test")
+                            lang=lang, is_test=bank == "test", amount_req=amount_req)
 
 
-async def _start(user, *, order, lead, purpose, card, card_id, lang, is_test) -> dict:
+async def _start(user, *, order, lead, purpose, card, card_id, lang, is_test, amount_req=None) -> dict:
     cid = int(user["company_id"] or 1)
     await _rate(cid, user["id"])
     saved = None
@@ -523,13 +572,13 @@ async def _start(user, *, order, lead, purpose, card, card_id, lang, is_test) ->
         if purpose == "prepay":
             if not info["can_prepay"]:
                 raise PayError("prepay_unavailable", 409)
-            amount = info["prepay_amount"]
+            amount = await prepay_pick(cid, amount_req)
         else:
             if not info["can_pay"]:
                 raise PayError("nothing_to_pay" if info["measured"] or info["due"] < 1000 else "not_measured", 409)
             amount = info["due"]
     else:
-        amount = await prepay_amount(cid)
+        amount = await prepay_pick(cid, amount_req)
         async with db.pool.acquire() as c:
             done = await c.fetchval("SELECT COUNT(*) FROM pay_tx WHERE lead_id=$1 AND kind='pay' AND purpose='prepay' "
                                     "AND status IN ('paid','refunded','review')", lead["id"])
@@ -1052,7 +1101,7 @@ async def _due_pushes() -> None:
             if not user or not (await bank_for(user))[0]:
                 continue
             m = await money(o)
-            if m["due"] < 1000 or last == m["due"] or m["open_tx"]:
+            if m["due"] < 1000 or last == m["due"] or m["open_tx"] or m["paid"] > 0:
                 continue
             async with db.pool.acquire() as c:
                 await c.execute("INSERT INTO pay_due_push (order_id, amount, sent_at) VALUES ($1,$2,NOW()) "
@@ -1093,6 +1142,7 @@ async def worker() -> None:
             await _attach_lead_prepays()
             await _check_pending_refunds()
             await _due_pushes()
+            await _net_change_notices()
             async with db.pool.acquire() as c:
                 await c.execute("DELETE FROM pay_card_binds WHERE created_at < NOW() - INTERVAL '1 day'")
         except Exception as e:
@@ -1135,7 +1185,9 @@ def _card_body(body: dict) -> tuple[dict | None, int | None]:
 async def api_config(user=Depends(_user)):
     bank, _ = await bank_for(user)
     cid = int(user["company_id"] or 1)
-    return {"ok": True, "enabled": bank is not None, "test_bank": bank == "test", "prepay_amount": await prepay_amount(cid)}
+    lo, hi, _d = await prepay_limits(cid)
+    return {"ok": True, "enabled": bank is not None, "test_bank": bank == "test", "prepay_amount": await prepay_amount(cid),
+            "prepay_min": lo, "prepay_max": hi}
 
 
 @router.get("/api/pay/orders/{order_num}")
@@ -1149,7 +1201,8 @@ async def api_order_pay(order_num: str, body: dict = Body({}), user=Depends(_use
     card, card_id = _card_body(body)
     purpose = "prepay" if body.get("purpose") == "prepay" else "balance"
     try:
-        return await start(user, order=order, purpose=purpose, card=card, card_id=card_id, lang=body.get("lang") or "ru")
+        return await start(user, order=order, purpose=purpose, card=card, card_id=card_id, lang=body.get("lang") or "ru",
+                           amount_req=body.get("amount") if purpose == "prepay" else None)
     except PayError as e:
         raise _http(e) from None
 
@@ -1162,7 +1215,9 @@ async def api_lead(code: str, user=Depends(_user)):
         done = await c.fetchrow("SELECT id, status, amount FROM pay_tx WHERE lead_id=$1 AND kind='pay' AND purpose='prepay' "
                                 "AND status IN ('paid','refunded','review','pending','otp') ORDER BY id DESC LIMIT 1", lead["id"])
     return {"ok": True, "lead_code": lead.get("lead_code"), "enabled": bank is not None, "test_bank": bank == "test",
-            "prepay_amount": await prepay_amount(int(user["company_id"] or 1)), "prepay": dict(done) if done else None,
+            "prepay_amount": await prepay_amount(int(user["company_id"] or 1)),
+            "prepay_min": (await prepay_limits(int(user["company_id"] or 1)))[0], "prepay_max": (await prepay_limits(int(user["company_id"] or 1)))[1],
+            "prepay": dict(done) if done else None,
             "can_prepay": bank is not None and not done and lead["status"] not in ("converted", "lost")}
 
 
@@ -1173,7 +1228,8 @@ async def api_lead_pay(code: str, body: dict = Body({}), user=Depends(_user)):
         raise _http(PayError("prepay_unavailable", 409))
     card, card_id = _card_body(body)
     try:
-        return await start(user, lead=lead, purpose="prepay", card=card, card_id=card_id, lang=body.get("lang") or "ru")
+        return await start(user, lead=lead, purpose="prepay", card=card, card_id=card_id, lang=body.get("lang") or "ru",
+                           amount_req=body.get("amount"))
     except PayError as e:
         raise _http(e) from None
 
@@ -1278,7 +1334,9 @@ async def _settings_out(a: dict) -> dict:
     cid = a["cid"]
     conf = await plum_conf(cid)
     login = conf["login"]
+    lo, hi, _d = await prepay_limits(cid)
     return {"ok": True, "mode": await setting(cid, "pay_mode"), "prepay_amount": await prepay_amount(cid),
+            "prepay_min": lo, "prepay_max": hi,
             "otpless_limit": int(float(await setting(cid, "pay_otpless_limit"))), "notify": await setting(cid, "pay_notify"),
             "base_url": conf["base_url"], "login": login,
             "password_set": bool(conf["password"]), "proxy_key_set": bool(conf["proxy_key"]),
@@ -1319,7 +1377,8 @@ async def adm_settings_put(body: dict = Body({}), a=Depends(_admin)):
         if body["mode"] == "all" and not plum.conf_ready(await plum_conf(cid)):
             raise HTTPException(400, "Сначала заполните адрес, логин и пароль PLUM — «для всех» без них включить нельзя")
         await put("pay_mode", body["mode"]); changes.append(f"mode={body['mode']}")
-    for key, cfg, lo in (("prepay_amount", "pay_prepay_amount", 1000), ("otpless_limit", "pay_otpless_limit", 0)):
+    for key, cfg, lo in (("prepay_amount", "pay_prepay_amount", 1000), ("otpless_limit", "pay_otpless_limit", 0),
+                         ("prepay_min", "pay_prepay_min", 1000), ("prepay_max", "pay_prepay_max", 1000)):
         if key in body:
             try:
                 v = int(float(body[key]))
@@ -1618,3 +1677,96 @@ async def adm_refund_perm(staff_id: int, body: dict = Body({}), a=Depends(_admin
         raise HTTPException(404, "Сотрудник не найден")
     await _log(a["cid"], a["name"], "refund_perm", f"staff {staff_id} → {on}")
     return {"ok": True, "value": on}
+
+
+# ══════════════════════════════════════
+#  Итог заказа изменился ПОСЛЕ оплаты — клиенту push + Telegram ботом компании (перенос ARTEZ a961cc3)
+# ══════════════════════════════════════
+NET_NOTICE_MIN = 1000
+
+
+async def _client_say(order: dict, ru: str, uz: str) -> None:
+    import main
+    cid = int(order.get("company_id") or 1)
+    phone = order.get("client_phone") or ""
+    num = order.get("order_num") or ""
+    try:
+        import app_api
+        lt = app_api._lang_text
+    except Exception:
+        lt = lambda code, r, u: r if code == "ru" else u  # noqa: E731
+    if hasattr(main, "_expo_send") and phone:
+        try:
+            async with db.pool.acquire() as c:
+                if await c.fetchval("SELECT to_regclass('public.app_push_tokens') IS NOT NULL"):
+                    tokens = await c.fetch(
+                        "SELECT t.token, t.lang FROM app_push_tokens t JOIN users u ON u.id=t.subject_id AND u.company_id=t.company_id "
+                        "WHERE t.kind='client' AND t.revoked_at IS NULL AND t.company_id=$1 AND u.phone=$2", cid, phone)
+                else:
+                    tokens = []
+            if tokens:
+                await main._expo_send([{
+                    "to": t["token"], "sound": "default", "priority": "high", "channelId": "default",
+                    "title": lt(t["lang"], f"Заказ №{num}", f"Buyurtma №{num}"), "body": lt(t["lang"], ru, uz),
+                    "data": {"kind": "pay_change", "order_num": num},
+                } for t in tokens])
+        except Exception as e:
+            log.warning("net notice push %s: %s", num, type(e).__name__)
+    try:
+        tg, lang = await main._lead_client_tg({"client_phone": phone}, cid)
+        if tg:
+            cyr = getattr(main, "_to_cyrl_lead", lambda x: x)
+            body = ru if lang == "ru" else (cyr(uz) if lang == "uz_cyrl" else uz)
+            head = f"Заказ №{num}" if lang == "ru" else (cyr(f"Buyurtma №{num}") if lang == "uz_cyrl" else f"Buyurtma №{num}")
+            await main._send_client_tg(cid, tg, f"<b>{html.escape(head)}</b>\n{html.escape(body)}")
+    except Exception as e:
+        log.warning("net notice tg %s: %s", num, type(e).__name__)
+
+
+async def _net_change_notices() -> None:
+    """Заказы с внесёнными деньгами и принятым замером: итог изменился больше чем на 1000 — сообщить клиенту
+    (его компании ботом). Первый раз только запоминаем итог. Доставленные/отменённые не трогаем."""
+    async with db.pool.acquire() as c:
+        rows = await c.fetch(
+            """SELECT o.* FROM orders o
+                WHERE o.status <> ALL($1::text[]) AND o.created_at > NOW() - INTERVAL '60 days'
+                  AND EXISTS (SELECT 1 FROM order_payments p WHERE p.order_id=o.id AND p.amount > 0
+                               AND NOT (p.confirmed=FALSE AND p.confirmed_at IS NOT NULL))
+                  AND EXISTS (SELECT 1 FROM order_items i WHERE i.order_id=o.id)
+                  AND NOT EXISTS (SELECT 1 FROM order_items i WHERE i.order_id=o.id
+                                   AND COALESCE(i.measure_status,'pending') <> ALL($2::text[]))
+                LIMIT 300""",
+            ["delivered", "cancelled"], list(MEASURED_OK))
+    for o in rows:
+        o = dict(o)
+        try:
+            m = await money(o)
+            if m["paid"] <= 0:
+                continue
+            async with db.pool.acquire() as c:
+                last = await c.fetchval("SELECT net FROM pay_net_notice WHERE order_id=$1", o["id"])
+                if last is None:
+                    await c.execute("INSERT INTO pay_net_notice (order_id, net) VALUES ($1,$2) ON CONFLICT (order_id) DO NOTHING",
+                                    o["id"], m["net"])
+                    continue
+                if abs(m["net"] - last) <= NET_NOTICE_MIN:
+                    continue
+                moved = await c.fetchval("UPDATE pay_net_notice SET net=$2, notified_at=NOW() WHERE order_id=$1 AND net=$3 RETURNING order_id",
+                                         o["id"], m["net"], last)
+            if not moved:
+                continue
+            over = m["paid"] - m["net"]
+            if m["due"] >= 1000:
+                ru = f"Сумма заказа изменилась: теперь {_fmt(m['net'])} сум. Доплата {_fmt(m['due'])} сум — можно картой в приложении или курьеру"
+                uz = f"Buyurtma summasi o'zgardi: endi {_fmt(m['net'])} so'm. Qo'shimcha to'lov {_fmt(m['due'])} so'm — ilovada karta bilan yoki kuryerga"
+            elif over >= 1000:
+                ru = f"Сумма заказа изменилась: теперь {_fmt(m['net'])} сум. Вы внесли больше — вернём вам {_fmt(over)} сум"
+                uz = f"Buyurtma summasi o'zgardi: endi {_fmt(m['net'])} so'm. Siz ko'proq to'lagansiz — {_fmt(over)} so'm qaytaramiz"
+            else:
+                ru = f"Сумма заказа изменилась: теперь {_fmt(m['net'])} сум. Всё оплачено"
+                uz = f"Buyurtma summasi o'zgardi: endi {_fmt(m['net'])} so'm. Hammasi to'langan"
+            await _client_say(o, ru, uz)
+            if over >= 1000:
+                await notify(int(o["company_id"] or 1), f"↩️ Переплата {_fmt(over)} сум — заказ {o['order_num']}: итог изменился после оплаты. Админка → 💳 Оплаты → «Кому вернуть»")
+        except Exception as e:
+            log.warning("net notice %s: %s", o.get("id"), type(e).__name__)
