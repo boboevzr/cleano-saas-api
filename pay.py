@@ -1608,7 +1608,7 @@ async def _refund_staff(authorization: str = Header(None)) -> dict:
     import main
     staff = await main.get_current_staff(authorization)
     if not (staff.get("role") == "admin" or staff.get("sub") == "admin" or staff.get("can_refund_prepay")):
-        raise HTTPException(403, "Нет права на возврат предоплаты — включается в карточке сотрудника")
+        raise HTTPException(403, "Нет права «Возвраты на карту» — включается в карточке сотрудника (🔐 Доступы)")
     name = " ".join(filter(None, [staff.get("first_name"), staff.get("last_name")])) or staff.get("login") or "сотрудник"
     return {"name": name, "id": staff.get("id"), "cid": int(staff.get("company_id") or 1)}
 
@@ -1617,7 +1617,8 @@ async def _refund_staff(authorization: str = Header(None)) -> dict:
 async def staff_prepay(lead_id: int = 0, order_id: int = 0, s=Depends(_refund_staff)):
     if not (lead_id or order_id):
         raise HTTPException(400, "lead_id или order_id")
-    q = ("SELECT * FROM pay_tx WHERE kind='pay' AND purpose='prepay' AND status IN ('paid','refunded') AND company_id=$2 AND "
+    # 16.11: любая онлайн-оплата заказа (предоплата и окончательный расчёт), у заявки — предоплата; только своя компания
+    q = ("SELECT * FROM pay_tx WHERE kind='pay' AND status IN ('paid','refunded') AND company_id=$2 AND "
          + ("order_id=$1" if order_id else "lead_id=$1") + " ORDER BY id")
     async with db.pool.acquire() as c:
         rows = await c.fetch(q, order_id or lead_id, s["cid"])
@@ -1627,6 +1628,7 @@ async def staff_prepay(lead_id: int = 0, order_id: int = 0, s=Depends(_refund_st
                                     "AND status IN ('paid','manual','pending')", t["id"])
             left = int(t["amount"]) - int(back or 0)
             out.append({"id": t["id"], "amount": t["amount"], "left": left, "card_mask": t["card_mask"], "is_test": t["is_test"],
+                        "purpose": t["purpose"],
                         "created_at": t["created_at"].isoformat(),
                         "can_reverse": bool(t["plum_tx_id"]) and t["status"] == "paid" and int(back or 0) == 0
                                        and _tash_day(t["created_at"]) == _tash_day(_now())})
@@ -1635,9 +1637,9 @@ async def staff_prepay(lead_id: int = 0, order_id: int = 0, s=Depends(_refund_st
 
 async def _staff_tx(tx_id: int, cid: int) -> dict:
     async with db.pool.acquire() as c:
-        t = await c.fetchrow("SELECT * FROM pay_tx WHERE id=$1 AND company_id=$2 AND kind='pay' AND purpose='prepay'", tx_id, cid)
+        t = await c.fetchrow("SELECT * FROM pay_tx WHERE id=$1 AND company_id=$2 AND kind='pay'", tx_id, cid)
     if not t:
-        raise HTTPException(404, "Предоплата не найдена")
+        raise HTTPException(404, "Оплата не найдена")
     return dict(t)
 
 
@@ -1648,7 +1650,7 @@ async def staff_reverse(tx_id: int, s=Depends(_refund_staff)):
         r = await reverse_tx(tx_id, actor=s["name"], reason="staff", cid=s["cid"])
     except PayError as e:
         raise _http(e) from None
-    await notify(s["cid"], f"↩️ Предоплата возвращена на карту — {s['name']}")
+    await notify(s["cid"], f"↩️ Онлайн-оплата возвращена на карту — {s['name']} · pay_tx {tx_id}")
     return r
 
 
@@ -1663,7 +1665,7 @@ async def staff_manual_refund(tx_id: int, body: dict = Body({}), s=Depends(_refu
         r = await manual_refund(s["cid"], tx_id, amount, str(body.get("note") or "")[:300], s["name"])
     except PayError as e:
         raise _http(e) from None
-    await notify(s["cid"], f"↩️ Предоплата {amount:,} сум отмечена «вернули вручную» — {s['name']}".replace(",", " "))
+    await notify(s["cid"], f"↩️ Онлайн-оплата {amount:,} сум отмечена «вернули вручную» — {s['name']}".replace(",", " "))
     return r
 
 
