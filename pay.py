@@ -1033,7 +1033,7 @@ async def _due_pushes() -> None:
         rows = await c.fetch(
             """SELECT DISTINCT o.* FROM orders o
                  JOIN users u ON u.phone = o.client_phone AND u.company_id = o.company_id
-                 JOIN app_push_tokens t ON t.kind='client' AND t.subject_id = u.id AND t.revoked_at IS NULL
+                 JOIN app_push_tokens t ON t.kind='client' AND t.subject_id = u.id AND t.company_id = o.company_id AND t.revoked_at IS NULL
                 WHERE o.status = ANY($1::text[]) AND o.created_at > NOW() - INTERVAL '60 days'
                   AND EXISTS (SELECT 1 FROM order_items i WHERE i.order_id=o.id)
                   AND NOT EXISTS (SELECT 1 FROM order_items i WHERE i.order_id=o.id
@@ -1046,8 +1046,8 @@ async def _due_pushes() -> None:
             async with db.pool.acquire() as c:
                 user = await c.fetchrow("SELECT * FROM users WHERE phone=$1 AND company_id=$2", o["client_phone"], o["company_id"])
                 last = await c.fetchval("SELECT amount FROM pay_due_push WHERE order_id=$1", o["id"])
-                tokens = await c.fetch("SELECT token, lang FROM app_push_tokens WHERE kind='client' AND subject_id=$1 "
-                                       "AND revoked_at IS NULL", user["id"]) if user else []
+                tokens = await c.fetch("SELECT token, lang FROM app_push_tokens WHERE kind='client' AND subject_id=$1 AND company_id=$2 "
+                                       "AND revoked_at IS NULL", user["id"], o["company_id"]) if user else []
             if not user or not (await bank_for(user))[0]:
                 continue
             m = await money(o)
@@ -1509,3 +1509,23 @@ async def add_prepaid(leads: list[dict]) -> list[dict]:
     except Exception as e:  # метка не должна ломать список заявок
         log.warning("add_prepaid: %s", type(e).__name__)
     return leads
+
+
+# ══════════════════════════════════════
+#  Удаление аккаунта клиента из приложения — убрать его сохранённые карты (app_api.py, 16.11)
+# ══════════════════════════════════════
+async def delete_all_cards(company_id: int, user_id: int) -> None:
+    """Карты клиента своей компании — пометить удалёнными у нас и отвязать в банке (тот банк, где привязали)."""
+    async with db.pool.acquire() as c:
+        rows = await c.fetch("UPDATE pay_cards SET deleted_at=NOW() WHERE company_id=$1 AND user_id=$2 AND deleted_at IS NULL "
+                             "RETURNING *", company_id, user_id)
+    if not rows:
+        return
+    conf = await plum_conf(company_id)
+    for k in rows:
+        if k["plum_binding_id"]:
+            with plum.using(conf, k["is_test"]):
+                try:
+                    await plum.delete_card(k["plum_binding_id"])
+                except plum.PlumError:
+                    pass
