@@ -5903,18 +5903,24 @@ async def admin_change_order_status(order_id: int, staff=Depends(get_current_sta
             if tmpl and tmpl.get("enabled"):
                 # Язык клиента — только в рамках ЕГО компании (раньше искали по tg_id
                 # во всех компаниях: один человек в двух компаниях получал чужой язык)
+                # Язык выбирают в боте → clients.lang ("ru" | "uz" | "uzc" — Ўзбекча, кирилл).
+                # Колонку language никто не пишет — из-за этого до 16.11.2026 всем шло RU.
                 lang = "ru"
+                cyrl = False
                 try:
                     async with db.pool.acquire() as _c:
                         row = await _c.fetchrow(
-                            "SELECT language FROM clients WHERE tg_id=$1 AND company_id=$2",
+                            "SELECT COALESCE(NULLIF(lang,''), language) AS l FROM clients WHERE tg_id=$1 AND company_id=$2",
                             int(tg_id), order_cid)
-                        if row and row["language"] in ("uz", "ru"):
-                            lang = row["language"]
+                        if row and row["l"] in ("uz", "ru", "uzc"):
+                            lang = "uz" if row["l"] == "uzc" else row["l"]
+                            cyrl = row["l"] == "uzc"
                 except Exception:
                     pass
 
                 raw = tmpl.get(f"message_{lang}") or tmpl.get("message_ru") or ""
+                if lang == "uz" and not tmpl.get("message_uz"):
+                    lang, cyrl = "ru", False   # узбекский шаблон не заполнен — шлём русский
                 if raw:
                     STATUS_EMOJI = {
                         "new":"🆕","confirmed":"✅","pickup":"🚗","received":"📦",
@@ -5927,9 +5933,15 @@ async def admin_change_order_status(order_id: int, staff=Depends(get_current_sta
                         "packing":"Упаковка","ready":"Готов","delivery":"Доставка",
                         "delivered":"Доставлен","cancelled":"Отменён",
                     }
+                    STATUS_NAME_UZ = {
+                        "new":"Yangi","confirmed":"Tasdiqlandi","pickup":"Olib ketish",
+                        "received":"Ustaxonada","washing":"Yuvilmoqda","drying":"Quritilmoqda",
+                        "packing":"Qadoqlanmoqda","ready":"Tayyor","delivery":"Yetkazilmoqda",
+                        "delivered":"Yetkazildi","cancelled":"Bekor qilindi",
+                    }
                     text = raw.format(
                         order_num  = order.get("order_num", ""),
-                        status     = STATUS_NAME_RU.get(status, status),
+                        status     = (STATUS_NAME_UZ if lang == "uz" else STATUS_NAME_RU).get(status, status),
                         status_emoji = STATUS_EMOJI.get(status, ""),
                         client_name  = order.get("client_first_name", ""),
                         service      = order.get("service", ""),
@@ -5937,6 +5949,9 @@ async def admin_change_order_status(order_id: int, staff=Depends(get_current_sta
                         pickup_date  = str(order.get("pickup_date", "") or ""),
                         phone        = order.get("client_phone", ""),
                     )
+                    if cyrl:
+                        from translit import to_cyrl
+                        text = to_cyrl(text)
                     res = await _send_client_tg(order_cid, tg_id, text)
                     try:
                         # В историю — по факту доставки (раньше «отправлено» писалось всегда)
