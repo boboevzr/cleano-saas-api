@@ -55,7 +55,7 @@ import time as _time
 from contextvars import ContextVar
 
 from aiogram import Router, F, BaseMiddleware
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
     Message, CallbackQuery, BufferedInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton,
@@ -1394,7 +1394,7 @@ async def cmd_menu(message: Message, company_id: int, state: FSMContext) -> None
 
 
 @router.message(CommandStart())
-async def start(message: Message, company_id: int, state: FSMContext) -> None:
+async def start(message: Message, company_id: int, state: FSMContext, command: CommandObject | None = None) -> None:
     await state.clear()
     uid = message.from_user.id
     lang = await _resolve_lang(uid, company_id, state)
@@ -1412,6 +1412,12 @@ async def start(message: Message, company_id: int, state: FSMContext) -> None:
 
     if lang:
         await state.update_data(lang=lang)
+        # Deep link /start operator — из приложения «Написать оператору» (перенос из ARTEZ 3382db1): клиент, уже
+        # выбравший язык, сразу попадает в чат с оператором (как кнопка «Оператор»); новый — обычное приветствие
+        if command and (command.args or "").strip() == "operator":
+            await state.set_state(OperatorForm.message)
+            await message.answer(t(lang, "operator_text"), reply_markup=cancel_kb(lang))
+            return
         await _show_menu(message, lang, company_id, uid)
     else:
         await message.answer(t("ru", "hello"), reply_markup=lang_kb())
