@@ -3150,6 +3150,8 @@ async def update_user_password(user_id: int, password_hash: str):
         await conn.execute("""
             UPDATE users SET password_hash=$2, must_change_password=FALSE, updated_at=NOW() WHERE id=$1
         """, user_id, password_hash)
+    # Пароль сменили/сбросили — входы по Face ID на сайте больше не действуют (ARTEZ 3fb6596)
+    await passkeys_revoke_user(user_id)
 
 async def get_all_site_users(search: str = "", limit: int = 500):
     if not pool: return []
@@ -12820,3 +12822,101 @@ async def delete_kb_article(article_id: int) -> bool:
     async with pool.acquire() as conn:
         result = await conn.execute("DELETE FROM kb_articles WHERE id=$1", article_id)
         return result != "DELETE 0"
+
+
+# ══════════════════════════════════════
+#  Passkey (Face ID на сайте компании) — перенос из ARTEZ 0d54817 (16.11.2026)
+#  Хранится только открытый ключ; закрытый не покидает телефон. Вызовы — одноразовые, 5 минут.
+#  company_id + rp_id: ключ компании A не подходит для входа в компанию B.
+# ══════════════════════════════════════
+async def ensure_passkey_tables():
+    if not pool: return
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS passkeys (
+                id            BIGSERIAL PRIMARY KEY,
+                user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                company_id    INTEGER NOT NULL,
+                rp_id         TEXT NOT NULL,
+                credential_id TEXT NOT NULL UNIQUE,
+                public_key    BYTEA NOT NULL,
+                sign_count    BIGINT NOT NULL DEFAULT 0,
+                name          TEXT,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_used_at  TIMESTAMPTZ,
+                revoked_at    TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS idx_passkeys_user ON passkeys(user_id) WHERE revoked_at IS NULL;
+            CREATE TABLE IF NOT EXISTS passkey_challenges (
+                id         BIGSERIAL PRIMARY KEY,
+                user_id    INTEGER,
+                company_id INTEGER NOT NULL,
+                purpose    VARCHAR(10) NOT NULL,
+                challenge  TEXT NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                used_at    TIMESTAMPTZ
+            );
+        """)
+
+
+async def passkey_challenge_save(purpose: str, challenge: str, user_id: int | None, company_id: int) -> int:
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM passkey_challenges WHERE expires_at < NOW() - INTERVAL '1 hour'")
+        return await conn.fetchval(
+            "INSERT INTO passkey_challenges (user_id, company_id, purpose, challenge, expires_at) "
+            "VALUES ($1,$2,$3,$4, NOW() + INTERVAL '5 minutes') RETURNING id", user_id, company_id, purpose, challenge)
+
+
+async def passkey_challenge_take(challenge_id: int, purpose: str, user_id: int | None, company_id: int) -> str | None:
+    """Одноразово забрать вызов (не истёк, та же цель, та же компания, тот же пользователь для регистрации)."""
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "UPDATE passkey_challenges SET used_at=NOW() WHERE id=$1 AND purpose=$2 AND used_at IS NULL "
+            "AND expires_at > NOW() AND user_id IS NOT DISTINCT FROM $3 AND company_id=$4 RETURNING challenge",
+            challenge_id, purpose, user_id, company_id)
+
+
+async def passkey_add(user_id: int, company_id: int, rp_id: str, credential_id: str, public_key: bytes,
+                      sign_count: int, name: str | None) -> int:
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "INSERT INTO passkeys (user_id, company_id, rp_id, credential_id, public_key, sign_count, name) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (credential_id) DO NOTHING RETURNING id",
+            user_id, company_id, rp_id, credential_id, public_key, sign_count, (name or "")[:60] or None)
+
+
+async def passkey_by_credential(credential_id: str, company_id: int) -> dict | None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM passkeys WHERE credential_id=$1 AND company_id=$2 AND revoked_at IS NULL",
+                                  credential_id, company_id)
+        return dict(row) if row else None
+
+
+async def passkey_used(passkey_id: int, sign_count: int):
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE passkeys SET sign_count=$2, last_used_at=NOW() WHERE id=$1", passkey_id, sign_count)
+
+
+async def passkeys_of_user(user_id: int) -> list[dict]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, credential_id, name, created_at, last_used_at FROM passkeys "
+            "WHERE user_id=$1 AND revoked_at IS NULL ORDER BY created_at", user_id)
+        return [dict(r) for r in rows]
+
+
+async def passkey_revoke(user_id: int, passkey_id: int) -> bool:
+    async with pool.acquire() as conn:
+        res = await conn.execute("UPDATE passkeys SET revoked_at=NOW() WHERE id=$1 AND user_id=$2 "
+                                 "AND revoked_at IS NULL", passkey_id, user_id)
+        return res.endswith(" 1")
+
+
+async def passkeys_revoke_user(user_id: int) -> None:
+    """Пароль сменили/сбросили — все Face ID этого аккаунта на сайте отключаются (ARTEZ 3fb6596)."""
+    if not pool: return
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute("UPDATE passkeys SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL", user_id)
+        except Exception:
+            pass   # таблицы ещё нет (до первого запуска ensure_passkey_tables)

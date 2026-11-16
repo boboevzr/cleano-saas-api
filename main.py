@@ -146,6 +146,7 @@ async def startup():
     await db.ensure_chat_tables()
     await db.ensure_chat_templates()
     await db.ensure_expense_tables()
+    await db.ensure_passkey_tables()   # Face ID на сайте компании (16.11.2026)
     await db.ensure_salary_ledger_table()
     asyncio.create_task(_tg_reminder_worker())
     asyncio.create_task(_salary_accrual_worker())
@@ -6351,6 +6352,139 @@ async def _company_site_domain(company_id: int) -> str:
     if slug == "artez":
         return "artez.uz"
     return f"{slug}.cleano.uz" if slug else "cleano.uz"
+
+
+# ══════════════════════════════════════
+#  САЙТ КОМПАНИИ: вход по Face ID / отпечатку — passkey (WebAuthn)
+#  Перенос из ARTEZ 0d54817/3fb6596/ba1e1e8 (16.11.2026). У каждой компании свой сайт — свой RP:
+#  {slug}.cleano.uz (artez → artez.uz). Ключ хранится с company_id и RP; вход — только в свою компанию.
+# ══════════════════════════════════════
+async def _passkey_rp(company_id: int) -> tuple[str, list[str]]:
+    # Только для локальных тестов (на сервере не задаётся): PASSKEY_RP_OVERRIDE=localhost,
+    # PASSKEY_ORIGINS_OVERRIDE=http://localhost:8097 — как PASSKEY_RP_ID/PASSKEY_ORIGINS в ARTEZ.
+    if os.getenv("PASSKEY_RP_OVERRIDE"):
+        return os.environ["PASSKEY_RP_OVERRIDE"], [o.strip() for o in os.getenv("PASSKEY_ORIGINS_OVERRIDE", "").split(",") if o.strip()]
+    domain = await _company_site_domain(company_id)
+    return domain, [f"https://{domain}", f"https://www.{domain}"]
+
+
+def _passkey_err(e: Exception):
+    logging.warning(f"passkey verify failed: {type(e).__name__}: {e}")
+    raise HTTPException(400, bi("Не удалось подтвердить Face ID. Попробуйте ещё раз",
+                                "Face ID tasdiqlanmadi. Qayta urinib ko'ring"))
+
+
+@app.post("/api/passkey/register/options")
+async def passkey_register_options(user=Depends(get_current_user)):
+    import webauthn
+    from webauthn.helpers.structs import (AuthenticatorSelectionCriteria, ResidentKeyRequirement,
+                                          UserVerificationRequirement, PublicKeyCredentialDescriptor)
+    from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
+    cid = user.get("company_id") or 1
+    rp_id, _ = await _passkey_rp(cid)
+    have = await db.passkeys_of_user(user["id"])
+    company_name = await db.pool.fetchval("SELECT name FROM companies WHERE id=$1", cid) if db.pool else None
+    opts = webauthn.generate_registration_options(
+        rp_id=rp_id, rp_name=(company_name or rp_id)[:60], user_id=str(user["id"]).encode(),
+        user_name=user["phone"], user_display_name=user.get("first_name") or user["phone"],
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            resident_key=ResidentKeyRequirement.REQUIRED, user_verification=UserVerificationRequirement.REQUIRED),
+        exclude_credentials=[PublicKeyCredentialDescriptor(id=base64url_to_bytes(p["credential_id"])) for p in have])
+    ch = await db.passkey_challenge_save("register", bytes_to_base64url(opts.challenge), user["id"], cid)
+    return {"ok": True, "challenge_id": ch, "options": _json.loads(webauthn.options_to_json(opts))}
+
+
+@app.post("/api/passkey/register/verify")
+async def passkey_register_verify(body: dict, user=Depends(get_current_user)):
+    import webauthn
+    from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
+    cid = user.get("company_id") or 1
+    challenge = await db.passkey_challenge_take(int(body.get("challenge_id") or 0), "register", user["id"], cid)
+    if not challenge:
+        raise HTTPException(400, bi("Время вышло — нажмите ещё раз", "Vaqt tugadi — qayta bosing"))
+    rp_id, origins = await _passkey_rp(cid)
+    try:
+        v = webauthn.verify_registration_response(
+            credential=body.get("credential"), expected_challenge=base64url_to_bytes(challenge),
+            expected_rp_id=rp_id, expected_origin=origins, require_user_verification=True)
+    except Exception as e:
+        _passkey_err(e)
+    pid = await db.passkey_add(user["id"], cid, rp_id, bytes_to_base64url(v.credential_id), v.credential_public_key,
+                               v.sign_count, str(body.get("name") or "")[:60])
+    if not pid:
+        raise HTTPException(400, bi("Этот Face ID уже подключён", "Bu Face ID allaqachon ulangan"))
+    if user.get("tg_id"):   # чтобы чужое подключение не прошло незаметно (без текста пользователя — ARTEZ ba1e1e8)
+        asyncio.create_task(_send_client_tg(cid, int(user["tg_id"]),
+            "🔐 К вашему аккаунту подключён вход по Face ID / отпечатку.\n"
+            "Если это были не вы — смените пароль на сайте: все входы по Face ID отключатся."))
+    return {"ok": True, "id": pid}
+
+
+@app.post("/api/passkey/login/options")
+async def passkey_login_options(body: dict = Body({})):
+    """company_slug — обязателен: Face ID привязан к сайту компании."""
+    import webauthn
+    from webauthn.helpers.structs import UserVerificationRequirement
+    from webauthn.helpers import bytes_to_base64url
+    if not body.get("company_slug"):
+        raise HTTPException(400, "Не указана компания")
+    cid = await _resolve_client_company_id(body.get("company_slug"))
+    rp_id, _ = await _passkey_rp(cid)
+    opts = webauthn.generate_authentication_options(rp_id=rp_id, user_verification=UserVerificationRequirement.REQUIRED)
+    ch = await db.passkey_challenge_save("login", bytes_to_base64url(opts.challenge), None, cid)
+    return {"ok": True, "challenge_id": ch, "options": _json.loads(webauthn.options_to_json(opts))}
+
+
+@app.post("/api/passkey/login/verify")
+async def passkey_login_verify(body: dict = Body({})):
+    import webauthn
+    from webauthn.helpers import base64url_to_bytes
+    if not body.get("company_slug"):
+        raise HTTPException(400, "Не указана компания")
+    cid = await _resolve_client_company_id(body.get("company_slug"))
+    cred = body.get("credential") or {}
+    challenge = await db.passkey_challenge_take(int(body.get("challenge_id") or 0), "login", None, cid)
+    if not challenge:
+        raise HTTPException(400, bi("Время вышло — нажмите ещё раз", "Vaqt tugadi — qayta bosing"))
+    pk = await db.passkey_by_credential(str(cred.get("id") or ""), cid) if isinstance(cred, dict) else None
+    if not pk:
+        raise HTTPException(401, bi("Этот Face ID не подключён к аккаунту. Войдите по паролю и включите его в настройках",
+                                    "Bu Face ID ulanmagan. Parol bilan kiring va sozlamalarda yoqing"))
+    rp_id, origins = await _passkey_rp(cid)
+    try:
+        v = webauthn.verify_authentication_response(
+            credential=cred, expected_challenge=base64url_to_bytes(challenge), expected_rp_id=rp_id,
+            expected_origin=origins, credential_public_key=bytes(pk["public_key"]),
+            credential_current_sign_count=int(pk["sign_count"]), require_user_verification=True)
+    except Exception as e:
+        _passkey_err(e)
+    user = await db.get_user_by_id(pk["user_id"])
+    if not user or not user["is_verified"] or (user.get("company_id") or 1) != cid:
+        raise HTTPException(401, bi("Аккаунт недоступен", "Akkaunt mavjud emas"))
+    await db.passkey_used(pk["id"], v.new_sign_count)
+    if hasattr(db, "update_user_last_login"):
+        asyncio.create_task(db.update_user_last_login(user["id"]))
+    u = dict(user)
+    return {"ok": True, "token": create_token(u["id"], u["phone"], cid), "user": {
+        "id": u["id"], "phone": u["phone"], "first_name": u.get("first_name"), "address": u.get("address"),
+        "car_plate": u.get("car_plate"),
+        "osago_expiry": u["osago_expiry"].isoformat() if u.get("osago_expiry") else None,
+        "must_change_password": bool(u.get("must_change_password"))}}
+
+
+@app.get("/api/passkey/list")
+async def passkey_list(user=Depends(get_current_user)):
+    rows = await db.passkeys_of_user(user["id"])
+    return {"ok": True, "passkeys": [{"id": r["id"], "name": r["name"], "created_at": r["created_at"].isoformat(),
+                                      "last_used_at": r["last_used_at"].isoformat() if r["last_used_at"] else None}
+                                     for r in rows]}
+
+
+@app.post("/api/passkey/{passkey_id}/delete")
+async def passkey_delete(passkey_id: int, user=Depends(get_current_user)):
+    if not await db.passkey_revoke(user["id"], passkey_id):
+        raise HTTPException(404, "Не найдено")
+    return {"ok": True}
 
 
 async def _render_order_receipt(order_id: int) -> tuple[bytes, dict]:

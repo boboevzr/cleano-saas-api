@@ -10,3 +10,4 @@ pywebpush==2.0.0
 Pillow==10.4.0
 aiogram==3.30.0
 httpx==0.28.1
+webauthn==2.2.0
