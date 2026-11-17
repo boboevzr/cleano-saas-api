@@ -10129,6 +10129,10 @@ async def get_measure_stage_public(company_slug: str = None):
     db.set_request_company(cid)
     return {"ok": True, "stage": await _measure_stage(), "stages": list(MEASURE_STAGES)}
 
+@app.get("/api/admin/settings/measure-stage")
+async def get_measure_stage_admin(_=Depends(get_admin)):
+    return {"ok": True, "stage": await _measure_stage(), "stages": list(MEASURE_STAGES)}
+
 @app.get("/api/staff/settings/measure-stage")
 async def get_measure_stage_staff(_staff=Depends(get_current_staff)):
     return {"ok": True, "stage": await _measure_stage(), "stages": list(MEASURE_STAGES)}
