@@ -8571,9 +8571,54 @@ async def cash_payment_history(year: int = None, month: int = None, day: int = 0
     rows = await db.get_cash_payment_history(year or today.year, month or today.month, branch, day)
     return {"ok": True, "rows": rows}
 
+async def _tg_file_response(file_id: str, request: Request):
+    """Файл из Telegram — отдаём сами (17.11.2026): раньше редирект на api.telegram.org (в ссылке
+    виден токен бота, .mov приходил как octet-stream и не играл). Тип по расширению + Range (Safari)."""
+    async with aiohttp.ClientSession() as s:
+        async with s.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}") as r:
+            data = await r.json()
+    if not data.get("ok"):
+        raise HTTPException(status_code=502, detail="Не удалось получить файл")
+
+    # 17.11.2026: раньше — редирект на api.telegram.org (в ссылке виден токен бота, .mov приходил
+    # как octet-stream и не проигрывался). Теперь отдаём сами: тип по расширению + Range (Safari без
+    # 206 видео не играет). .mov с iPhone — тот же MP4-контейнер, браузеру называем video/mp4.
+    from fastapi.responses import StreamingResponse
+    file_path = data["result"]["file_path"]
+    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+    ctype = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp",
+             "heic": "image/heic", "mp4": "video/mp4", "mov": "video/mp4", "m4v": "video/mp4",
+             "webm": "video/webm", "3gp": "video/3gpp"}.get(ext)
+    fwd = {}
+    if request.headers.get("range"):
+        fwd["Range"] = request.headers["range"]
+    session = aiohttp.ClientSession()
+    try:
+        resp = await session.get(file_url, headers=fwd)
+    except Exception:
+        await session.close()
+        raise HTTPException(status_code=502, detail="Не удалось получить файл")
+    out = {"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"}
+    for h in ("Content-Length", "Content-Range"):
+        if h in resp.headers:
+            out[h] = resp.headers[h]
+
+    async def _body():
+        try:
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                yield chunk
+        finally:
+            resp.release()
+            await session.close()
+
+    return StreamingResponse(_body(), status_code=resp.status if resp.status in (200, 206) else 502,
+                             media_type=ctype or resp.content_type or "application/octet-stream", headers=out)
+
 @app.get("/api/media/{photo_id}")
 async def serve_order_photo(
     photo_id: int,
+    request: Request,
     t: str = None,
     authorization: str = Header(None),
 ):
@@ -8598,19 +8643,12 @@ async def serve_order_photo(
         if not owner_phone or owner_phone != payload.get("phone"):
             raise HTTPException(status_code=403)
 
-    async with aiohttp.ClientSession() as s:
-        async with s.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={row['tg_file_id']}") as r:
-            data = await r.json()
-    if not data.get("ok"):
-        raise HTTPException(status_code=502, detail="Не удалось получить файл")
-
-    from fastapi.responses import RedirectResponse
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{data['result']['file_path']}"
-    return RedirectResponse(url=file_url)
+    return await _tg_file_response(row['tg_file_id'], request)
 
 @app.get("/api/item-media/{media_id}")
 async def serve_item_media(
     media_id: int,
+    request: Request,
     t: str = None,
     authorization: str = Header(None),
 ):
@@ -8634,15 +8672,7 @@ async def serve_item_media(
         if not owner_phone or owner_phone != payload.get("phone"):
             raise HTTPException(status_code=403)
 
-    async with aiohttp.ClientSession() as s:
-        async with s.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={row['tg_file_id']}") as r:
-            data = await r.json()
-    if not data.get("ok"):
-        raise HTTPException(status_code=502, detail="Не удалось получить файл")
-
-    from fastapi.responses import RedirectResponse
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{data['result']['file_path']}"
-    return RedirectResponse(url=file_url)
+    return await _tg_file_response(row['tg_file_id'], request)
 
 @app.patch("/api/admin/orders/{order_id}/discount")
 async def admin_set_order_discount(order_id: int, staff=Depends(get_current_staff),
