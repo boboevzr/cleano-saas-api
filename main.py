@@ -6818,6 +6818,7 @@ async def admin_bulk_create_items(order_id: int, count: int = Body(0, embed=True
                                    staff=Depends(get_current_staff)):
     # items={service_key: qty} — позиции сразу с услугой и ценой по прайсу (менеджер обязан
     # выбрать услугу, решение 2026-10-10); count — старый режим «пустых» (окно мойщика).
+    await _items_edit_guard(order_id, staff)   # заказ своей компании + права/статус (17.11.2026)
     if items:
         total = sum(max(0, int(q)) for q in items.values())
         if total < 1 or total > 50:
