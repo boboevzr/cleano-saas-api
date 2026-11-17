@@ -6756,23 +6756,28 @@ def _price_audit(staff: dict, price: float, list_price, note: str | None) -> dic
 
 
 async def _items_edit_guard(order_id: int, staff: dict, deleting: bool = False) -> dict:
-    """Добавить/удалить позицию (перенос из ARTEZ c411b44): заказ — только своей компании (db.get_order_by_id
-    скоупит по company_id), те же правила, что у правки позиции (admin_update_order_item): роль с доступом к заказам,
-    не при can_edit_items=false, статус — admin/can_edit_price до «Доставлен», остальные до «Упаковка»; удаление —
-    не мойщику. Раньше проверок не было, а удаление не сверяло даже компанию."""
+    """Добавить/удалить позицию (17.11.2026, ревью): те же правила, что у правки позиции
+    (admin_update_order_item) и у кнопок в staff.html (_itemEditLocked): только роли с доступом к заказам,
+    не при can_edit_items=false; статус — admin/can_edit_price до «Доставлен», менеджер до «Доставка»,
+    остальные до «Упаковка». Удаление — не мойщику (в его окне кнопки ✕ нет). Раньше проверок не было."""
     role = staff.get("role", "")
     is_admin = staff.get("sub") == "admin" or role == "admin"
     if not is_admin and "orders" not in ROLE_PERMISSIONS.get(role, []):
         raise HTTPException(status_code=403, detail="Нет доступа к позициям заказа")
     if not is_admin and staff.get("can_edit_items") is False:
         raise HTTPException(status_code=403, detail="Нет права менять позиции — включается в карточке сотрудника")
-    if deleting and role == "washer":
-        raise HTTPException(status_code=403, detail="Удалить позицию может менеджер")
+    # удалить позицию — только менеджер и админ (владелец 17.11.2026: «с удалением осторожнее»)
+    if deleting and not is_admin and role != "manager":
+        raise HTTPException(status_code=403, detail="Удалить позицию может только менеджер")
     order = await db.get_order_by_id(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден")
-    locked = {"delivered", "cancelled"} if (is_admin or staff.get("can_edit_price", False)) \
-        else {"packing", "ready", "delivery", "delivered", "cancelled"}
+    if is_admin or staff.get("can_edit_price", False):
+        locked = {"delivered", "cancelled"}
+    elif role == "manager":
+        locked = {"delivery", "delivered", "cancelled"}
+    else:
+        locked = {"packing", "ready", "delivery", "delivered", "cancelled"}
     if order.get("status") in locked:
         raise HTTPException(status_code=403, detail="Позиции в этом статусе заказа менять нельзя")
     return order
@@ -6808,7 +6813,7 @@ async def admin_bulk_create_items(order_id: int, count: int = Body(0, embed=True
                                    staff=Depends(get_current_staff)):
     # items={service_key: qty} — позиции сразу с услугой и ценой по прайсу (менеджер обязан
     # выбрать услугу, решение 2026-10-10); count — старый режим «пустых» (окно мойщика).
-    order = await _items_edit_guard(order_id, staff)
+    order = await _items_edit_guard(order_id, staff)   # заказ своей компании + права/статус (17.11.2026)
     if items:
         total = sum(max(0, int(q)) for q in items.values())
         if total < 1 or total > 50:
@@ -6924,8 +6929,8 @@ async def admin_update_order_item(order_id: int, item_id: int,
 
 @app.delete("/api/admin/orders/{order_id}/items/{item_id}")
 async def admin_delete_order_item(order_id: int, item_id: int, staff=Depends(get_current_staff)):
-    await _items_edit_guard(order_id, staff, deleting=True)   # заказ своей компании
-    # позиция — именно этого заказа (раньше удалялась любая позиция по id, даже другой компании)
+    await _items_edit_guard(order_id, staff, deleting=True)   # заказ своей компании (get_order_by_id по _cid)
+    # позиция — именно этого заказа (раньше удалялась любая позиция по id, в т.ч. чужой компании)
     if not db.pool or not await db.pool.fetchval("SELECT 1 FROM order_items WHERE id=$1 AND order_id=$2", item_id, order_id):
         raise HTTPException(status_code=404, detail="Позиция не найдена")
     ok = await db.delete_order_item(item_id)
