@@ -7911,17 +7911,20 @@ async def get_cash_summary(date_from: str, date_to: str) -> dict:
     if not pool: return {}
     ts_from, ts_to = _tz_range(date_from, date_to)
     async with pool.acquire() as conn:
-        # Суммы по методу оплаты (из order_payments)
+        # Суммы по методу оплаты (из order_payments) — только своей компании (17.11.2026: раньше суммировались
+        # оплаты ВСЕХ компаний; компания — по заказу, т.к. у старых строк order_payments.company_id мог быть пуст)
+        cid = _cid()
         rows = await conn.fetch("""
             SELECT
-                method AS payment_method,
-                COALESCE(SUM(amount), 0) AS amount,
-                COUNT(DISTINCT order_id) AS cnt
-            FROM order_payments
-            WHERE created_at >= $1 AND created_at < $2
-              AND NOT (confirmed = FALSE AND confirmed_at IS NOT NULL)
-            GROUP BY method
-        """, ts_from, ts_to)
+                op.method AS payment_method,
+                COALESCE(SUM(op.amount), 0) AS amount,
+                COUNT(DISTINCT op.order_id) AS cnt
+            FROM order_payments op
+            JOIN orders o ON o.id = op.order_id AND o.company_id = $3
+            WHERE op.created_at >= $1 AND op.created_at < $2
+              AND NOT (op.confirmed = FALSE AND op.confirmed_at IS NOT NULL)
+            GROUP BY op.method
+        """, ts_from, ts_to, cid)
         # Заказы с оплатами за период
         orders = await conn.fetch("""
             SELECT
@@ -7940,8 +7943,9 @@ async def get_cash_summary(date_from: str, date_to: str) -> dict:
                   AND NOT (confirmed = FALSE AND confirmed_at IS NOT NULL)
                 GROUP BY order_id
             ) sub ON sub.order_id = o.id
+            WHERE o.company_id = $3
             ORDER BY sub.last_payment_at DESC
-        """, ts_from, ts_to)
+        """, ts_from, ts_to, cid)
         return {
             "summary": [dict(r) for r in rows],
             "orders": [dict(r) for r in orders],
@@ -7969,12 +7973,12 @@ async def get_payments_log(date_from: str, date_to: str) -> list:
                 TRIM(COALESCE(cv.last_name,'') || ' ' || COALESCE(cv.first_name,'')) AS confirmed_by_name,
                 op.driver_tg_id
             FROM order_payments op
-            LEFT JOIN orders o ON o.id = op.order_id
+            JOIN orders o ON o.id = op.order_id AND o.company_id = $3   -- только своя компания (17.11.2026)
             LEFT JOIN staff cs ON cs.id = op.created_by_staff_id
             LEFT JOIN staff cv ON cv.id = op.confirmed_by
             WHERE op.created_at >= $1 AND op.created_at < $2
             ORDER BY op.created_at DESC
-        """, ts_from, ts_to)
+        """, ts_from, ts_to, _cid())
         return [dict(r) for r in rows]
 
 async def close_cash_shift(shift_date, closed_by: str, note: str) -> dict:
