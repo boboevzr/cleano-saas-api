@@ -324,6 +324,7 @@ T = {
         "btn_order_detail":   "📋 №{num}: подробнее",
         "btn_positions":      "📄 Позиции",
         "btn_measure_media":  "📐 Фото/видео замера",
+        "lbl_measure_done":   "📐 Замер проведён",
         "btn_photos":         "📸 Фото: до/после/повреждения",
         "btn_back_to_order":  "◀️ К заказу",
         "order_positions_title": "📄 Позиции заказа №{num}",
@@ -512,6 +513,7 @@ T = {
         "btn_order_detail":   "📋 №{num}: batafsil",
         "btn_positions":      "📄 Pozitsiyalar",
         "btn_measure_media":  "📐 O'lchash foto/video",
+        "lbl_measure_done":   "📐 O'lchov o'tkazildi",
         "btn_photos":         "📸 Foto: oldin/keyin/shikastlanish",
         "btn_back_to_order":  "◀️ Buyurtmaga",
         "order_positions_title": "📄 №{num} buyurtma pozitsiyalari",
@@ -2757,6 +2759,8 @@ def _format_order_summary(lang: str, o: dict) -> str:
         lines.append(f"✅ {t(lang,'lbl_delivered')}: {_fmt_dt(o['delivered_at'])}")
     lines.append(f"📍 {t(lang,'lbl_status')}: {_order_status_name(lang, o['status'])}")
     lines.append(f"📦 {t(lang,'lbl_items')}: {o.get('item_count') or 0}")
+    if o.get("measure_done"):
+        lines.append(t(lang, 'lbl_measure_done'))
 
     pay = db.order_payment_summary(o)
     cur = t(lang, 'lbl_currency')

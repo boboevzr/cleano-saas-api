@@ -1797,6 +1797,42 @@ ALL_ORDER_STATUSES = [
     "new","confirmed","pickup","received","washing","drying","packing","ready","delivery","delivered","cancelled"
 ]
 
+# ── Этап замера (перенос из ARTEZ 16–17.11.2026) ───────────────────────────────
+# Настройка компании (config measure_stage): мастерская / мойка / сушка / упаковка.
+# Мерить можно от этого этапа и до доставки (менеджер — с «В мастерской»); дальше этапа
+# без утверждённых замеров не пускаем — пропустить могут только админ и менеджер.
+MEASURE_STAGES = ("received", "washing", "drying", "packing")
+_ORDER_STATUS_RU_SHORT = {"new": "Новый", "confirmed": "Подтверждён", "pickup": "Вывоз", "received": "В мастерской",
+                          "washing": "Мойка", "drying": "Сушка", "packing": "Упаковка", "ready": "Готов",
+                          "delivery": "Доставка", "delivered": "Доставлен", "cancelled": "Отменён"}
+_ORDER_FLOW = ["new","confirmed","pickup","received","washing","drying","packing","ready","delivery","delivered"]
+MEASURED_OK_STATUSES = ("approved", "confirmed")
+
+
+async def _measure_stage() -> str:
+    """Этап замера текущей компании (db._cid() уже выставлен запросом)."""
+    try:
+        v = await db.get_config("measure_stage")
+    except Exception:
+        v = None
+    return v if v in MEASURE_STAGES else "washing"
+
+
+def _flow_idx(status: str) -> int:
+    return _ORDER_FLOW.index(status) if status in _ORDER_FLOW else -1
+
+
+async def _measure_block(order_id: int, cur_status: str, new_status: str, stage: str | None = None) -> int:
+    """Сколько позиций не замерено, если переход уводит заказ ЗА этап замера; 0 — можно."""
+    stage = stage or await _measure_stage()
+    si, ci, ni = _flow_idx(stage), _flow_idx(cur_status), _flow_idx(new_status)
+    # не за этап / откат / заказ уже был дальше этапа. Статус вне потока (cancelled) —
+    # проверяем как «до этапа» (fail closed): из «Отменён» сразу в «Готов» без замеров нельзя.
+    if ni <= si or ci > si:
+        return 0
+    items = await db.get_order_items(order_id)
+    return sum(1 for i in items if (i.get("measure_status") or "pending") not in MEASURED_OK_STATUSES)
+
 async def get_current_user(authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Не авторизован")
@@ -3464,8 +3500,23 @@ async def bulk_status_orders(body: dict, staff=Depends(require_perm("orders"))):
     ids = body.get("ids", [])
     if not ids:
         raise HTTPException(status_code=400, detail="Нет ID заказов")
+    # Этап замера: без утверждённых замеров дальше этапа — только с skip_measure (админ/менеджер)
+    stage = await _measure_stage()
+    skipped = []
+    for order_id in ids:
+        o = await db.get_order_by_id(int(order_id))
+        if o and await _measure_block(int(order_id), o.get("status", ""), status, stage):
+            skipped.append((int(order_id), o.get("order_num") or f"#{order_id}"))
+    _can_skip = staff.get("role") in ("admin", "manager")
+    if skipped and not (body.get("skip_measure") and _can_skip):
+        return JSONResponse(status_code=409, content={
+            "detail": "Не все замеры утверждены: " + ", ".join(n for _, n in skipped[:20]),
+            "code": "measure_required", "orders": [n for _, n in skipped], "can_skip": _can_skip})
     for order_id in ids:
         await db.update_order_status(int(order_id), status, note="Массовая смена статуса")
+    for order_id, _n in skipped:
+        await db.add_order_activity(order_id, staff.get("id"), staff.get("login", ""), "measure_skipped",
+                                    f"Без замера — массовая смена → {_ORDER_STATUS_RU_SHORT.get(status, status)}")
     return {"ok": True, "updated": len(ids)}
 
 @app.post("/api/staff/orders/bulk-delete")
@@ -6077,7 +6128,8 @@ async def set_order_packer(order_id: int,
 async def admin_change_order_status(order_id: int, staff=Depends(get_current_staff),
                                      status: str = Body(..., embed=True),
                                      note: str = Body("", embed=True),
-                                     packer_login: str = Body(None, embed=True)):
+                                     packer_login: str = Body(None, embed=True),
+                                     skip_measure: bool = Body(False, embed=True)):
     role = staff.get("role", "")
     if role == "washer":
         order = await db.get_order_by_id(order_id)
@@ -6108,25 +6160,29 @@ async def admin_change_order_status(order_id: int, staff=Depends(get_current_sta
     if status not in ALL_ORDER_STATUSES:
         raise HTTPException(status_code=400, detail="Неизвестный статус")
 
-    # Замер больше НЕ блокирует переход в «Мойка» — незамеренные позиции домеряются
-    # уже мойщиком в статусе «Мойка». Но если за позицией уже кто-то закреплён, это
-    # должен быть мойщик (а не менеджер/админ, снявший замер в исключительном
-    # порядке) — иначе зарплата за мойку уйдёт не тому.
-    if status == "washing":
-        items = await db.get_order_items(order_id)
-        logins = {i.get("washer_login") for i in items if i.get("washer_login")}
-        if logins:
-            roles = await db.get_staff_roles_by_logins(list(logins))
-            bad = [i for i in items if i.get("washer_login") and roles.get(i["washer_login"]) != "washer"]
-            if bad:
-                raise HTTPException(status_code=400,
-                    detail=f"У {len(bad)} позиций замер провёл не мойщик — назначьте мойщика "
-                           f"или откройте позицию, чтобы её мог взять мойщик")
-
+    # Этап замера (перенос из ARTEZ): дальше этапа — только с утверждёнными замерами.
+    # Ошибки «замер провёл не мойщик» больше нет: мерить может любой с правом замера
+    # («Замерил» — measure_submitted_by), мойщик (ЗП) — отдельно.
     staff_name = " ".join(filter(None,[staff.get("last_name"),staff.get("first_name")])) or staff.get("login","")
-    order = await db.update_order_status(order_id, status,
-                                          note=note or bi(f"Статус изменён сотрудником {staff_name}",
-                                                           f"{staff_name} xodim tomonidan holat oʻzgartirildi"))
+    _cur = await db.get_order_by_id(order_id)
+    if not _cur:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    _stage = await _measure_stage()
+    _left = await _measure_block(order_id, _cur.get("status", ""), status, _stage)
+    if _left:
+        can_skip = role in ("admin", "manager")
+        if not (skip_measure and can_skip):
+            return JSONResponse(status_code=409, content={
+                "detail": (f"Не все замеры утверждены: {_left} поз. — дальше этапа «{_ORDER_STATUS_RU_SHORT.get(_stage, _stage)}» "
+                           f"без замера нельзя" + ("" if can_skip else ". Пропустить может админ или менеджер")),
+                "code": "measure_required", "left": _left, "can_skip": can_skip})
+        await db.add_order_activity(order_id, staff.get("id"), staff_name, "measure_skipped",
+                                    f"Без замера ({_left} поз.) → {_ORDER_STATUS_RU_SHORT.get(status, status)}")
+    _note = note or bi(f"Статус изменён сотрудником {staff_name}",
+                       f"{staff_name} xodim tomonidan holat oʻzgartirildi")
+    if _left:   # пропуск замера видно в истории статусов заказа
+        _note += f" · ⚠️ без замера ({_left} поз.)"
+    order = await db.update_order_status(order_id, status, note=_note)
     if status == 'packing' and packer_login:
         async with db.pool.acquire() as _pc:
             await _pc.execute("UPDATE orders SET packer_login=$1 WHERE id=$2", packer_login, order_id)
@@ -6643,7 +6699,23 @@ async def admin_get_order_items(order_id: int, staff=Depends(get_current_staff))
         raise HTTPException(status_code=404, detail="Заказ не найден")
     await db.recalc_client_discount(order_id)
     billing = await db.get_order_items_billing(order_id, as_list_price=staff.get("role") == "washer")
+    await _add_measured_by_names(billing["items"])
     return {"ok": True, "items": billing["items"], "groups": billing["groups"], "order_total": billing["order_total"]}
+
+
+async def _add_measured_by_names(items: list) -> None:
+    """«Замерил» — имя сотрудника из measure_submitted_by (не влияет на ЗП мойщика); только своя компания."""
+    ids = sorted({i.get("measure_submitted_by") for i in items if i.get("measure_submitted_by")})
+    names = {}
+    if ids and db.pool:
+        try:
+            rows = await db.pool.fetch("SELECT id, first_name, last_name, login FROM staff WHERE id = ANY($1::int[]) AND company_id=$2",
+                                       ids, db._cid())
+            names = {r["id"]: (" ".join(filter(None, [r["first_name"], r["last_name"]])) or r["login"]) for r in rows}
+        except Exception as e:
+            logging.warning(f"measured_by names: {e}")
+    for i in items:
+        i["measured_by_name"] = names.get(i.get("measure_submitted_by"))
 
 class OrderItemRequest(BaseModel):
     service: str
@@ -6739,8 +6811,13 @@ async def admin_update_order_item(order_id: int, item_id: int,
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден")
     can_bypass_lock = staff.get("role") == "admin" or staff.get("can_edit_price", False)
-    locked_statuses = {"delivered", "cancelled"} if can_bypass_lock \
-        else {"packing", "ready", "delivery", "delivered", "cancelled"}
+    # менеджер после мойки тоже добавляет/правит позиции и мерит — до доставки (перенос из ARTEZ 17.11)
+    if can_bypass_lock:
+        locked_statuses = {"delivered", "cancelled"}
+    elif staff.get("role") == "manager":
+        locked_statuses = {"delivery", "delivered", "cancelled"}
+    else:
+        locked_statuses = {"packing", "ready", "delivery", "delivered", "cancelled"}
     if order.get("status") in locked_statuses:
         raise HTTPException(status_code=403, detail="Редактирование позиций недоступно в этом статусе заказа")
     sqm = req.sqm
@@ -8635,6 +8712,25 @@ async def admin_measure_item(order_id: int, item_id: int, staff=Depends(get_curr
         raise HTTPException(status_code=403, detail="Нет прав для проверки замеров")
     if action == "direct_approve" and not (staff.get("can_override_measure") or is_admin):
         raise HTTPException(status_code=403, detail="Нет прав для переопределения замера")
+    # Окно замера: от этапа замера (настройка компании; менеджер — с «В мастерской») до доставки.
+    # Админ и «переопределение замера» — как раньше (кроме доставленных/отменённых).
+    _o = await db.get_order_by_id(order_id)
+    if not _o:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    # позиция должна быть из ЭТОГО заказа — иначе окно замера проверялось бы по чужому статусу
+    if not db.pool or not await db.pool.fetchval(
+            "SELECT 1 FROM order_items WHERE id=$1 AND order_id=$2", item_id, order_id):
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+    _st = _o.get("status", "")
+    if _st in ("delivered", "cancelled"):
+        raise HTTPException(status_code=400, detail="Заказ закрыт — замер менять нельзя")
+    if action == "submit" and not (is_admin or staff.get("can_override_measure")):
+        _stage = await _measure_stage()
+        if staff.get("role") == "manager" and _flow_idx("received") < _flow_idx(_stage):
+            _stage = "received"
+        if not (_flow_idx(_stage) <= _flow_idx(_st) < _flow_idx("delivery")):
+            raise HTTPException(status_code=400,
+                detail=f"Замер — с этапа «{_ORDER_STATUS_RU_SHORT.get(_stage, _stage)}» и до доставки")
     if action == "submit":
         if quantity:
             await db.save_measure_qty(item_id, quantity)
@@ -8706,10 +8802,11 @@ async def admin_measure_item(order_id: int, item_id: int, staff=Depends(get_curr
         except Exception as _pe:
             logging.warning(f"measure approved push error: {_pe}")
     elif action == "direct_approve":
+        # кто ввёл замер сам — тот и «Замерил» (measure_submitted_by)
         if quantity:
-            item = await db.direct_approve_measure_qty(item_id, quantity)
+            item = await db.direct_approve_measure_qty(item_id, quantity, by=staff.get("id"))
         elif actual_width_cm and actual_length_cm:
-            item = await db.direct_approve_measure(item_id, actual_width_cm, actual_length_cm)
+            item = await db.direct_approve_measure(item_id, actual_width_cm, actual_length_cm, by=staff.get("id"))
         else:
             raise HTTPException(status_code=400, detail="Укажите ширину и длину или количество")
     elif action == "reject":
@@ -9017,6 +9114,26 @@ async def delete_item_media(order_id: int, item_id: int, media_id: int, staff=De
 @app.patch("/api/admin/orders/{order_id}/items/{item_id}/washer")
 async def admin_set_item_washer(order_id: int, item_id: int, staff=Depends(get_current_staff),
                                  washer_login: str = Body("", embed=True)):
+    # Мойщик позиции = его ЗП за мойку (перенос из ARTEZ): назначать может админ/менеджер/
+    # с правом правки позиций; мойщик — только себя взять или свою позицию отдать.
+    washer_login = (washer_login or "").strip()
+    if not await db.get_order_by_id(order_id):
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    cur = await db.pool.fetchrow("SELECT washer_login FROM order_items WHERE id=$1 AND order_id=$2",
+                                 item_id, order_id) if db.pool else None
+    if not cur:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+    role, me = staff.get("role"), staff.get("login") or ""
+    if role == "washer":
+        own = cur["washer_login"]
+        if not ((washer_login == me and own in (None, "", me)) or (washer_login == "" and own == me)):
+            raise HTTPException(status_code=403, detail="Мойщик может взять свободную позицию или отказаться от своей")
+    elif not (role in ("admin", "manager") or staff.get("can_edit_items") is True):
+        raise HTTPException(status_code=403, detail="Нет прав назначать мойщика")
+    if washer_login and role != "washer":
+        w = await db.get_staff_by_login(washer_login, db._cid())
+        if not w or w.get("role") != "washer":
+            raise HTTPException(status_code=400, detail="Назначить можно только мойщика")
     item = await db.update_item_washer(item_id, washer_login or None)
     if not item:
         raise HTTPException(status_code=404, detail="Позиция не найдена")
@@ -10004,6 +10121,24 @@ async def get_delivery_discount_public(company_slug: str = None):
     db.set_request_company(cid)
     val = await db.get_config("delivery_discount_pct")
     return {"ok": True, "discount": float(val) if val else 0.0}
+
+# ── Этап замера (перенос из ARTEZ 16.11.2026) ─────────────────
+@app.get("/api/settings/measure-stage")
+async def get_measure_stage_public(company_slug: str = None):
+    cid = await _resolve_client_company_id(company_slug)
+    db.set_request_company(cid)
+    return {"ok": True, "stage": await _measure_stage(), "stages": list(MEASURE_STAGES)}
+
+@app.get("/api/staff/settings/measure-stage")
+async def get_measure_stage_staff(_staff=Depends(get_current_staff)):
+    return {"ok": True, "stage": await _measure_stage(), "stages": list(MEASURE_STAGES)}
+
+@app.put("/api/admin/settings/measure-stage")
+async def save_measure_stage(stage: str = Body(..., embed=True), _=Depends(get_admin)):
+    if stage not in MEASURE_STAGES:
+        raise HTTPException(status_code=400, detail="Неверный этап замера")
+    await db.set_config("measure_stage", stage)
+    return {"ok": True, "stage": stage}
 
 @app.put("/api/admin/settings/delivery-discount")
 async def save_delivery_discount(discount: float = Body(..., embed=True), _=Depends(get_admin)):
