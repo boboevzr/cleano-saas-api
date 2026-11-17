@@ -35,6 +35,11 @@ def _resolve_tz(tz_name: str):
         return _FALLBACK_TZ
 
 
+# Часовой пояс отметок прихода/ухода и др. (17.11.2026): имя использовалось в 7 местах, но не было объявлено —
+# «Пришёл/Ушёл», «Сегодня» и отчёт «Отметки» падали с NameError (500).
+_TASHKENT = _resolve_tz("Asia/Tashkent")
+
+
 def _tz_range(date_from: str, date_to: str, tz_name: str = DEFAULT_TZ_NAME):
     """Преобразует строки дат в UTC-границы для TIMESTAMPTZ-сравнения.
 
@@ -5616,6 +5621,9 @@ async def save_timesheet(data: dict) -> dict:
     d = data["date"]
     if isinstance(d, str): d = _date.fromisoformat(d)
     async with pool.acquire() as conn:
+        # сотрудник — своей компании (17.11.2026: раньше ON CONFLICT перезаписывал строку чужой компании)
+        if not await conn.fetchval("SELECT 1 FROM staff WHERE id=$1 AND company_id=$2", int(data["staff_id"]), cid):
+            return {}
         row = await conn.fetchrow("""
             INSERT INTO timesheet (staff_id, date, hours, type, note, company_id)
             VALUES ($1, $2, $3, $4, $5, $6)
@@ -5637,18 +5645,19 @@ async def update_timesheet(ts_id: int, data: dict) -> dict:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE timesheet SET staff_id=$2, date=$3, hours=$4, type=$5, note=$6
-            WHERE id=$1
+            WHERE id=$1 AND staff_id IN (SELECT id FROM staff WHERE company_id=$7)
+              AND EXISTS (SELECT 1 FROM staff WHERE id=$2 AND company_id=$7)   -- 17.11.2026: только своя компания
             RETURNING id, staff_id, date::text, hours, type, note
         """, ts_id, int(data["staff_id"]), d,
             float(data.get("hours") or 8),
             data.get("type", "work"),
-            data.get("note", ""))
+            data.get("note", ""), _cid())
         return dict(row) if row else {}
 
 async def delete_timesheet(ts_id: int) -> bool:
     if not pool: return False
     async with pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM timesheet WHERE id=$1", ts_id)
+        result = await conn.execute("DELETE FROM timesheet WHERE id=$1 AND staff_id IN (SELECT id FROM staff WHERE company_id=$2)", ts_id, _cid())
         return result == "DELETE 1"
 
 async def init_timesheet_month(year: int, month: int, until_today: bool = False) -> dict:
@@ -5665,12 +5674,15 @@ async def init_timesheet_month(year: int, month: int, until_today: bool = False)
         last_day = min(last_day, today.day if (today.year == year and today.month == month) else last_day)
     month_start = date(year, month, 1)
     async with pool.acquire() as conn:
+        cid = _cid()
+        # 17.11.2026: только сотрудники своей компании (раньше — всех компаний, строки без company_id)
         staff_rows = await conn.fetch("""
             SELECT id, salary_type, hire_date FROM staff
             WHERE (active IS NULL OR active = TRUE)
               AND COALESCE(role,'') != 'agent'
               AND COALESCE(salary_type,'') NOT IN ('percent','per_unit','per_point')
-        """)
+              AND company_id = $1
+        """, cid)
         count = 0
         skipped = 0
         for s in staff_rows:
@@ -5685,10 +5697,10 @@ async def init_timesheet_month(year: int, month: int, until_today: bool = False)
                 if d.weekday() == 6:  # воскресенье — пропуск
                     continue
                 r = await conn.execute("""
-                    INSERT INTO timesheet (staff_id, date, hours, type)
-                    VALUES ($1, $2, 8, 'work')
+                    INSERT INTO timesheet (staff_id, date, hours, type, company_id)
+                    VALUES ($1, $2, 8, 'work', $3)
                     ON CONFLICT (staff_id, date) DO NOTHING
-                """, s["id"], d)
+                """, s["id"], d, cid)
                 if r.endswith("0 1"):
                     count += 1
     return {"created": count, "skipped": skipped}
@@ -5696,9 +5708,11 @@ async def init_timesheet_month(year: int, month: int, until_today: bool = False)
 async def reset_timesheet_month(year: int, month: int) -> dict:
     if not pool: return {"deleted": 0}
     async with pool.acquire() as conn:
+        # 17.11.2026: только своя компания — раньше «сбросить месяц» стирал табель ВСЕХ компаний
         result = await conn.execute(
-            "DELETE FROM timesheet WHERE EXTRACT(YEAR FROM date)=$1 AND EXTRACT(MONTH FROM date)=$2",
-            year, month)
+            "DELETE FROM timesheet WHERE EXTRACT(YEAR FROM date)=$1 AND EXTRACT(MONTH FROM date)=$2 "
+            "AND staff_id IN (SELECT id FROM staff WHERE company_id=$3)",
+            year, month, _cid())
         deleted = int(result.split()[-1]) if result else 0
     return {"deleted": deleted}
 
