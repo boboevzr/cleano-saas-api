@@ -1978,6 +1978,8 @@ def _staff_public(s: dict) -> dict:
         "can_accept_payment":  s.get("can_accept_payment", False),
         "can_manage_cash":     s.get("can_manage_cash", False),
         "can_refund_prepay":   bool(s.get("can_refund_prepay", False)),  # pay.py: возврат онлайн-предоплаты из staff
+        # тогл «Может давать скидку» (перенос из ARTEZ aab9387); админ/менеджер могут всегда (сервер и staff.html)
+        "can_give_discount":   bool(s.get("can_give_discount", False)),
         "can_approve_debt":    s.get("can_approve_debt", False),
         "can_drive":           s.get("can_drive", False),
         "notify_new_users":    s.get("notify_new_users", False),
@@ -5951,9 +5953,42 @@ async def update_order_data(order_id: int, body: dict = Body(...), staff=Depends
         raise HTTPException(status_code=400, detail="Нельзя редактировать заказ в этом статусе")
     allowed = {"client_first_name","client_last_name","client_phone",
                "branch","address","short_address","location","location_address","note","deadline","service_type",
-               "pickup_type","self_pickup_discount","discount_sum","manual_discount",
+               "pickup_type","self_pickup_discount","discount_sum","manual_discount","manual_discount_pct",
                "delivery_type","delivery_discount","delivery_discount_pct"}
     updates = {k: v for k, v in body.items() if k in allowed}
+    # Ручная скидка (сумма или %) — перенос из ARTEZ aab9387: админ и менеджер — всегда; остальным — тогл
+    # «Может давать скидку» (staff.can_give_discount). Скидки самовывоза/доставки — как раньше.
+    if ("manual_discount" in updates or "manual_discount_pct" in updates) and not _can_give_discount(staff):
+        raise HTTPException(status_code=403, detail="Нет права давать скидку — включается в карточке сотрудника")
+    # Ручная скидка в % (перенос из ARTEZ 1d7e2b9): «12,52» или 12.52, 0 < % ≤ 100, до 2 знаков; сумму считает
+    # сервер (db.recalc_manual_discount_pct). Пусто/0 — % снят. Скидка суммой (manual_discount) снимает %.
+    if "manual_discount_pct" in updates:
+        raw = updates["manual_discount_pct"]
+        if raw is None or str(raw).strip() in ("", "0", "0.0", "0,0", "0.00", "0,00"):
+            updates["manual_discount_pct"] = None
+            updates.setdefault("manual_discount", 0)
+        else:
+            from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+            try:
+                p = Decimal(str(raw).strip().replace(" ", "").replace(",", "."))
+            except (InvalidOperation, ValueError):
+                raise HTTPException(status_code=400, detail="Скидка в % — число, например 12,52")
+            if not p.is_finite() or p > 100:
+                raise HTTPException(status_code=400, detail="Скидка в % — больше 0 и не больше 100")
+            p = p.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)   # до 2 знаков: 0,001 → 0,00 — отказ
+            if p <= 0 or p > 100:
+                raise HTTPException(status_code=400, detail="Скидка в % — больше 0 и не больше 100")
+            updates["manual_discount_pct"] = p
+            updates.pop("manual_discount", None)   # сумму посчитает сервер
+    elif "manual_discount" in updates:
+        try:
+            md = float(updates["manual_discount"] or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Скидка — число")
+        if md < 0:
+            raise HTTPException(status_code=400, detail="Скидка не может быть меньше 0")
+        updates["manual_discount"] = md
+        updates["manual_discount_pct"] = None
     if not updates:
         raise HTTPException(status_code=400, detail="Нет данных для обновления")
     if "client_phone" in updates and updates["client_phone"]:
@@ -9029,6 +9064,25 @@ async def admin_set_item_washer(order_id: int, item_id: int, staff=Depends(get_c
     except Exception as e:
         logging.warning(f"item_updated broadcast error: {e}")
     return {"ok": True, "item": _item_for(staff, item)}
+
+def _can_give_discount(s: dict) -> bool:
+    """Ручная скидка заказа (перенос из ARTEZ aab9387): админ и менеджер — всегда; остальным — тогл в карточке."""
+    return bool(s.get("sub") == "admin" or s.get("role") in ("admin", "manager") or s.get("can_give_discount") is True)
+
+
+@app.patch("/api/admin/staff/{staff_id}/can-give-discount")
+async def admin_set_can_give_discount(staff_id: int, cid: int = Depends(_get_admin_cid),
+                                      value: bool = Body(..., embed=True)):
+    """Тогл «Может давать скидку» в карточке сотрудника (admin.html) — только сотрудник своей компании."""
+    if not db.pool: raise HTTPException(status_code=503, detail="DB unavailable")
+    async with db.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE staff SET can_give_discount=$3 WHERE id=$1 AND company_id=$2 RETURNING id, can_give_discount",
+            staff_id, cid, value)
+    if not row:
+        raise HTTPException(status_code=404, detail="Сотрудник не найден")
+    return {"ok": True, **dict(row)}
+
 
 @app.patch("/api/admin/staff/{staff_id}/can-edit-items")
 async def admin_set_can_edit_items(staff_id: int, cid: int = Depends(_get_admin_cid),

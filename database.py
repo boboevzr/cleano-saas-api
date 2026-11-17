@@ -1815,6 +1815,8 @@ async def create_tables():
         await c.execute("""
         ALTER TABLE orders ADD COLUMN IF NOT EXISTS manual_discount NUMERIC(12,2) DEFAULT 0;
         """)
+        # перенос из ARTEZ 1d7e2b9 (16.11.2026): ручная скидка в % — сумма считается от суммы позиций; NULL — суммой
+        await c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS manual_discount_pct NUMERIC(6,2) DEFAULT NULL")
 
     # ── Шаг 10: тип вывоза и скидка при самовывозе (из мастерской) ───────
     async with pool.acquire() as c:
@@ -1957,6 +1959,8 @@ async def create_tables():
     # ── Шаг 19: флаг водителя ────────────────────────────────────────────
     async with pool.acquire() as c:
         await c.execute("ALTER TABLE staff ADD COLUMN IF NOT EXISTS can_drive BOOLEAN DEFAULT FALSE;")
+        # перенос из ARTEZ aab9387 (17.11.2026): ручная скидка — кроме админа/менеджера только с этим тоглом
+        await c.execute("ALTER TABLE staff ADD COLUMN IF NOT EXISTS can_give_discount BOOLEAN DEFAULT FALSE;")
 
     # ── Шаг 20: промо-акции (generic-модель, одна кампания засеяна) ──────
     async with pool.acquire() as c:
@@ -7342,7 +7346,7 @@ async def update_order(order_id: int, **kwargs) -> dict:
                "branch", "address", "short_address", "location", "location_address", "note", "deadline",
                "delivery_address", "delivery_short_address", "delivery_location", "delivery_location_address",
                "service_type", "pickup_type", "self_pickup_discount",
-               "discount_sum", "manual_discount",
+               "discount_sum", "manual_discount", "manual_discount_pct",
                "delivery_type", "delivery_discount", "delivery_discount_pct"}
     fields = {k: v for k, v in kwargs.items() if k in allowed}
     if not fields: return {}
@@ -7375,9 +7379,29 @@ async def update_order_discount(order_id: int, discount_sum: float) -> dict:
 # не складывается со скидками за самовывоз/самостоятельную доставку, только новые
 # заказы (client_discount_enabled), доставленные/отменённые не пересчитываются.
 # Категории пенсионер/инвалид в SaaS остаются информационными (как было).
+async def recalc_manual_discount_pct(order_id: int) -> None:
+    """Ручная скидка в % (перенос из ARTEZ 1d7e2b9): manual_discount = сумма позиций (с минимумами, как в карточке)
+    × % / 100, до сума. Пересчёт при любых изменениях позиций/замера (зовётся из recalc_client_discount).
+    Только заказ компании текущего запроса; доставленные/отменённые не трогаем."""
+    if not pool or not order_id:
+        return
+    async with pool.acquire() as conn:
+        o = await conn.fetchrow("SELECT company_id, status, manual_discount_pct, COALESCE(manual_discount,0) AS md "
+                                "FROM orders WHERE id=$1", order_id)
+    if not o or o["company_id"] != _cid() or o["manual_discount_pct"] is None or o["status"] in ("delivered", "cancelled"):
+        return
+    base = (await get_order_items_billing(order_id))["order_total"]
+    amount = float(int(base * float(o["manual_discount_pct"]) / 100 + 0.5))  # half-up, до сума
+    if amount != float(o["md"]):
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE orders SET manual_discount=$2 WHERE id=$1 AND company_id=$3 "
+                               "AND manual_discount_pct IS NOT NULL", order_id, amount, o["company_id"])
+
+
 async def recalc_client_discount(order_id: int) -> dict | None:
     if not pool or not order_id:
         return None
+    await recalc_manual_discount_pct(order_id)   # ручная скидка в % — тоже от суммы позиций
     async with pool.acquire() as conn:
         o = await conn.fetchrow("""
             SELECT o.id, o.company_id, o.status, o.source, o.client_discount_enabled, o.client_discount_online,
@@ -9707,7 +9731,8 @@ async def resolve_discount_request(request_id: int, approved_amount: float, reso
             return None
         r = dict(row)
         await conn.execute("""
-            UPDATE orders SET manual_discount = COALESCE(manual_discount,0) + $2 WHERE id=$1 AND company_id=$3
+            UPDATE orders SET manual_discount = COALESCE(manual_discount,0) + $2, manual_discount_pct = NULL
+             WHERE id=$1 AND company_id=$3
         """, r["order_id"], approved_amount, cid)
         return r
 
@@ -9748,7 +9773,8 @@ async def apply_auto_discount(order_id: int, amount: float, company_id: int) -> 
     if not pool: return False
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE orders SET manual_discount = COALESCE(manual_discount,0) + $2 WHERE id=$1 AND company_id=$3",
+            "UPDATE orders SET manual_discount = COALESCE(manual_discount,0) + $2, manual_discount_pct = NULL "
+            "WHERE id=$1 AND company_id=$3",   # % → суммой (перенос из ARTEZ 321ea03)
             order_id, amount, company_id)
     return True
 
