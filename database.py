@@ -35,6 +35,11 @@ def _resolve_tz(tz_name: str):
         return _FALLBACK_TZ
 
 
+# Часовой пояс отметок прихода/ухода и др. (17.11.2026): имя использовалось в 7 местах, но не было объявлено —
+# «Пришёл/Ушёл», «Сегодня» и отчёт «Отметки» падали с NameError (500).
+_TASHKENT = _resolve_tz("Asia/Tashkent")
+
+
 def _tz_range(date_from: str, date_to: str, tz_name: str = DEFAULT_TZ_NAME):
     """Преобразует строки дат в UTC-границы для TIMESTAMPTZ-сравнения.
 
