@@ -9454,52 +9454,60 @@ _CHAT_TEMPLATE_SEED = [
 ]
 
 async def seed_chat_templates_forced():
-    """Обновить auto-шаблоны (welcome/auto_reply/warn/bye) по key+lang,
-       добавить quick-шаблоны если текста ещё нет."""
+    """Обновить auto-шаблоны (welcome/auto_reply/warn/bye) по key+lang, добавить quick-шаблоны, если текста ещё нет —
+    ТОЛЬКО в своей компании (_cid()). 17.11.2026: раньше без company_id — админ одной компании переписывал
+    шаблоны (приветствия чата) других компаний."""
     if not pool: return 0
+    cid = _cid()
     updated = 0
     inserted = 0
     async with pool.acquire() as conn:
-        existing_texts = {r['text'] for r in await conn.fetch("SELECT text FROM chat_templates")}
+        existing_texts = {r['text'] for r in await conn.fetch("SELECT text FROM chat_templates WHERE company_id=$1", cid)}
         for key, lang, text, sort_order in _CHAT_TEMPLATE_SEED:
             if key == 'quick':
                 if text not in existing_texts:
                     await conn.execute(
-                        "INSERT INTO chat_templates (key, lang, text, sort_order) VALUES ($1,$2,$3,$4)",
-                        key, lang, text, sort_order
+                        "INSERT INTO chat_templates (key, lang, text, sort_order, company_id) VALUES ($1,$2,$3,$4,$5)",
+                        key, lang, text, sort_order, cid
                     )
                     inserted += 1
             else:
                 row = await conn.fetchrow(
-                    "SELECT id FROM chat_templates WHERE key=$1 AND lang=$2 LIMIT 1", key, lang
+                    "SELECT id FROM chat_templates WHERE key=$1 AND lang=$2 AND company_id=$3 LIMIT 1", key, lang, cid
                 )
                 if row:
                     await conn.execute(
-                        "UPDATE chat_templates SET text=$1, sort_order=$2 WHERE id=$3",
-                        text, sort_order, row['id']
+                        "UPDATE chat_templates SET text=$1, sort_order=$2 WHERE id=$3 AND company_id=$4",
+                        text, sort_order, row['id'], cid
                     )
                     updated += 1
                 else:
                     await conn.execute(
-                        "INSERT INTO chat_templates (key, lang, text, sort_order) VALUES ($1,$2,$3,$4)",
-                        key, lang, text, sort_order
+                        "INSERT INTO chat_templates (key, lang, text, sort_order, company_id) VALUES ($1,$2,$3,$4,$5)",
+                        key, lang, text, sort_order, cid
                     )
                     inserted += 1
     return updated + inserted
 
-async def get_chat_template_text(key: str, lang: str) -> str:
-    """Получить текст шаблона по ключу и языку, fallback на uz."""
+async def get_chat_template_text(key: str, lang: str, company_id: int | None = None) -> str:
+    """Текст шаблона чата СВОЕЙ компании по ключу и языку (17.11.2026: раньше — любой компании, клиент мог получить
+    чужое приветствие). Порядок: компания+язык → компания (любой язык) → шаблон суперадмина (company_id=0).
+    company_id не передан — компания запроса (_cid()); в фоновых задачах передавать явно (компания чата)."""
     if not pool: return None
+    cid = company_id if company_id is not None else _cid()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT text FROM chat_templates WHERE key=$1 AND lang=$2 AND active=TRUE LIMIT 1",
-            key, lang
-        )
-        if not row:
+        for c in (cid, 0):
             row = await conn.fetchrow(
-                "SELECT text FROM chat_templates WHERE key=$1 AND active=TRUE LIMIT 1", key
+                "SELECT text FROM chat_templates WHERE key=$1 AND lang=$2 AND active=TRUE AND company_id=$3 LIMIT 1",
+                key, lang, c
             )
-        return row['text'] if row else None
+            if not row:
+                row = await conn.fetchrow(
+                    "SELECT text FROM chat_templates WHERE key=$1 AND active=TRUE AND company_id=$2 LIMIT 1", key, c
+                )
+            if row:
+                return row['text']
+        return None
 
 async def touch_chat_client_activity(code: str):
     if not pool: return

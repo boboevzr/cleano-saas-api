@@ -10920,9 +10920,9 @@ async def _chat_timeout_worker():
             to_warn = await db.get_sessions_to_warn()
             for s in to_warn:
                 lang = s.get('lang') or 'uz'
-                warn_text = _tpl(await db.get_chat_template_text('warn_timeout', lang) or \
+                warn_text = _tpl(await db.get_chat_template_text('warn_timeout', lang, s.get('company_id')) or \
                     "⏰ Вы давно не отвечаете. Чат будет автоматически закрыт через 1 минуту.", s)
-                msg = await db.add_chat_message(s['id'], 'bot', 'ARTEZ', warn_text)
+                msg = await db.add_chat_message(s['id'], 'bot', await _chat_bot_name(s.get('company_id')), warn_text)
                 if msg:
                     await _chat.send_client(s['code'], {"type": "message", "msg": _msg_json(msg)})
                     claimed = s.get('claimed_by')
@@ -10939,9 +10939,9 @@ async def _chat_timeout_worker():
                 lang   = s.get('lang') or 'uz'
                 gender = (s.get('staff_gender') or 'M').upper()
                 bye_key = 'bye_f' if gender == 'F' else 'bye_m'
-                bye = _tpl(await db.get_chat_template_text(bye_key, lang) or \
+                bye = _tpl(await db.get_chat_template_text(bye_key, lang, s.get('company_id')) or \
                     ("Я рада, что смогла вам помочь! 😊" if gender == 'F' else "Я рад, что смог вам помочь! 😊"), s)
-                msg = await db.add_chat_message(s['id'], 'bot', 'ARTEZ', bye)
+                msg = await db.add_chat_message(s['id'], 'bot', await _chat_bot_name(s.get('company_id')), bye)
                 if msg:
                     await _chat.send_client(s['code'], {"type": "message", "msg": _msg_json(msg)})
                     claimed = s.get('claimed_by')
@@ -10984,9 +10984,10 @@ async def chat_start(body: dict = Body(...)):
     if not session:
         raise HTTPException(500, "Не удалось создать сессию")
 
-    welcome = _tpl(await db.get_chat_template_text('welcome', lang) or \
-        "Здравствуйте! 👋 Спасибо, что обратились в ARTEZ. Менеджер ответит вам в ближайшее время.", session)
-    await db.add_chat_message(session['id'], 'bot', 'ARTEZ', welcome)
+    _bot = await _chat_bot_name(cid)
+    welcome = _tpl(await db.get_chat_template_text('welcome', lang, cid) or \
+        f"Здравствуйте! 👋 Спасибо, что обратились в {_bot}. Менеджер ответит вам в ближайшее время.", session)
+    await db.add_chat_message(session['id'], 'bot', _bot, welcome)
 
     # Уведомить подключённых сотрудников той же компании через WS
     await _chat.broadcast_staff({
@@ -11013,8 +11014,28 @@ async def chat_start(body: dict = Body(...)):
     return {"ok": True, "code": code}
 
 
+# Кто работает с чатом клиентов (17.11.2026, как в staff.html _chatRoles; перенос из ARTEZ e45537a):
+# раньше любой сотрудник компании (мойщик, водитель) мог читать/брать/закрывать чаты и писать клиентам через WS.
+CHAT_ROLES = {"admin", "manager", "callcenter"}
+
+
+async def _chat_staff(staff=Depends(get_current_staff)):
+    if staff.get("role") not in CHAT_ROLES:
+        raise HTTPException(status_code=403, detail="Чат — для менеджера и колл-центра")
+    return staff
+
+
+async def _chat_bot_name(company_id: int | None) -> str:
+    """Подпись бота в чате клиента — название компании (раньше у всех компаний «ARTEZ»)."""
+    try:
+        name, _ = await _company_brand(company_id)
+    except Exception:
+        name = ""
+    return name or "Cleano"
+
+
 @app.get("/api/chat/sessions")
-async def chat_sessions(staff=Depends(get_current_staff)):
+async def chat_sessions(staff=Depends(_chat_staff)):
     sessions = await db.get_active_chat_sessions()
     result = []
     for s in sessions:
@@ -11027,7 +11048,7 @@ async def chat_sessions(staff=Depends(get_current_staff)):
 
 
 @app.get("/api/chat/{code}/messages")
-async def chat_get_messages(code: str, staff=Depends(get_current_staff)):
+async def chat_get_messages(code: str, staff=Depends(_chat_staff)):
     session = await db.get_chat_session(code)
     if not session or session.get('company_id') != (staff.get('company_id') or 1):
         raise HTTPException(404, "Сессия не найдена")
@@ -11037,7 +11058,7 @@ async def chat_get_messages(code: str, staff=Depends(get_current_staff)):
 
 
 @app.post("/api/chat/{code}/claim")
-async def chat_claim(code: str, staff=Depends(get_current_staff)):
+async def chat_claim(code: str, staff=Depends(_chat_staff)):
     existing = await db.get_chat_session(code)
     if not existing or existing.get('company_id') != (staff.get('company_id') or 1):
         raise HTTPException(404, "Сессия не найдена")
@@ -11055,7 +11076,7 @@ async def chat_claim(code: str, staff=Depends(get_current_staff)):
 
 
 @app.post("/api/chat/{code}/close")
-async def chat_close(code: str, staff=Depends(get_current_staff)):
+async def chat_close(code: str, staff=Depends(_chat_staff)):
     existing = await db.get_chat_session(code)
     if not existing or existing.get('company_id') != (staff.get('company_id') or 1):
         raise HTTPException(404, "Сессия не найдена")
@@ -11064,12 +11085,12 @@ async def chat_close(code: str, staff=Depends(get_current_staff)):
         raise HTTPException(404, "Сессия не найдена")
     await _chat.broadcast_staff({"type": "chat_closed", "code": code}, company_id=session.get('company_id'))
     await _chat.send_client(code, {"type": "chat_closed",
-                                    "text": "Чат завершён. Спасибо, что обратились в ARTEZ!"})
+                                    "text": f"Чат завершён. Спасибо, что обратились в {await _chat_bot_name(session.get('company_id'))}!"})
     return {"ok": True}
 
 
 @app.post("/api/chat/templates/seed")
-async def seed_templates(staff=Depends(get_current_staff)):
+async def seed_templates(staff=Depends(_chat_staff)):
     if staff.get('role') not in ('admin',):
         raise HTTPException(403, "Только для admin")
     # принудительно засеять (даже если таблица не пустая)
@@ -11092,7 +11113,7 @@ async def chat_active_by_phone(phone: str, company_slug: str = None):
 
 @app.get("/api/chat/history")
 async def chat_history(limit: int = 50, offset: int = 0, filter: str = "own",
-                       staff=Depends(get_current_staff)):
+                       staff=Depends(_chat_staff)):
     role = staff.get("role", "")
     can_see_all = role in ("admin", "manager")
     own_only = not can_see_all or filter == "own"
@@ -11104,24 +11125,24 @@ async def chat_history(limit: int = 50, offset: int = 0, filter: str = "own",
     return {"rows": rows, "can_see_all": can_see_all}
 
 @app.get("/api/chat/templates")
-async def get_templates(staff=Depends(get_current_staff)):
+async def get_templates(staff=Depends(_chat_staff)):
     rows = await db.get_all_chat_templates()
     return rows
 
 @app.get("/api/chat/templates/quick")
-async def get_quick_templates(lang: str = "uz", staff=Depends(get_current_staff)):
+async def get_quick_templates(lang: str = "uz", staff=Depends(_chat_staff)):
     rows = await db.get_chat_templates(lang=lang, key='quick')
     return rows
 
 @app.post("/api/chat/templates")
-async def create_template(body: dict = Body(...), staff=Depends(get_current_staff)):
+async def create_template(body: dict = Body(...), staff=Depends(_chat_staff)):
     if staff.get('role') not in ('admin', 'manager'):
         raise HTTPException(403, "Недостаточно прав")
     row = await db.upsert_chat_template(body)
     return row or {}
 
 @app.put("/api/chat/templates/{tid}")
-async def update_template(tid: int, body: dict = Body(...), staff=Depends(get_current_staff)):
+async def update_template(tid: int, body: dict = Body(...), staff=Depends(_chat_staff)):
     if staff.get('role') not in ('admin', 'manager'):
         raise HTTPException(403, "Недостаточно прав")
     body['id'] = tid
@@ -11129,7 +11150,7 @@ async def update_template(tid: int, body: dict = Body(...), staff=Depends(get_cu
     return row or {}
 
 @app.delete("/api/chat/templates/{tid}")
-async def del_template(tid: int, staff=Depends(get_current_staff)):
+async def del_template(tid: int, staff=Depends(_chat_staff)):
     if staff.get('role') not in ('admin', 'manager'):
         raise HTTPException(403, "Недостаточно прав")
     await db.delete_chat_template(tid)
@@ -11211,10 +11232,10 @@ async def ws_chat_client(websocket: WebSocket, code: str):
                 async def _send_auto_reply(c=code, sess=dict(session), cl=claimed):
                     await asyncio.sleep(3)
                     lang = sess.get('lang') or 'uz'
-                    auto_text = _tpl(await db.get_chat_template_text('auto_reply', lang), sess)
+                    auto_text = _tpl(await db.get_chat_template_text('auto_reply', lang, sess.get('company_id')), sess)
                     if not auto_text:
                         return
-                    auto_msg = await db.add_chat_message(sess['id'], 'bot', 'ARTEZ', auto_text)
+                    auto_msg = await db.add_chat_message(sess['id'], 'bot', await _chat_bot_name(sess.get('company_id')), auto_text)
                     if not auto_msg:
                         return
                     auto_payload = {"type": "message", "code": c, "msg": _msg_json(auto_msg)}
@@ -11243,6 +11264,9 @@ async def ws_chat_staff(websocket: WebSocket, token: str):
     _st = await _staff_from_payload(payload)
     if not _st:
         await websocket.close(code=4001)
+        return
+    if _st.get("role") not in CHAT_ROLES:   # 17.11.2026: только те, кто отвечает в чате (как в staff.html)
+        await websocket.close(code=4003)
         return
     staff_id = _st["id"]
     staff_company_id = int(_st.get("company_id") or 1)
