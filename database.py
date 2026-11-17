@@ -964,6 +964,8 @@ async def create_tables():
             created_at  TIMESTAMPTZ DEFAULT NOW(),
             updated_at  TIMESTAMPTZ DEFAULT NOW()
         )""",
+        # «маршрут отправлен водителю» — push «новый адрес» только после неё (перенос из ARTEZ 715c2f2, 17.11.2026)
+        "ALTER TABLE routes ADD COLUMN IF NOT EXISTS app_sent_at TIMESTAMPTZ",
         """CREATE TABLE IF NOT EXISTS route_orders (
             id          SERIAL PRIMARY KEY,
             route_id    INTEGER NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
@@ -1217,6 +1219,14 @@ async def create_tables():
         )""",
         "CREATE INDEX IF NOT EXISTS idx_attendance_events_staff ON staff_attendance_events(staff_id)",
         "CREATE INDEX IF NOT EXISTS idx_attendance_events_created ON staff_attendance_events(created_at)",
+        # «Приход только у цеха» (перенос из ARTEZ b506eae, 17.11.2026): координаты отметки, точность GPS,
+        # расстояние до цеха, автозакрытие незакрытой отметки в 23:59; у сотрудника — «отмечаться в любом месте»
+        "ALTER TABLE staff_attendance_events ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION",
+        "ALTER TABLE staff_attendance_events ADD COLUMN IF NOT EXISTS lon DOUBLE PRECISION",
+        "ALTER TABLE staff_attendance_events ADD COLUMN IF NOT EXISTS accuracy_m INTEGER",
+        "ALTER TABLE staff_attendance_events ADD COLUMN IF NOT EXISTS distance_m INTEGER",
+        "ALTER TABLE staff_attendance_events ADD COLUMN IF NOT EXISTS auto_closed BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE staff ADD COLUMN IF NOT EXISTS attendance_anywhere BOOLEAN DEFAULT FALSE",
         # Журнал отправок чека клиенту — для предупреждения о повторной отправке
         """CREATE TABLE IF NOT EXISTS order_receipt_log (
             id          SERIAL PRIMARY KEY,
@@ -1750,6 +1760,8 @@ async def create_tables():
             created_at    TIMESTAMPTZ  DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_order_photos_order ON order_photos(order_id);
+        -- кто загрузил (id сотрудника) — удалить своё фото может автор (перенос из ARTEZ 2911b3f, 17.11.2026)
+        ALTER TABLE order_photos ADD COLUMN IF NOT EXISTS uploaded_by_staff_id INTEGER;
         """)
 
     # ── Шаг 6: оплата и касса ────────────────────────────────────────────
@@ -1884,6 +1896,8 @@ async def create_tables():
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS pickup_time VARCHAR(100) DEFAULT '';
         -- 16.11.2026 (из ARTEZ d85db99): несколько услуг в заявке [{service_key,type_key,qty,name_ru,type_ru}]
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS services_json JSONB DEFAULT NULL;
+        -- «оформляется в заказ»: защита от двойного convert (перенос из ARTEZ 22c2819, 17.11.2026)
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS converting_at TIMESTAMPTZ DEFAULT NULL;
         """)
 
     # ── Шаг 15b: tg_id водителя в платежах ──────────────────────────────
@@ -5224,6 +5238,9 @@ async def revoke_staff_sessions(staff_id: int, reason: str, sid: int | None = No
                                    "AND revoked_at IS NULL", staff_id)
                 await conn.execute("UPDATE app_sessions SET revoked_at=NOW() WHERE kind='staff' AND subject_id=$1 "
                                    "AND revoked_at IS NULL", staff_id)
+                # и уведомления в приложение этому сотруднику больше не шлём (перенос из ARTEZ 715c2f2)
+                await conn.execute("UPDATE app_push_tokens SET revoked_at=NOW() WHERE kind='staff' AND subject_id=$1 "
+                                   "AND revoked_at IS NULL", staff_id)
             except Exception:
                 pass   # таблиц приложения ещё нет
         return n
@@ -5734,7 +5751,7 @@ async def reset_timesheet_month(year: int, month: int) -> dict:
 #  ОТМЕТКИ ПРИХОДА/УХОДА (staff_attendance)
 # ══════════════════════════════════════
 
-async def attendance_check_in(staff_id: int) -> dict:
+async def attendance_check_in(staff_id: int, geo: dict | None = None) -> dict:
     if not pool: return {}
     cid = _cid()
     today = datetime.now(_TASHKENT).date()
@@ -5747,14 +5764,15 @@ async def attendance_check_in(staff_id: int) -> dict:
         """, staff_id, today)
         if events and events[-1]["event_type"] == "in":
             return {"error": "already_in"}
+        g = geo or {}
         row = await conn.fetchrow("""
-            INSERT INTO staff_attendance_events (staff_id, event_type, company_id)
-            VALUES ($1, 'in', $2)
-            RETURNING id, staff_id, event_type, created_at
-        """, staff_id, cid)
+            INSERT INTO staff_attendance_events (staff_id, event_type, company_id, lat, lon, accuracy_m, distance_m)
+            VALUES ($1, 'in', $2, $3, $4, $5, $6)
+            RETURNING id, staff_id, event_type, created_at, distance_m
+        """, staff_id, cid, g.get("lat"), g.get("lon"), g.get("accuracy_m"), g.get("distance_m"))
         return dict(row) if row else {}
 
-async def attendance_check_out(staff_id: int) -> dict:
+async def attendance_check_out(staff_id: int, geo: dict | None = None) -> dict:
     if not pool: return {}
     cid = _cid()
     today = datetime.now(_TASHKENT).date()
@@ -5767,12 +5785,39 @@ async def attendance_check_out(staff_id: int) -> dict:
         """, staff_id, today)
         if not events or events[-1]["event_type"] == "out":
             return {"error": "not_checked_in"}
+        g = geo or {}
         row = await conn.fetchrow("""
-            INSERT INTO staff_attendance_events (staff_id, event_type, company_id)
-            VALUES ($1, 'out', $2)
-            RETURNING id, staff_id, event_type, created_at
-        """, staff_id, cid)
+            INSERT INTO staff_attendance_events (staff_id, event_type, company_id, lat, lon, accuracy_m, distance_m)
+            VALUES ($1, 'out', $2, $3, $4, $5, $6)
+            RETURNING id, staff_id, event_type, created_at, distance_m
+        """, staff_id, cid, g.get("lat"), g.get("lon"), g.get("accuracy_m"), g.get("distance_m"))
         return dict(row) if row else {}
+
+async def attendance_autoclose() -> int:
+    """Незакрытый приход прошлых дней → уход в 23:59:59 того дня (Ташкент) с пометкой auto_closed
+    («уход не отмечен»), в той же компании. Воркер — по всем компаниям. На оклад не влияет."""
+    if not pool: return 0
+    today = datetime.now(_TASHKENT).date()
+    n = 0
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT DISTINCT ON (staff_id) staff_id, event_type, created_at, company_id
+            FROM staff_attendance_events
+            ORDER BY staff_id, created_at DESC, id DESC
+        """)
+        for r in rows:
+            if r["event_type"] != "in":
+                continue
+            day = r["created_at"].astimezone(_TASHKENT).date()
+            if day >= today:
+                continue
+            end = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=_TASHKENT)
+            await conn.execute("""
+                INSERT INTO staff_attendance_events (staff_id, event_type, created_at, auto_closed, company_id)
+                VALUES ($1, 'out', $2, TRUE, $3)
+            """, r["staff_id"], end, r["company_id"])
+            n += 1
+    return n
 
 def _pair_attendance_sessions(events: list) -> list:
     """Pairs consecutive in/out events (sorted ascending by created_at) into sessions."""
@@ -5780,11 +5825,14 @@ def _pair_attendance_sessions(events: list) -> list:
     open_session = None
     for ev in events:
         if ev["event_type"] == "in":
-            open_session = {"check_in_at": ev["created_at"], "check_out_at": None}
+            open_session = {"check_in_at": ev["created_at"], "check_out_at": None,
+                            "in_distance_m": ev.get("distance_m"), "out_distance_m": None, "auto_out": False}
             sessions.append(open_session)
         elif ev["event_type"] == "out":
             if open_session is not None and open_session["check_out_at"] is None:
                 open_session["check_out_at"] = ev["created_at"]
+                open_session["out_distance_m"] = ev.get("distance_m")
+                open_session["auto_out"] = bool(ev.get("auto_closed"))
                 open_session = None
             # else: stray "out" with no open session — defensively skip it
     return sessions
@@ -5801,7 +5849,7 @@ async def get_attendance_today(staff_id: int) -> dict:
     today = datetime.now(_TASHKENT).date()
     async with pool.acquire() as conn:
         events = await conn.fetch("""
-            SELECT id, staff_id, event_type, created_at
+            SELECT id, staff_id, event_type, created_at, distance_m, auto_closed
             FROM staff_attendance_events
             WHERE staff_id=$1 AND (created_at AT TIME ZONE 'Asia/Tashkent')::date = $2
             ORDER BY created_at
@@ -5816,6 +5864,8 @@ async def get_attendance_today(staff_id: int) -> dict:
                 {
                     "check_in_at": s["check_in_at"].isoformat() if s["check_in_at"] else None,
                     "check_out_at": s["check_out_at"].isoformat() if s["check_out_at"] else None,
+                    "in_distance_m": s.get("in_distance_m"), "out_distance_m": s.get("out_distance_m"),
+                    "auto_out": s.get("auto_out", False),
                 }
                 for s in sessions
             ],
@@ -5827,7 +5877,7 @@ async def get_admin_attendance(year: int, month: int, staff_id: int = None) -> l
     cid = _cid()
     async with pool.acquire() as conn:
         sql = """
-            SELECT a.staff_id, a.event_type, a.created_at,
+            SELECT a.staff_id, a.event_type, a.created_at, a.distance_m, a.auto_closed,
                    s.first_name, s.last_name, s.role, s.branch, s.salary_type
             FROM staff_attendance_events a
             JOIN staff s ON s.id = a.staff_id
@@ -5849,6 +5899,8 @@ async def get_admin_attendance(year: int, month: int, staff_id: int = None) -> l
             groups.setdefault(key, []).append({
                 "event_type": r["event_type"],
                 "created_at": r["created_at"],
+                "distance_m": r["distance_m"],
+                "auto_closed": r["auto_closed"],
             })
             if key not in meta:
                 meta[key] = {
@@ -5871,6 +5923,8 @@ async def get_admin_attendance(year: int, month: int, staff_id: int = None) -> l
                     {
                         "check_in_at": s["check_in_at"].isoformat() if s["check_in_at"] else None,
                         "check_out_at": s["check_out_at"].isoformat() if s["check_out_at"] else None,
+                        "in_distance_m": s.get("in_distance_m"), "out_distance_m": s.get("out_distance_m"),
+                        "auto_out": s.get("auto_out", False),
                     }
                     for s in sessions
                 ],
@@ -7237,6 +7291,39 @@ async def _service_key_label(service_key: str, service_type: str | None) -> tupl
     return type_key, ru, ru, uz
 
 
+async def create_items_from_lead_lines(order_id: int, lines: list) -> list:
+    """Позиции заказа из services_json заявки («Стал заказом» в приложении; перенос из ARTEZ e45537a):
+    [{service_key, type_key, qty}] — вариант ровно из заявки, цена — снимок прайса компании (как у водителя);
+    «шт» — одна позиция с количеством, м² — по одной на вещь (мойщик доизмерит). Скидки — recalc в create_order_item."""
+    if not pool: return []
+    result = []
+    for ln in lines or []:
+        if not isinstance(ln, dict):
+            continue
+        service_key = str(ln.get("service_key") or "")
+        try:
+            n = max(0, min(50, int(ln.get("qty") or 1)))
+        except (TypeError, ValueError):
+            n = 1
+        keyed = await _service_key_label(service_key, ln.get("type_key") or None)
+        if not keyed or not n:
+            continue
+        type_key, label, ru, uz = keyed
+        snap = await resolve_price_snapshot(service_key, type_key) or {}
+        price = snap.get("list_price") or 0
+        extra = {"service_ru": ru, "service_uz": uz}
+        if snap.get("unit_key_snap") == "pcs":
+            row = await create_order_item(order_id, label, n, price, **snap, **extra)
+            if row:
+                result.append(row)
+            continue
+        for _ in range(n):
+            row = await create_order_item(order_id, label, 0, price, **snap, **extra)
+            if row:
+                result.append(row)
+    return result
+
+
 async def create_empty_items_by_service(order_id: int, service_counts: dict,
                                         service_type: str | None = None) -> list:
     """Как create_empty_items, но с разбивкой по услугам (по N позиций на каждую).
@@ -7889,14 +7976,16 @@ async def get_order_photos(order_id: int) -> list:
         return [dict(r) for r in rows]
 
 async def save_order_photo(order_id: int, tg_file_id: str, tg_file_type: str,
-                           photo_type: str, note: str, uploaded_by: str) -> dict:
+                           photo_type: str, note: str, uploaded_by: str,
+                           uploaded_by_staff_id: int | None = None) -> dict:
     if not pool: return {}
     cid = _cid()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO order_photos (order_id, tg_file_id, tg_file_type, photo_type, note, uploaded_by, company_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
-        """, order_id, tg_file_id, tg_file_type, photo_type, note, uploaded_by, cid)
+            INSERT INTO order_photos (order_id, tg_file_id, tg_file_type, photo_type, note, uploaded_by, company_id,
+                                      uploaded_by_staff_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *
+        """, order_id, tg_file_id, tg_file_type, photo_type, note, uploaded_by, cid, uploaded_by_staff_id)
         return dict(row) if row else {}
 
 async def delete_order_photo(photo_id: int, company_id: int) -> bool:
@@ -9277,15 +9366,18 @@ async def ensure_chat_tables():
         ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS last_client_msg_at TIMESTAMPTZ;
         ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS warned_at TIMESTAMPTZ;
         ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS lang VARCHAR(5) DEFAULT 'uz';
+        -- откуда клиент пишет: 'site' (виджет сайта) | 'app' (приложение) — 16.11.2026
+        ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS source VARCHAR(10) DEFAULT 'site';
         """)
 
-async def create_chat_session(code: str, client_phone: str = '', client_name: str = '', branch: str = '', lang: str = 'uz') -> dict:
+async def create_chat_session(code: str, client_phone: str = '', client_name: str = '', branch: str = '', lang: str = 'uz',
+                              source: str = 'site') -> dict:
     if not pool: return None
     cid = _cid()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "INSERT INTO chat_sessions (code, client_phone, client_name, branch, lang, company_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *",
-            code, client_phone, client_name, branch, lang, cid
+            "INSERT INTO chat_sessions (code, client_phone, client_name, branch, lang, company_id, source) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
+            code, client_phone, client_name, branch, lang, cid, source
         )
         return dict(row) if row else None
 
@@ -9314,6 +9406,19 @@ async def is_first_client_message(session_id: int) -> bool:
             session_id
         )
         return count == 0
+
+async def get_active_app_chat_by_phone(phone: str) -> dict:
+    """Открытый чат ИЗ ПРИЛОЖЕНИЯ этого номера в своей компании. Чаты сайта сюда не попадают: там номер вводит
+    кто угодно и он не проверен — иначе чужой чат «с моим номером» подхватился бы в моём приложении."""
+    if not pool or not phone: return None
+    cid = _cid()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM chat_sessions WHERE client_phone=$1 AND company_id=$2 AND source='app' "
+            "AND status IN ('pending','active') ORDER BY created_at DESC LIMIT 1",
+            phone.strip(), cid
+        )
+        return dict(row) if row else None
 
 async def get_active_chat_by_phone(phone: str) -> dict:
     """Найти активный/pending чат клиента (своей компании) по номеру телефона."""
