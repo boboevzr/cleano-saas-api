@@ -85,19 +85,77 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Проверка «запись своей компании» для путей с числовым id (17.11.2026, аудит межтенантных дыр) ──
+# Многие эндпоинты брали заказ/оплату/позицию/сотрудника/запись табеля… по одному id без company_id —
+# сотрудник компании A менял или видел данные компании B. Здесь одна общая проверка ДО входа в эндпоинт:
+# id из пути должен принадлежать компании из токена (позиция/оплата — ещё и этому заказу), иначе 404.
+_TENANT_RULES = [
+    (re.compile(r"^/api/(?:admin|staff)/orders/(\d+)(?:/|$)"),
+     "SELECT 1 FROM orders WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/staff/my-route/stops/(\d+)(?:/|$)"),
+     "SELECT 1 FROM orders WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/(?:admin|staff)/orders/(\d+)/items/(\d+)(?:/|$)"),
+     "SELECT 1 FROM order_items i JOIN orders o ON o.id=i.order_id WHERE i.order_id=$1 AND i.id=$3 AND o.company_id=$2"),
+    (re.compile(r"^/api/(?:admin|staff)/orders/(\d+)/payments/(\d+)(?:/|$)"),
+     "SELECT 1 FROM order_payments p JOIN orders o ON o.id=p.order_id WHERE p.order_id=$1 AND p.id=$3 AND o.company_id=$2"),
+    (re.compile(r"^/api/staff/payments/(\d+)(?:/|$)"),
+     "SELECT 1 FROM order_payments p JOIN orders o ON o.id=p.order_id WHERE p.id=$1 AND o.company_id=$2"),
+    (re.compile(r"^/api/(?:admin/)?staff/(\d+)(?:/|$)"),
+     "SELECT 1 FROM staff WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/admin/timesheet/(\d+)(?:/|$)"),
+     "SELECT 1 FROM timesheet t JOIN staff s ON s.id=t.staff_id WHERE t.id=$1 AND s.company_id=$2"),
+    (re.compile(r"^/api/admin/expenses/(\d+)(?:/|$)"),
+     "SELECT 1 FROM expenses WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/admin/expenses/categories/(\d+)(?:/|$)"),
+     "SELECT 1 FROM expense_categories WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/admin/cash/shifts/(\d+)(?:/|$)"),
+     "SELECT 1 FROM cash_shifts WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/staff/leads/(\d+)(?:/|$)"),
+     "SELECT 1 FROM leads WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/staff/reminders/(\d+)(?:/|$)"),
+     "SELECT 1 FROM lead_reminders r JOIN leads l ON l.id=r.lead_id WHERE r.id=$1 AND l.company_id=$2"),
+]
+
+
+async def _tenant_path_ok(path: str, company_id: int) -> bool:
+    if not db.pool:
+        return True
+    for rx, sql in _TENANT_RULES:
+        m_ = rx.match(path)
+        if not m_:
+            continue
+        ids = [int(g) for g in m_.groups()]
+        args = [ids[0], company_id] + ids[1:]
+        if not await db.pool.fetchval(sql, *args):
+            return False
+    return True
+
+
 @app.middleware("http")
 async def company_id_middleware(request: Request, call_next):
-    """Читает company_id из JWT и записывает в ContextVar перед каждым запросом."""
+    """Читает company_id из JWT и записывает в ContextVar перед каждым запросом.
+    17.11.2026: для путей с id (заказ, позиция, оплата, сотрудник, табель, расход, смена, заявка…) сначала
+    проверяет, что запись своей компании (_TENANT_RULES), иначе 404 — эндпоинт не вызывается."""
     company_id = 1
+    tenant_checked = False
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
         token = auth.removeprefix("Bearer ").strip()
         try:
             payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
             company_id = int(payload.get("company_id") or 1)
+            tenant_checked = payload.get("type") != "superadmin"
         except Exception:
             pass
     db.set_request_company(company_id)
+    if tenant_checked and request.url.path.startswith(("/api/admin/", "/api/staff/")):
+        try:
+            ok_ = await _tenant_path_ok(request.url.path, company_id)
+        except Exception as e:
+            logging.warning(f"tenant guard {request.url.path}: {type(e).__name__}: {e}")
+            ok_ = False
+        if not ok_:
+            return JSONResponse(status_code=404, content={"detail": "Не найдено"})
     return await call_next(request)
 
 
@@ -4886,13 +4944,18 @@ class LinkTgRequest(BaseModel):
     tg_username: str | None = None
 
 @app.post("/api/user/link-tg")
-async def link_tg(req: LinkTgRequest):
-    """Бот вызывает этот endpoint чтобы привязать tg_id к аккаунту сайта."""
+async def link_tg(req: LinkTgRequest, x_bot_secret: str = Header(None)):
+    """Бот вызывает этот endpoint чтобы привязать tg_id к аккаунту сайта.
+    17.11.2026 (аудит): раньше без всякой проверки — любой привязывал свой Telegram к ЛЮБОМУ клиенту любой
+    компании по user_id (дальше код входа в приложение уходил ему) и получал телефон. Теперь — только бот
+    платформы по секрету (заголовок X-Bot-Secret = BOT_TOKEN), телефон не отдаём."""
+    if not BOT_TOKEN or not x_bot_secret or not secrets.compare_digest(x_bot_secret, BOT_TOKEN):
+        raise HTTPException(403, "Forbidden")
     user = await db.get_user_by_id(req.user_id)
     if not user:
         raise HTTPException(404, "Пользователь не найден")
     await db.link_user_tg_id(user["phone"], req.tg_id, user["company_id"])
-    return {"ok": True, "phone": user["phone"], "name": user.get("first_name") or ""}
+    return {"ok": True, "name": user.get("first_name") or ""}
 
 @app.get("/api/orders")
 async def my_orders(user = Depends(get_current_user)):
@@ -7142,6 +7205,9 @@ async def create_cash_handover(
     note:          str   = Body("", embed=True),
     _=Depends(_get_admin),
 ):
+    # оба сотрудника — своей компании (17.11.2026: можно было менять «на руках» сотрудника чужой компании)
+    if not await db.staff_in_company(from_staff_id) or not await db.staff_in_company(to_staff_id):
+        raise HTTPException(status_code=404, detail="Сотрудник не найден")
     row = await db.add_cash_handover(from_staff_id, to_staff_id, amount, note)
     handover_id = row.get("id")
     # Эта запись создаётся вручную самим админом ("✅ Подтвердить приём") — в
@@ -7476,6 +7542,9 @@ async def staff_cash_handover(
     note:        str   = Body("", embed=True),
     staff=Depends(get_current_staff),
 ):
+    # получатель — своей компании (17.11.2026)
+    if not await db.staff_in_company(to_staff_id, staff.get("company_id")):
+        raise HTTPException(status_code=404, detail="Сотрудник не найден")
     from_name = " ".join(filter(None,[staff.get("last_name"),staff.get("first_name")])) or staff.get("login","")
     row = await db.add_cash_handover(staff["id"], to_staff_id, amount, note)
     handover_id = row["id"]
@@ -7603,6 +7672,9 @@ async def bank_deposit(
     if to_type not in ("bank", "safe"):
         raise HTTPException(status_code=400, detail="to_type must be bank or safe")
     depositor_id = from_staff_id or staff.get("id")
+    # сдающий — своей компании (17.11.2026: принимался любой from_staff_id)
+    if from_staff_id and not await db.staff_in_company(from_staff_id, staff.get("company_id")):
+        raise HTTPException(status_code=404, detail="Сотрудник не найден")
     row = await db.create_bank_deposit(depositor_id, amount, to_type, note)
     if not row:
         raise HTTPException(status_code=500, detail="Ошибка создания")
@@ -7849,9 +7921,10 @@ async def approve_expense(expense_id: int, staff=Depends(get_current_staff)):
         asyncio.create_task(send_web_push(row["created_by_staff_id"], title=title, body=body, push_type="expense_approved"))
     # Если mgr_approved — пуш admin
     if new_status == "mgr_approved":
-        admin_rows = await db.get_expenses(status=None)  # получим admin staff через другой путь
+        # админам СВОЕЙ компании (17.11.2026: уходило админам всех компаний)
         async with db.pool.acquire() as conn:
-            admins = await conn.fetch("SELECT id FROM staff WHERE role='admin' AND active=TRUE")
+            admins = await conn.fetch("SELECT id FROM staff WHERE role='admin' AND active=TRUE AND company_id=$1",
+                                      staff.get("company_id") or db._cid())
         for a in admins:
             asyncio.create_task(send_web_push(a["id"], title="📋 Расход ждёт подтверждения", body=body, push_type="expense_mgr_approved"))
     return {"ok": True, "expense": row}
@@ -8474,7 +8547,10 @@ async def cash_debug(staff=Depends(get_current_staff)):
             "SELECT id, order_id, amount, method, purpose, created_by, created_by_staff_id, handed_to_staff_id, created_at FROM order_payments WHERE created_by_staff_id=$1 OR handed_to_staff_id=$1 ORDER BY created_at DESC LIMIT 20",
             sid)
         name_rows = await conn.fetch(
-            "SELECT id, order_id, amount, method, purpose, created_by, created_by_staff_id, handed_to_staff_id FROM order_payments WHERE method='cash' AND created_by_staff_id IS NULL ORDER BY created_at DESC LIMIT 10")
+            "SELECT id, order_id, amount, method, purpose, created_by, created_by_staff_id, handed_to_staff_id FROM order_payments "
+            "WHERE method='cash' AND created_by_staff_id IS NULL "
+            "AND order_id IN (SELECT id FROM orders WHERE company_id=$1) ORDER BY created_at DESC LIMIT 10",   # своя компания
+            db._cid())
         staff_row = await conn.fetchrow("SELECT id, first_name, last_name, login FROM staff WHERE id=$1", sid)
     return {
         "staff_id": sid,
@@ -8935,7 +9011,7 @@ async def get_pending_position_requests(staff=Depends(get_current_staff)):
         return {"ok": True, "order_ids": []}
     async with db.pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id FROM orders WHERE pos_request_pending=TRUE"
+            "SELECT id FROM orders WHERE pos_request_pending=TRUE AND company_id=$1", db._cid()   # своя компания
         )
     return {"ok": True, "order_ids": [r["id"] for r in rows]}
 
@@ -9583,7 +9659,9 @@ async def _driver_take_delivery_core(order_id: int, staff: dict, source: str = "
     if not _can_drive(staff): raise HTTPException(403, "Нет доступа")
     name = _driver_name(staff)
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT status FROM orders WHERE id=$1", order_id)
+        # заказ — компании водителя (17.11.2026, аудит: бот передаёт order_id из callback, мимо middleware)
+        row = await conn.fetchrow("SELECT status FROM orders WHERE id=$1 AND company_id=$2",
+                                  order_id, int(staff.get("company_id") or db._cid()))
         if not row: raise HTTPException(404)
         cur = row["status"]
         if cur not in ("ready", "delivery"):
@@ -9653,7 +9731,9 @@ async def driver_undo_delivery(order_id: int, staff=Depends(get_current_staff)):
     if not _can_drive(staff): raise HTTPException(403, "Нет доступа")
     name = _driver_name(staff)
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT status FROM orders WHERE id=$1", order_id)
+        # заказ — компании водителя (17.11.2026, аудит: бот передаёт order_id из callback, мимо middleware)
+        row = await conn.fetchrow("SELECT status FROM orders WHERE id=$1 AND company_id=$2",
+                                  order_id, int(staff.get("company_id") or db._cid()))
         if not row: raise HTTPException(404)
         if row["status"] == "delivery":
             await conn.execute("UPDATE orders SET status='ready', updated_at=NOW() WHERE id=$1", order_id)
@@ -9728,7 +9808,9 @@ async def _driver_deliver_core(order_id: int, staff: dict, method: str = "", amo
     if not _can_drive(staff): raise HTTPException(403, "Нет доступа")
     name = _driver_name(staff)
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT status FROM orders WHERE id=$1", order_id)
+        # заказ — компании водителя (17.11.2026, аудит: бот передаёт order_id из callback, мимо middleware)
+        row = await conn.fetchrow("SELECT status FROM orders WHERE id=$1 AND company_id=$2",
+                                  order_id, int(staff.get("company_id") or db._cid()))
         if not row: raise HTTPException(404)
         if row["status"] not in ("ready", "delivery"):
             raise HTTPException(400, f"Статус: {row['status']}")
