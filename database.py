@@ -35,6 +35,11 @@ def _resolve_tz(tz_name: str):
         return _FALLBACK_TZ
 
 
+# Часовой пояс отметок прихода/ухода и др. (17.11.2026): имя использовалось в 7 местах, но не было объявлено —
+# «Пришёл/Ушёл», «Сегодня» и отчёт «Отметки» падали с NameError (500).
+_TASHKENT = _resolve_tz("Asia/Tashkent")
+
+
 def _tz_range(date_from: str, date_to: str, tz_name: str = DEFAULT_TZ_NAME):
     """Преобразует строки дат в UTC-границы для TIMESTAMPTZ-сравнения.
 
@@ -2067,6 +2072,9 @@ async def create_tables():
         # Cash / Expenses
         f"ALTER TABLE cash_shifts        ADD COLUMN IF NOT EXISTS company_id {_cid}",
         f"ALTER TABLE cash_handovers     ADD COLUMN IF NOT EXISTS company_id {_cid}",
+        # 17.11.2026: сдачи в банк/сейф писались без company_id (DEFAULT 1) — компания по сдавшему сотруднику
+        "UPDATE cash_handovers ch SET company_id = s.company_id FROM staff s WHERE s.id = ch.from_staff_id "
+        "AND ch.to_type IN ('bank','safe') AND s.company_id IS NOT NULL AND ch.company_id IS DISTINCT FROM s.company_id",
         f"ALTER TABLE expense_categories ADD COLUMN IF NOT EXISTS company_id {_cid}",
         f"ALTER TABLE expenses           ADD COLUMN IF NOT EXISTS company_id {_cid}",
         f"ALTER TABLE salary_ledger      ADD COLUMN IF NOT EXISTS company_id {_cid}",
@@ -4616,6 +4624,13 @@ async def get_staff_by_id(staff_id: int):
     async with pool.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM staff WHERE id=$1", staff_id)
 
+async def staff_in_company(staff_id, company_id: int | None = None) -> bool:
+    """Сотрудник с этим id — из этой компании (по умолчанию — компании запроса). Для id из тела запроса."""
+    if not pool or not staff_id: return False
+    async with pool.acquire() as conn:
+        return bool(await conn.fetchval("SELECT 1 FROM staff WHERE id=$1 AND company_id=$2",
+                                        int(staff_id), company_id or _cid()))
+
 async def get_first_admin_staff():
     if not pool: return None
     async with pool.acquire() as conn:
@@ -5138,11 +5153,12 @@ async def get_agent_commissions(staff_id: int, year: int = None, month: int = No
 async def get_all_commissions(year: int = None, month: int = None) -> list:
     if not pool: return []
     async with pool.acquire() as conn:
+        # только своей компании (17.11.2026: было WHERE 1=1 — начисления всех компаний)
         sql = """SELECT c.*, s.first_name, s.last_name
                  FROM staff_commissions c
                  LEFT JOIN staff s ON s.id = c.staff_id
-                 WHERE 1=1"""
-        args = []
+                 WHERE c.company_id=$1"""
+        args = [_cid()]
         if year:
             args.append(year); sql += f" AND EXTRACT(YEAR FROM c.created_at)=${len(args)}"
         if month:
@@ -5625,6 +5641,9 @@ async def save_timesheet(data: dict) -> dict:
     d = data["date"]
     if isinstance(d, str): d = _date.fromisoformat(d)
     async with pool.acquire() as conn:
+        # сотрудник — своей компании (17.11.2026: раньше ON CONFLICT перезаписывал строку чужой компании)
+        if not await conn.fetchval("SELECT 1 FROM staff WHERE id=$1 AND company_id=$2", int(data["staff_id"]), cid):
+            return {}
         row = await conn.fetchrow("""
             INSERT INTO timesheet (staff_id, date, hours, type, note, company_id)
             VALUES ($1, $2, $3, $4, $5, $6)
@@ -5646,18 +5665,19 @@ async def update_timesheet(ts_id: int, data: dict) -> dict:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE timesheet SET staff_id=$2, date=$3, hours=$4, type=$5, note=$6
-            WHERE id=$1
+            WHERE id=$1 AND staff_id IN (SELECT id FROM staff WHERE company_id=$7)
+              AND EXISTS (SELECT 1 FROM staff WHERE id=$2 AND company_id=$7)   -- 17.11.2026: только своя компания
             RETURNING id, staff_id, date::text, hours, type, note
         """, ts_id, int(data["staff_id"]), d,
             float(data.get("hours") or 8),
             data.get("type", "work"),
-            data.get("note", ""))
+            data.get("note", ""), _cid())
         return dict(row) if row else {}
 
 async def delete_timesheet(ts_id: int) -> bool:
     if not pool: return False
     async with pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM timesheet WHERE id=$1", ts_id)
+        result = await conn.execute("DELETE FROM timesheet WHERE id=$1 AND staff_id IN (SELECT id FROM staff WHERE company_id=$2)", ts_id, _cid())
         return result == "DELETE 1"
 
 async def init_timesheet_month(year: int, month: int, until_today: bool = False) -> dict:
@@ -5674,12 +5694,15 @@ async def init_timesheet_month(year: int, month: int, until_today: bool = False)
         last_day = min(last_day, today.day if (today.year == year and today.month == month) else last_day)
     month_start = date(year, month, 1)
     async with pool.acquire() as conn:
+        cid = _cid()
+        # 17.11.2026: только сотрудники своей компании (раньше — всех компаний, строки без company_id)
         staff_rows = await conn.fetch("""
             SELECT id, salary_type, hire_date FROM staff
             WHERE (active IS NULL OR active = TRUE)
               AND COALESCE(role,'') != 'agent'
               AND COALESCE(salary_type,'') NOT IN ('percent','per_unit','per_point')
-        """)
+              AND company_id = $1
+        """, cid)
         count = 0
         skipped = 0
         for s in staff_rows:
@@ -5694,10 +5717,10 @@ async def init_timesheet_month(year: int, month: int, until_today: bool = False)
                 if d.weekday() == 6:  # воскресенье — пропуск
                     continue
                 r = await conn.execute("""
-                    INSERT INTO timesheet (staff_id, date, hours, type)
-                    VALUES ($1, $2, 8, 'work')
+                    INSERT INTO timesheet (staff_id, date, hours, type, company_id)
+                    VALUES ($1, $2, 8, 'work', $3)
                     ON CONFLICT (staff_id, date) DO NOTHING
-                """, s["id"], d)
+                """, s["id"], d, cid)
                 if r.endswith("0 1"):
                     count += 1
     return {"created": count, "skipped": skipped}
@@ -5705,9 +5728,11 @@ async def init_timesheet_month(year: int, month: int, until_today: bool = False)
 async def reset_timesheet_month(year: int, month: int) -> dict:
     if not pool: return {"deleted": 0}
     async with pool.acquire() as conn:
+        # 17.11.2026: только своя компания — раньше «сбросить месяц» стирал табель ВСЕХ компаний
         result = await conn.execute(
-            "DELETE FROM timesheet WHERE EXTRACT(YEAR FROM date)=$1 AND EXTRACT(MONTH FROM date)=$2",
-            year, month)
+            "DELETE FROM timesheet WHERE EXTRACT(YEAR FROM date)=$1 AND EXTRACT(MONTH FROM date)=$2 "
+            "AND staff_id IN (SELECT id FROM staff WHERE company_id=$3)",
+            year, month, _cid())
         deleted = int(result.split()[-1]) if result else 0
     return {"deleted": deleted}
 
@@ -7329,14 +7354,17 @@ async def delete_order(order_id: int) -> bool:
     if not pool: return False
     cid = _cid()
     async with pool.acquire() as conn:
+        # Заказ — своей компании, ДО любых удалений (17.11.2026, аудит: раньше позиции/фото/остановки
+        # чужого заказа стирались до проверки компании)
+        row = await conn.fetchrow("SELECT order_num FROM orders WHERE id=$1 AND company_id=$2", order_id, cid)
+        if not row:
+            return False
+        order_num = dict(row).get("order_num")
         # Блокируем удаление если есть платежи — деньги должны быть сняты вручную
         payment_count = await conn.fetchval(
             "SELECT COUNT(*) FROM order_payments WHERE order_id=$1", order_id)
         if payment_count:
             raise ValueError(f"has_payments:{payment_count}")
-        # Получаем order_num до удаления (нужен для history)
-        row = await conn.fetchrow("SELECT order_num FROM orders WHERE id=$1 AND company_id=$2", order_id, cid)
-        order_num = dict(row).get("order_num") if row else None
         # Удаляем медиафайлы позиций
         await conn.execute("DELETE FROM order_item_media WHERE order_id=$1", order_id)
         # Удаляем позиции
@@ -8103,8 +8131,9 @@ async def get_current_shift() -> dict:
         return dict(row) if row else {}
 
 async def _get_current_shift_id(conn) -> int:
+    # открытая смена СВОЕЙ компании (17.11.2026: брала последнюю открытую смену любой компании)
     row = await conn.fetchrow(
-        "SELECT id FROM cash_shifts WHERE status='open' ORDER BY opened_at DESC LIMIT 1")
+        "SELECT id FROM cash_shifts WHERE status='open' AND company_id=$1 ORDER BY opened_at DESC LIMIT 1", _cid())
     return row['id'] if row else None
 
 async def get_cash_shifts(limit: int = 50) -> list:
@@ -8134,7 +8163,8 @@ async def get_cash_daily_total(date_str: str) -> dict:
             FROM order_payments
             WHERE created_at >= $1 AND created_at < $2
               AND NOT (confirmed = FALSE AND confirmed_at IS NOT NULL)
-        """, ts_from, ts_to)
+              AND order_id IN (SELECT id FROM orders WHERE company_id=$3)   -- 17.11.2026: только своя компания
+        """, ts_from, ts_to, _cid())
         return dict(row) if row else {}
 
 async def get_cash_payment_history(year: int, month: int, branch: str = '', day: int = 0) -> list:
@@ -8161,12 +8191,13 @@ async def get_cash_payment_history(year: int, month: int, branch: str = '', day:
                 COALESCE(SUM(op.amount), 0) AS total
             FROM order_payments op
             JOIN staff s ON s.id = op.created_by_staff_id
+            JOIN orders o ON o.id = op.order_id AND o.company_id = $4   -- 17.11.2026: только своя компания
             WHERE op.created_at >= $1 AND op.created_at < $2
               AND NOT (op.confirmed = FALSE AND op.confirmed_at IS NOT NULL)
               AND ($3 = '' OR s.branch = $3)
             GROUP BY pay_date, s.id, s.last_name, s.first_name, s.branch
             ORDER BY pay_date DESC, staff_name
-        """, ts_from, ts_to, branch)
+        """, ts_from, ts_to, branch, _cid())
         return [dict(r) for r in rows]
 
 # ── order_payments ────────────────────────────────────────────────────────────
@@ -8355,7 +8386,7 @@ async def get_all_cashiers_for_push() -> list:
     if not pool: return []
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id FROM staff WHERE can_manage_cash=TRUE AND active=TRUE"
+            "SELECT id FROM staff WHERE can_manage_cash=TRUE AND active=TRUE AND company_id=$1", _cid()
         )
         return [dict(r) for r in rows]
 
@@ -8755,8 +8786,8 @@ async def get_cashiers() -> list:
         rows = await conn.fetch(
             """SELECT id, first_name, last_name, role, position
                FROM staff
-               WHERE can_manage_cash=TRUE AND active=TRUE
-               ORDER BY (role='admin') DESC, last_name, first_name""")
+               WHERE can_manage_cash=TRUE AND active=TRUE AND company_id=$1
+               ORDER BY (role='admin') DESC, last_name, first_name""", _cid())
         return [dict(r) for r in rows]
 
 def _parse_date_param(s: str):
@@ -9004,9 +9035,9 @@ async def add_safe_deposit(from_staff_id: int, amount: float, note: str = '') ->
     async with pool.acquire() as conn:
         shift_id = await _get_current_shift_id(conn)
         row = await conn.fetchrow("""
-            INSERT INTO cash_handovers (from_staff_id, to_staff_id, amount, note, to_type, status, shift_id)
-            VALUES ($1, NULL, $2, $3, 'safe', 'pending', $4) RETURNING *
-        """, from_staff_id, amount, note, shift_id)
+            INSERT INTO cash_handovers (from_staff_id, to_staff_id, amount, note, to_type, status, shift_id, company_id)
+            VALUES ($1, NULL, $2, $3, 'safe', 'pending', $4, $5) RETURNING *
+        """, from_staff_id, amount, note, shift_id, _cid())
         return dict(row) if row else {}
 
 async def get_pending_safe_deposits() -> list:
@@ -9018,9 +9049,9 @@ async def get_pending_safe_deposits() -> list:
                    TRIM(COALESCE(sf.last_name,'') || ' ' || COALESCE(sf.first_name,'')) AS from_name
             FROM cash_handovers ch
             LEFT JOIN staff sf ON sf.id = ch.from_staff_id
-            WHERE ch.to_type='safe' AND ch.status='pending'
+            WHERE ch.to_type='safe' AND ch.status='pending' AND ch.company_id=$1
             ORDER BY ch.created_at DESC
-        """)
+        """, _cid())
         return [dict(r) for r in rows]
 
 async def create_bank_deposit(from_staff_id: int, amount: float, to_type: str, note: str = '') -> dict:
@@ -9029,9 +9060,9 @@ async def create_bank_deposit(from_staff_id: int, amount: float, to_type: str, n
     async with pool.acquire() as conn:
         shift_id = await _get_current_shift_id(conn)
         row = await conn.fetchrow("""
-            INSERT INTO cash_handovers (from_staff_id, to_staff_id, amount, note, to_type, status, confirmed_at, shift_id)
-            VALUES ($1, NULL, $2, $3, $4, 'confirmed', NOW(), $5) RETURNING *
-        """, from_staff_id, amount, note, to_type, shift_id)
+            INSERT INTO cash_handovers (from_staff_id, to_staff_id, amount, note, to_type, status, confirmed_at, shift_id, company_id)
+            VALUES ($1, NULL, $2, $3, $4, 'confirmed', NOW(), $5, $6) RETURNING *
+        """, from_staff_id, amount, note, to_type, shift_id, _cid())
         return dict(row) if row else {}
 
 async def get_bank_deposits(limit: int = 100) -> list:
@@ -9043,9 +9074,9 @@ async def get_bank_deposits(limit: int = 100) -> list:
                    TRIM(COALESCE(s.last_name,'') || ' ' || COALESCE(s.first_name,'')) AS from_name
             FROM cash_handovers ch
             LEFT JOIN staff s ON s.id = ch.from_staff_id
-            WHERE ch.to_type IN ('bank','safe')
+            WHERE ch.to_type IN ('bank','safe') AND ch.company_id=$2
             ORDER BY ch.created_at DESC LIMIT $1
-        """, limit)
+        """, limit, _cid())
         return [dict(r) for r in rows]
 
 async def get_cash_dashboard() -> dict:
@@ -9142,11 +9173,11 @@ async def get_unconfirmed_payments() -> list:
                    TRIM(COALESCE(s.last_name,'') || ' ' || COALESCE(s.first_name,'')) AS staff_full_name,
                    s.phone AS staff_phone
             FROM order_payments p
-            LEFT JOIN orders o ON o.id = p.order_id
+            JOIN orders o ON o.id = p.order_id AND o.company_id = $1   -- 17.11.2026: только своя компания
             LEFT JOIN staff s ON s.id = p.created_by_staff_id
             WHERE p.method IN ('card','transfer') AND p.confirmed=FALSE AND p.confirmed_at IS NULL
             ORDER BY p.created_at DESC
-        """)
+        """, _cid())
         return [dict(r) for r in rows]
 
 async def get_cash_tg_channel() -> str:
@@ -10749,8 +10780,9 @@ async def get_my_expenses(staff_id: int, date_from: str = None, date_to: str = N
 async def get_pending_expenses_for_manager(branch: str = None) -> list:
     if not pool: return []
     async with pool.acquire() as conn:
-        cond = "AND e.branch=$1" if branch else ""
-        params = [branch] if branch else []
+        # только своей компании (17.11.2026: были расходы всех компаний)
+        cond = "AND e.branch=$2" if branch else ""
+        params = [_cid()] + ([branch] if branch else [])
         rows = await conn.fetch(f"""
             SELECT e.*,
                    ec.name_ru AS category_name_ru, ec.name_uz AS category_name_uz,
@@ -10762,7 +10794,7 @@ async def get_pending_expenses_for_manager(branch: str = None) -> list:
             LEFT JOIN expense_categories ec ON ec.id = e.category_id
             LEFT JOIN expense_categories ep ON ep.id = ec.parent_id
             LEFT JOIN staff sc ON sc.id = e.created_by_staff_id
-            WHERE e.status='pending' AND ec.approve_level IN ('manager','both')
+            WHERE e.status='pending' AND ec.approve_level IN ('manager','both') AND e.company_id=$1
             {cond}
             ORDER BY e.created_at DESC
         """, *params)
@@ -10784,10 +10816,10 @@ async def get_pending_expenses_for_admin() -> list:
             LEFT JOIN expense_categories ep ON ep.id = ec.parent_id
             LEFT JOIN staff sc ON sc.id = e.created_by_staff_id
             LEFT JOIN staff sm ON sm.id = e.manager_id
-            WHERE (e.status='pending' AND ec.approve_level IN ('admin','both'))
-               OR e.status='mgr_approved'
+            WHERE e.company_id=$1 AND ((e.status='pending' AND ec.approve_level IN ('admin','both'))
+               OR e.status='mgr_approved')
             ORDER BY e.created_at DESC
-        """)
+        """, _cid())
         return [dict(r) for r in rows]
 
 async def approve_expense_manager(expense_id: int, manager_id: int) -> dict:
