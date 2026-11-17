@@ -85,19 +85,77 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Проверка «запись своей компании» для путей с числовым id (17.11.2026, аудит межтенантных дыр) ──
+# Многие эндпоинты брали заказ/оплату/позицию/сотрудника/запись табеля… по одному id без company_id —
+# сотрудник компании A менял или видел данные компании B. Здесь одна общая проверка ДО входа в эндпоинт:
+# id из пути должен принадлежать компании из токена (позиция/оплата — ещё и этому заказу), иначе 404.
+_TENANT_RULES = [
+    (re.compile(r"^/api/(?:admin|staff)/orders/(\d+)(?:/|$)"),
+     "SELECT 1 FROM orders WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/staff/my-route/stops/(\d+)(?:/|$)"),
+     "SELECT 1 FROM orders WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/(?:admin|staff)/orders/(\d+)/items/(\d+)(?:/|$)"),
+     "SELECT 1 FROM order_items i JOIN orders o ON o.id=i.order_id WHERE i.order_id=$1 AND i.id=$3 AND o.company_id=$2"),
+    (re.compile(r"^/api/(?:admin|staff)/orders/(\d+)/payments/(\d+)(?:/|$)"),
+     "SELECT 1 FROM order_payments p JOIN orders o ON o.id=p.order_id WHERE p.order_id=$1 AND p.id=$3 AND o.company_id=$2"),
+    (re.compile(r"^/api/staff/payments/(\d+)(?:/|$)"),
+     "SELECT 1 FROM order_payments p JOIN orders o ON o.id=p.order_id WHERE p.id=$1 AND o.company_id=$2"),
+    (re.compile(r"^/api/(?:admin/)?staff/(\d+)(?:/|$)"),
+     "SELECT 1 FROM staff WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/admin/timesheet/(\d+)(?:/|$)"),
+     "SELECT 1 FROM timesheet t JOIN staff s ON s.id=t.staff_id WHERE t.id=$1 AND s.company_id=$2"),
+    (re.compile(r"^/api/admin/expenses/(\d+)(?:/|$)"),
+     "SELECT 1 FROM expenses WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/admin/expenses/categories/(\d+)(?:/|$)"),
+     "SELECT 1 FROM expense_categories WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/admin/cash/shifts/(\d+)(?:/|$)"),
+     "SELECT 1 FROM cash_shifts WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/staff/leads/(\d+)(?:/|$)"),
+     "SELECT 1 FROM leads WHERE id=$1 AND company_id=$2"),
+    (re.compile(r"^/api/staff/reminders/(\d+)(?:/|$)"),
+     "SELECT 1 FROM lead_reminders r JOIN leads l ON l.id=r.lead_id WHERE r.id=$1 AND l.company_id=$2"),
+]
+
+
+async def _tenant_path_ok(path: str, company_id: int) -> bool:
+    if not db.pool:
+        return True
+    for rx, sql in _TENANT_RULES:
+        m_ = rx.match(path)
+        if not m_:
+            continue
+        ids = [int(g) for g in m_.groups()]
+        args = [ids[0], company_id] + ids[1:]
+        if not await db.pool.fetchval(sql, *args):
+            return False
+    return True
+
+
 @app.middleware("http")
 async def company_id_middleware(request: Request, call_next):
-    """Читает company_id из JWT и записывает в ContextVar перед каждым запросом."""
+    """Читает company_id из JWT и записывает в ContextVar перед каждым запросом.
+    17.11.2026: для путей с id (заказ, позиция, оплата, сотрудник, табель, расход, смена, заявка…) сначала
+    проверяет, что запись своей компании (_TENANT_RULES), иначе 404 — эндпоинт не вызывается."""
     company_id = 1
+    tenant_checked = False
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
         token = auth.removeprefix("Bearer ").strip()
         try:
             payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
             company_id = int(payload.get("company_id") or 1)
+            tenant_checked = payload.get("type") != "superadmin"
         except Exception:
             pass
     db.set_request_company(company_id)
+    if tenant_checked and request.url.path.startswith(("/api/admin/", "/api/staff/")):
+        try:
+            ok_ = await _tenant_path_ok(request.url.path, company_id)
+        except Exception as e:
+            logging.warning(f"tenant guard {request.url.path}: {type(e).__name__}: {e}")
+            ok_ = False
+        if not ok_:
+            return JSONResponse(status_code=404, content={"detail": "Не найдено"})
     return await call_next(request)
 
 
@@ -4835,13 +4893,18 @@ class LinkTgRequest(BaseModel):
     tg_username: str | None = None
 
 @app.post("/api/user/link-tg")
-async def link_tg(req: LinkTgRequest):
-    """Бот вызывает этот endpoint чтобы привязать tg_id к аккаунту сайта."""
+async def link_tg(req: LinkTgRequest, x_bot_secret: str = Header(None)):
+    """Бот вызывает этот endpoint чтобы привязать tg_id к аккаунту сайта.
+    17.11.2026 (аудит): раньше без всякой проверки — любой привязывал свой Telegram к ЛЮБОМУ клиенту любой
+    компании по user_id (дальше код входа в приложение уходил ему) и получал телефон. Теперь — только бот
+    платформы по секрету (заголовок X-Bot-Secret = BOT_TOKEN), телефон не отдаём."""
+    if not BOT_TOKEN or not x_bot_secret or not secrets.compare_digest(x_bot_secret, BOT_TOKEN):
+        raise HTTPException(403, "Forbidden")
     user = await db.get_user_by_id(req.user_id)
     if not user:
         raise HTTPException(404, "Пользователь не найден")
     await db.link_user_tg_id(user["phone"], req.tg_id, user["company_id"])
-    return {"ok": True, "phone": user["phone"], "name": user.get("first_name") or ""}
+    return {"ok": True, "name": user.get("first_name") or ""}
 
 @app.get("/api/orders")
 async def my_orders(user = Depends(get_current_user)):
