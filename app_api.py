@@ -833,6 +833,88 @@ async def app_chat_start(body: dict = Body({}), cur=Depends(current)):
     return {"ok": True, "code": code, "status": session["status"]}
 
 
+# ── Push сотрудникам в приложение (перенос из ARTEZ b98f753/715c2f2/796bf7c/e45537a, 17.11.2026) ──
+# Токен сотрудника — kind='staff', subject_id = staff.id; берём ТОЛЬКО токены этой компании и только
+# активного сотрудника этой компании (уволенному не шлём).
+
+async def _staff_tokens(company_id: int, staff_id: int | None = None, roles: list[str] | None = None) -> list[dict]:
+    rows = await db.pool.fetch(
+        "SELECT t.token, t.lang FROM app_push_tokens t JOIN staff s ON s.id = t.subject_id "
+        "WHERE t.kind='staff' AND t.revoked_at IS NULL AND t.company_id=$1 AND s.company_id=$1 AND s.active IS TRUE "
+        "AND ($2::int IS NULL OR s.id=$2) AND ($3::text[] IS NULL OR s.role = ANY($3::text[]))",
+        company_id, staff_id, list(roles) if roles is not None else None)
+    return [dict(r) for r in rows]
+
+
+async def _send_plain(tokens: list[dict], title: str, body: str, data: dict) -> int:
+    receipts = await expo_send([{
+        "to": t["token"], "sound": "default", "priority": "high", "channelId": "default",
+        "title": title, "body": body, "data": data,
+    } for t in tokens])
+    ok = 0
+    for t, rc in zip(tokens, receipts):
+        if rc.get("status") == "ok":
+            ok += 1
+        elif (rc.get("details") or {}).get("error") == "DeviceNotRegistered":
+            await db.pool.execute("UPDATE app_push_tokens SET revoked_at=NOW() WHERE token=$1", t["token"])
+    return ok
+
+
+async def push_staff(company_id: int, staff_id: int, title: str, body: str, data: dict) -> None:
+    """Push одному сотруднику своей компании; нет приложения — тихо ничего (в лог)."""
+    try:
+        if not db.pool or not company_id or not staff_id:
+            return
+        tokens = await _staff_tokens(company_id, staff_id=int(staff_id))
+        if not tokens:
+            log.info("app push staff=%s c=%s: нет токена приложения — «%s» не отправлен", staff_id, company_id, title)
+            return
+        await _send_plain(tokens, title, body, data)
+    except Exception as e:
+        log.warning("push_staff %s: %s: %s", staff_id, type(e).__name__, e)
+
+
+async def push_roles(company_id: int, roles: list[str], title: str, body: str, data: dict,
+                     only_id: int | None = None) -> None:
+    """Push всем активным сотрудникам компании с ролью из roles (only_id — одному из них)."""
+    try:
+        if not db.pool or not company_id:
+            return
+        tokens = await _staff_tokens(company_id, staff_id=only_id, roles=roles)
+        if tokens:
+            await _send_plain(tokens, title, body, data)
+    except Exception as e:
+        log.warning("push_roles %s: %s: %s", roles, type(e).__name__, e)
+
+
+async def push_route(company_id: int, route_id: int, added: int = 0) -> None:
+    """Водителю: «Новый адрес в маршруте» (добавили остановки в уже отправленный/активный маршрут) или
+    «Маршрут на сегодня» (отправили маршрут). Тап — экран «Маршрут»."""
+    try:
+        if not db.pool or not company_id:
+            return
+        async with db.pool.acquire() as c:
+            r = await c.fetchrow(
+                "SELECT driver_id, name, (app_sent_at IS NOT NULL OR status='active') AS sent, "
+                "(SELECT COUNT(*) FROM route_orders WHERE route_id=routes.id)::int AS n "
+                "FROM routes WHERE id=$1 AND company_id=$2", route_id, company_id)
+        if not r or not r["driver_id"] or (added and not r["sent"]):
+            return
+        tokens = await _staff_tokens(company_id, staff_id=int(r["driver_id"]))
+        if not tokens:
+            return
+        n, name = r["n"], r["name"] or ""
+        if added:
+            title = ("🚗 Новый адрес в маршруте", "🚗 Marshrutda yangi manzil")
+            text = (f"Добавлено: {added} · всего остановок: {n}", f"Qo'shildi: {added} · jami to'xtash: {n}")
+        else:
+            title = ("🚗 Маршрут на сегодня", "🚗 Bugungi marshrut")
+            text = (f"{name} · остановок: {n}", f"{name} · to'xtash: {n}")
+        await _send_to(tokens, title, text, {"kind": "route", "route_id": route_id})
+    except Exception as e:
+        log.warning("push_route %s: %s: %s", route_id, type(e).__name__, e)
+
+
 async def push_lead(company_id: int, lead_id: int, status: str) -> None:
     """Push клиенту, когда менеджер начал работу по заявке (contacted/callback/no_answer)."""
     text = APP_PUSH_LEAD.get(status)

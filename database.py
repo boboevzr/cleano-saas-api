@@ -959,6 +959,8 @@ async def create_tables():
             created_at  TIMESTAMPTZ DEFAULT NOW(),
             updated_at  TIMESTAMPTZ DEFAULT NOW()
         )""",
+        # «маршрут отправлен водителю» — push «новый адрес» только после неё (перенос из ARTEZ 715c2f2, 17.11.2026)
+        "ALTER TABLE routes ADD COLUMN IF NOT EXISTS app_sent_at TIMESTAMPTZ",
         """CREATE TABLE IF NOT EXISTS route_orders (
             id          SERIAL PRIMARY KEY,
             route_id    INTEGER NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
@@ -1745,6 +1747,8 @@ async def create_tables():
             created_at    TIMESTAMPTZ  DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_order_photos_order ON order_photos(order_id);
+        -- кто загрузил (id сотрудника) — удалить своё фото может автор (перенос из ARTEZ 2911b3f, 17.11.2026)
+        ALTER TABLE order_photos ADD COLUMN IF NOT EXISTS uploaded_by_staff_id INTEGER;
         """)
 
     # ── Шаг 6: оплата и касса ────────────────────────────────────────────
@@ -1879,6 +1883,8 @@ async def create_tables():
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS pickup_time VARCHAR(100) DEFAULT '';
         -- 16.11.2026 (из ARTEZ d85db99): несколько услуг в заявке [{service_key,type_key,qty,name_ru,type_ru}]
         ALTER TABLE leads ADD COLUMN IF NOT EXISTS services_json JSONB DEFAULT NULL;
+        -- «оформляется в заказ»: защита от двойного convert (перенос из ARTEZ 22c2819, 17.11.2026)
+        ALTER TABLE leads ADD COLUMN IF NOT EXISTS converting_at TIMESTAMPTZ DEFAULT NULL;
         """)
 
     # ── Шаг 15b: tg_id водителя в платежах ──────────────────────────────
@@ -5205,6 +5211,9 @@ async def revoke_staff_sessions(staff_id: int, reason: str, sid: int | None = No
                                    "AND revoked_at IS NULL", staff_id)
                 await conn.execute("UPDATE app_sessions SET revoked_at=NOW() WHERE kind='staff' AND subject_id=$1 "
                                    "AND revoked_at IS NULL", staff_id)
+                # и уведомления в приложение этому сотруднику больше не шлём (перенос из ARTEZ 715c2f2)
+                await conn.execute("UPDATE app_push_tokens SET revoked_at=NOW() WHERE kind='staff' AND subject_id=$1 "
+                                   "AND revoked_at IS NULL", staff_id)
             except Exception:
                 pass   # таблиц приложения ещё нет
         return n
@@ -7209,6 +7218,39 @@ async def _service_key_label(service_key: str, service_type: str | None) -> tupl
     return type_key, ru, ru, uz
 
 
+async def create_items_from_lead_lines(order_id: int, lines: list) -> list:
+    """Позиции заказа из services_json заявки («Стал заказом» в приложении; перенос из ARTEZ e45537a):
+    [{service_key, type_key, qty}] — вариант ровно из заявки, цена — снимок прайса компании (как у водителя);
+    «шт» — одна позиция с количеством, м² — по одной на вещь (мойщик доизмерит). Скидки — recalc в create_order_item."""
+    if not pool: return []
+    result = []
+    for ln in lines or []:
+        if not isinstance(ln, dict):
+            continue
+        service_key = str(ln.get("service_key") or "")
+        try:
+            n = max(0, min(50, int(ln.get("qty") or 1)))
+        except (TypeError, ValueError):
+            n = 1
+        keyed = await _service_key_label(service_key, ln.get("type_key") or None)
+        if not keyed or not n:
+            continue
+        type_key, label, ru, uz = keyed
+        snap = await resolve_price_snapshot(service_key, type_key) or {}
+        price = snap.get("list_price") or 0
+        extra = {"service_ru": ru, "service_uz": uz}
+        if snap.get("unit_key_snap") == "pcs":
+            row = await create_order_item(order_id, label, n, price, **snap, **extra)
+            if row:
+                result.append(row)
+            continue
+        for _ in range(n):
+            row = await create_order_item(order_id, label, 0, price, **snap, **extra)
+            if row:
+                result.append(row)
+    return result
+
+
 async def create_empty_items_by_service(order_id: int, service_counts: dict,
                                         service_type: str | None = None) -> list:
     """Как create_empty_items, но с разбивкой по услугам (по N позиций на каждую).
@@ -7858,14 +7900,16 @@ async def get_order_photos(order_id: int) -> list:
         return [dict(r) for r in rows]
 
 async def save_order_photo(order_id: int, tg_file_id: str, tg_file_type: str,
-                           photo_type: str, note: str, uploaded_by: str) -> dict:
+                           photo_type: str, note: str, uploaded_by: str,
+                           uploaded_by_staff_id: int | None = None) -> dict:
     if not pool: return {}
     cid = _cid()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO order_photos (order_id, tg_file_id, tg_file_type, photo_type, note, uploaded_by, company_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
-        """, order_id, tg_file_id, tg_file_type, photo_type, note, uploaded_by, cid)
+            INSERT INTO order_photos (order_id, tg_file_id, tg_file_type, photo_type, note, uploaded_by, company_id,
+                                      uploaded_by_staff_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *
+        """, order_id, tg_file_id, tg_file_type, photo_type, note, uploaded_by, cid, uploaded_by_staff_id)
         return dict(row) if row else {}
 
 async def delete_order_photo(photo_id: int, company_id: int) -> bool:
