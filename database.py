@@ -3397,10 +3397,7 @@ async def get_orders_by_phone(phone: str, company_id: int):
         return await conn.fetch("""
             SELECT order_num, service, branch, city, address, status,
                    pickup_date, pickup_time, total_price, created_at,
-                   (SELECT COUNT(*) FROM order_items WHERE order_id=orders.id)::int AS item_count,
-                   -- «Замер проведён» клиенту: все позиции утверждены (перенос из ARTEZ)
-                   COALESCE((SELECT COUNT(*) > 0 AND bool_and(measure_status IN ('approved','confirmed'))
-                               FROM order_items WHERE order_id=orders.id), FALSE) AS measure_done
+                   (SELECT COUNT(*) FROM order_items WHERE order_id=orders.id)::int AS item_count
             FROM orders
             WHERE client_phone = $1 AND company_id = $2
             ORDER BY created_at DESC
@@ -8351,32 +8348,29 @@ async def approve_item_measure(item_id: int) -> dict:
         """, item_id)
         return dict(row) if row else {}
 
-async def direct_approve_measure(item_id: int, width_cm: float, length_cm: float, by: int | None = None) -> dict:
-    """by — кто ввёл замер сам (direct_approve) → «Замерил»; None — не трогаем (правка при утверждении)."""
+async def direct_approve_measure(item_id: int, width_cm: float, length_cm: float) -> dict:
     if not pool: return {}
     sqm = round(width_cm * length_cm / 10000, 3)
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE order_items
                SET width_cm=$2, length_cm=$3, sqm=$4,
-                   measure_status='approved', reject_note=NULL,
-                   measure_submitted_by=COALESCE($5, measure_submitted_by)
+                   measure_status='approved', reject_note=NULL
              WHERE id=$1 RETURNING *
-        """, item_id, width_cm, length_cm, sqm, by)
+        """, item_id, width_cm, length_cm, sqm)
     if row:
         await recalc_client_discount(row["order_id"])
     return dict(row) if row else {}
 
-async def direct_approve_measure_qty(item_id: int, quantity: float, by: int | None = None) -> dict:
+async def direct_approve_measure_qty(item_id: int, quantity: float) -> dict:
     if not pool: return {}
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE order_items
                SET width_cm=NULL, length_cm=NULL, sqm=$2,
-                   measure_status='approved', reject_note=NULL,
-                   measure_submitted_by=COALESCE($3, measure_submitted_by)
+                   measure_status='approved', reject_note=NULL
              WHERE id=$1 RETURNING *
-        """, item_id, round(quantity, 3), by)
+        """, item_id, round(quantity, 3))
     if row:
         await recalc_client_discount(row["order_id"])
     return dict(row) if row else {}
@@ -9904,10 +9898,7 @@ _ORDER_EXTRA_COLS = """,
     COALESCE((SELECT SUM(COALESCE(price_per_sqm,0)*COALESCE(sqm,0))
               FROM order_items WHERE order_id=orders.id), 0) AS items_total_calc,
     COALESCE((SELECT SUM(amount) FROM order_payments
-              WHERE order_id=orders.id AND NOT (confirmed=FALSE AND confirmed_at IS NOT NULL)), 0) AS paid_amount,
-    -- «Замер проведён»: все позиции утверждены (перенос из ARTEZ)
-    COALESCE((SELECT COUNT(*) > 0 AND bool_and(measure_status IN ('approved','confirmed'))
-              FROM order_items WHERE order_id=orders.id), FALSE) AS measure_done
+              WHERE order_id=orders.id AND NOT (confirmed=FALSE AND confirmed_at IS NOT NULL)), 0) AS paid_amount
 """
 
 def order_payment_summary(o: dict) -> dict:
