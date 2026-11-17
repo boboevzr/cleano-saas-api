@@ -2066,6 +2066,9 @@ async def create_tables():
         # Cash / Expenses
         f"ALTER TABLE cash_shifts        ADD COLUMN IF NOT EXISTS company_id {_cid}",
         f"ALTER TABLE cash_handovers     ADD COLUMN IF NOT EXISTS company_id {_cid}",
+        # 17.11.2026: сдачи в банк/сейф писались без company_id (DEFAULT 1) — компания по сдавшему сотруднику
+        "UPDATE cash_handovers ch SET company_id = s.company_id FROM staff s WHERE s.id = ch.from_staff_id "
+        "AND ch.to_type IN ('bank','safe') AND s.company_id IS NOT NULL AND ch.company_id IS DISTINCT FROM s.company_id",
         f"ALTER TABLE expense_categories ADD COLUMN IF NOT EXISTS company_id {_cid}",
         f"ALTER TABLE expenses           ADD COLUMN IF NOT EXISTS company_id {_cid}",
         f"ALTER TABLE salary_ledger      ADD COLUMN IF NOT EXISTS company_id {_cid}",
@@ -4615,6 +4618,13 @@ async def get_staff_by_id(staff_id: int):
     async with pool.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM staff WHERE id=$1", staff_id)
 
+async def staff_in_company(staff_id, company_id: int | None = None) -> bool:
+    """Сотрудник с этим id — из этой компании (по умолчанию — компании запроса). Для id из тела запроса."""
+    if not pool or not staff_id: return False
+    async with pool.acquire() as conn:
+        return bool(await conn.fetchval("SELECT 1 FROM staff WHERE id=$1 AND company_id=$2",
+                                        int(staff_id), company_id or _cid()))
+
 async def get_first_admin_staff():
     if not pool: return None
     async with pool.acquire() as conn:
@@ -5137,11 +5147,12 @@ async def get_agent_commissions(staff_id: int, year: int = None, month: int = No
 async def get_all_commissions(year: int = None, month: int = None) -> list:
     if not pool: return []
     async with pool.acquire() as conn:
+        # только своей компании (17.11.2026: было WHERE 1=1 — начисления всех компаний)
         sql = """SELECT c.*, s.first_name, s.last_name
                  FROM staff_commissions c
                  LEFT JOIN staff s ON s.id = c.staff_id
-                 WHERE 1=1"""
-        args = []
+                 WHERE c.company_id=$1"""
+        args = [_cid()]
         if year:
             args.append(year); sql += f" AND EXTRACT(YEAR FROM c.created_at)=${len(args)}"
         if month:
@@ -8076,8 +8087,9 @@ async def get_current_shift() -> dict:
         return dict(row) if row else {}
 
 async def _get_current_shift_id(conn) -> int:
+    # открытая смена СВОЕЙ компании (17.11.2026: брала последнюю открытую смену любой компании)
     row = await conn.fetchrow(
-        "SELECT id FROM cash_shifts WHERE status='open' ORDER BY opened_at DESC LIMIT 1")
+        "SELECT id FROM cash_shifts WHERE status='open' AND company_id=$1 ORDER BY opened_at DESC LIMIT 1", _cid())
     return row['id'] if row else None
 
 async def get_cash_shifts(limit: int = 50) -> list:
@@ -8330,7 +8342,7 @@ async def get_all_cashiers_for_push() -> list:
     if not pool: return []
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id FROM staff WHERE can_manage_cash=TRUE AND active=TRUE"
+            "SELECT id FROM staff WHERE can_manage_cash=TRUE AND active=TRUE AND company_id=$1", _cid()
         )
         return [dict(r) for r in rows]
 
@@ -8730,8 +8742,8 @@ async def get_cashiers() -> list:
         rows = await conn.fetch(
             """SELECT id, first_name, last_name, role, position
                FROM staff
-               WHERE can_manage_cash=TRUE AND active=TRUE
-               ORDER BY (role='admin') DESC, last_name, first_name""")
+               WHERE can_manage_cash=TRUE AND active=TRUE AND company_id=$1
+               ORDER BY (role='admin') DESC, last_name, first_name""", _cid())
         return [dict(r) for r in rows]
 
 def _parse_date_param(s: str):
@@ -8979,9 +8991,9 @@ async def add_safe_deposit(from_staff_id: int, amount: float, note: str = '') ->
     async with pool.acquire() as conn:
         shift_id = await _get_current_shift_id(conn)
         row = await conn.fetchrow("""
-            INSERT INTO cash_handovers (from_staff_id, to_staff_id, amount, note, to_type, status, shift_id)
-            VALUES ($1, NULL, $2, $3, 'safe', 'pending', $4) RETURNING *
-        """, from_staff_id, amount, note, shift_id)
+            INSERT INTO cash_handovers (from_staff_id, to_staff_id, amount, note, to_type, status, shift_id, company_id)
+            VALUES ($1, NULL, $2, $3, 'safe', 'pending', $4, $5) RETURNING *
+        """, from_staff_id, amount, note, shift_id, _cid())
         return dict(row) if row else {}
 
 async def get_pending_safe_deposits() -> list:
@@ -8993,9 +9005,9 @@ async def get_pending_safe_deposits() -> list:
                    TRIM(COALESCE(sf.last_name,'') || ' ' || COALESCE(sf.first_name,'')) AS from_name
             FROM cash_handovers ch
             LEFT JOIN staff sf ON sf.id = ch.from_staff_id
-            WHERE ch.to_type='safe' AND ch.status='pending'
+            WHERE ch.to_type='safe' AND ch.status='pending' AND ch.company_id=$1
             ORDER BY ch.created_at DESC
-        """)
+        """, _cid())
         return [dict(r) for r in rows]
 
 async def create_bank_deposit(from_staff_id: int, amount: float, to_type: str, note: str = '') -> dict:
@@ -9004,9 +9016,9 @@ async def create_bank_deposit(from_staff_id: int, amount: float, to_type: str, n
     async with pool.acquire() as conn:
         shift_id = await _get_current_shift_id(conn)
         row = await conn.fetchrow("""
-            INSERT INTO cash_handovers (from_staff_id, to_staff_id, amount, note, to_type, status, confirmed_at, shift_id)
-            VALUES ($1, NULL, $2, $3, $4, 'confirmed', NOW(), $5) RETURNING *
-        """, from_staff_id, amount, note, to_type, shift_id)
+            INSERT INTO cash_handovers (from_staff_id, to_staff_id, amount, note, to_type, status, confirmed_at, shift_id, company_id)
+            VALUES ($1, NULL, $2, $3, $4, 'confirmed', NOW(), $5, $6) RETURNING *
+        """, from_staff_id, amount, note, to_type, shift_id, _cid())
         return dict(row) if row else {}
 
 async def get_bank_deposits(limit: int = 100) -> list:
@@ -9018,9 +9030,9 @@ async def get_bank_deposits(limit: int = 100) -> list:
                    TRIM(COALESCE(s.last_name,'') || ' ' || COALESCE(s.first_name,'')) AS from_name
             FROM cash_handovers ch
             LEFT JOIN staff s ON s.id = ch.from_staff_id
-            WHERE ch.to_type IN ('bank','safe')
+            WHERE ch.to_type IN ('bank','safe') AND ch.company_id=$2
             ORDER BY ch.created_at DESC LIMIT $1
-        """, limit)
+        """, limit, _cid())
         return [dict(r) for r in rows]
 
 async def get_cash_dashboard() -> dict:
@@ -10708,8 +10720,9 @@ async def get_my_expenses(staff_id: int, date_from: str = None, date_to: str = N
 async def get_pending_expenses_for_manager(branch: str = None) -> list:
     if not pool: return []
     async with pool.acquire() as conn:
-        cond = "AND e.branch=$1" if branch else ""
-        params = [branch] if branch else []
+        # только своей компании (17.11.2026: были расходы всех компаний)
+        cond = "AND e.branch=$2" if branch else ""
+        params = [_cid()] + ([branch] if branch else [])
         rows = await conn.fetch(f"""
             SELECT e.*,
                    ec.name_ru AS category_name_ru, ec.name_uz AS category_name_uz,
@@ -10721,7 +10734,7 @@ async def get_pending_expenses_for_manager(branch: str = None) -> list:
             LEFT JOIN expense_categories ec ON ec.id = e.category_id
             LEFT JOIN expense_categories ep ON ep.id = ec.parent_id
             LEFT JOIN staff sc ON sc.id = e.created_by_staff_id
-            WHERE e.status='pending' AND ec.approve_level IN ('manager','both')
+            WHERE e.status='pending' AND ec.approve_level IN ('manager','both') AND e.company_id=$1
             {cond}
             ORDER BY e.created_at DESC
         """, *params)
@@ -10743,10 +10756,10 @@ async def get_pending_expenses_for_admin() -> list:
             LEFT JOIN expense_categories ep ON ep.id = ec.parent_id
             LEFT JOIN staff sc ON sc.id = e.created_by_staff_id
             LEFT JOIN staff sm ON sm.id = e.manager_id
-            WHERE (e.status='pending' AND ec.approve_level IN ('admin','both'))
-               OR e.status='mgr_approved'
+            WHERE e.company_id=$1 AND ((e.status='pending' AND ec.approve_level IN ('admin','both'))
+               OR e.status='mgr_approved')
             ORDER BY e.created_at DESC
-        """)
+        """, _cid())
         return [dict(r) for r in rows]
 
 async def approve_expense_manager(expense_id: int, manager_id: int) -> dict:

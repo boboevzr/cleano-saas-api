@@ -7128,6 +7128,9 @@ async def create_cash_handover(
     note:          str   = Body("", embed=True),
     _=Depends(_get_admin),
 ):
+    # оба сотрудника — своей компании (17.11.2026: можно было менять «на руках» сотрудника чужой компании)
+    if not await db.staff_in_company(from_staff_id) or not await db.staff_in_company(to_staff_id):
+        raise HTTPException(status_code=404, detail="Сотрудник не найден")
     row = await db.add_cash_handover(from_staff_id, to_staff_id, amount, note)
     handover_id = row.get("id")
     # Эта запись создаётся вручную самим админом ("✅ Подтвердить приём") — в
@@ -7462,6 +7465,9 @@ async def staff_cash_handover(
     note:        str   = Body("", embed=True),
     staff=Depends(get_current_staff),
 ):
+    # получатель — своей компании (17.11.2026)
+    if not await db.staff_in_company(to_staff_id, staff.get("company_id")):
+        raise HTTPException(status_code=404, detail="Сотрудник не найден")
     from_name = " ".join(filter(None,[staff.get("last_name"),staff.get("first_name")])) or staff.get("login","")
     row = await db.add_cash_handover(staff["id"], to_staff_id, amount, note)
     handover_id = row["id"]
@@ -7589,6 +7595,9 @@ async def bank_deposit(
     if to_type not in ("bank", "safe"):
         raise HTTPException(status_code=400, detail="to_type must be bank or safe")
     depositor_id = from_staff_id or staff.get("id")
+    # сдающий — своей компании (17.11.2026: принимался любой from_staff_id)
+    if from_staff_id and not await db.staff_in_company(from_staff_id, staff.get("company_id")):
+        raise HTTPException(status_code=404, detail="Сотрудник не найден")
     row = await db.create_bank_deposit(depositor_id, amount, to_type, note)
     if not row:
         raise HTTPException(status_code=500, detail="Ошибка создания")
@@ -7835,9 +7844,10 @@ async def approve_expense(expense_id: int, staff=Depends(get_current_staff)):
         asyncio.create_task(send_web_push(row["created_by_staff_id"], title=title, body=body, push_type="expense_approved"))
     # Если mgr_approved — пуш admin
     if new_status == "mgr_approved":
-        admin_rows = await db.get_expenses(status=None)  # получим admin staff через другой путь
+        # админам СВОЕЙ компании (17.11.2026: уходило админам всех компаний)
         async with db.pool.acquire() as conn:
-            admins = await conn.fetch("SELECT id FROM staff WHERE role='admin' AND active=TRUE")
+            admins = await conn.fetch("SELECT id FROM staff WHERE role='admin' AND active=TRUE AND company_id=$1",
+                                      staff.get("company_id") or db._cid())
         for a in admins:
             asyncio.create_task(send_web_push(a["id"], title="📋 Расход ждёт подтверждения", body=body, push_type="expense_mgr_approved"))
     return {"ok": True, "expense": row}
