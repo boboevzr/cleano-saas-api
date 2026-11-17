@@ -974,13 +974,16 @@ async def _notify_agent_status(lead_id: int, status: str, note: str):
 
 async def _notify_new_lead(lead: dict, staff: dict):
     # Web push к callcenter/manager/admin — всегда, независимо от TG настроек
-    if db.pool and lead.get("id"):
+    lead_cid = lead.get("company_id") or db._cid()
+    if db.pool and lead.get("id") and lead_cid:
         try:
             async with db.pool.acquire() as conn:
+                # только своей компании (17.11.2026): раньше уходило менеджерам ВСЕХ компаний
                 rows = await conn.fetch(
                     "SELECT DISTINCT s.id FROM staff s "
                     "JOIN push_subscriptions ps ON ps.staff_id = s.id "
-                    "WHERE s.active=TRUE AND s.role IN ('callcenter','manager','admin')"
+                    "WHERE s.active=TRUE AND s.role IN ('callcenter','manager','admin') AND s.company_id=$1",
+                    lead_cid
                 )
             lead_code   = lead.get("lead_code") or f"#{lead.get('id')}"
             push_title  = f"🎯 Новый лид — {lead_code}"
@@ -991,6 +994,10 @@ async def _notify_new_lead(lead: dict, staff: dict):
                     row["id"], push_title, push_body,
                     lead_id=lead.get("id"), phone=client_phone, push_type="new_lead"
                 ))
+            # приложение (перенос из ARTEZ e45537a): та же группа ролей своей компании, без телефона в тексте
+            asyncio.create_task(app_api.push_roles(
+                lead_cid, ["callcenter", "manager", "admin"], push_title, lead.get("client_name") or "—",
+                {"kind": "lead", "lead_id": lead.get("id")}))
         except Exception as _ex:
             logging.warning(f"_notify_new_lead push error: {_ex}")
 
@@ -2585,6 +2592,8 @@ async def add_route_orders(route_id: int, body: dict, me=Depends(get_current_sta
         raise HTTPException(400, f"Заказы уже в активном маршруте: {names}")
     count = await db.add_orders_to_route(route_id, order_ids)
     await _auto_sync_route_channel(route_id)
+    if count:   # водителю в приложение — «новый адрес» (перенос из ARTEZ b98f753)
+        asyncio.create_task(app_api.push_route(me.get("company_id"), route_id, added=count))
     return {"ok": True, "added": count}
 
 @app.delete("/api/admin/routes/{route_id}/orders/{order_id}")
@@ -2612,6 +2621,10 @@ async def send_route_to_driver(route_id: int, me=Depends(get_current_staff)):
         raise HTTPException(status_code=404, detail="Маршрут не найден")
     if not route.get("driver_id"):
         raise HTTPException(status_code=400, detail="Водитель не назначен")
+    # приложение водителя — даже если Telegram не указан; дальше «новый адрес» тоже шлём (перенос из ARTEZ 715c2f2)
+    async with db.pool.acquire() as conn:
+        await conn.execute("UPDATE routes SET app_sent_at=NOW() WHERE id=$1 AND company_id=$2", route_id, me.get("company_id"))
+    asyncio.create_task(app_api.push_route(me.get("company_id"), route_id))
 
     # Получить tg_id водителя
     if not db.pool:
@@ -3698,6 +3711,56 @@ _STAGE_STATUSES = {
     "pack":    {"drying", "packing", "ready", "cancelled"},
     "deliver": {"ready", "delivery", "delivered", "cancelled"},
 }
+
+@app.get("/api/staff/washer/work")
+async def washer_work(staff=Depends(get_current_staff)):
+    """Мойщик в приложении (перенос из ARTEZ 796bf7c, 17.11.2026): заказы СВОЕЙ компании в мастерской
+    (приём…упаковка, с учётом этапов сотрудника — как /api/staff/orders) и их позиции — свои и свободные
+    (чужие не отдаём). Без цен и сумм. Только чтение; действия — существующие эндпоинты."""
+    if staff.get("role") != "washer":
+        raise HTTPException(status_code=403, detail="Только для мойщика")
+    cid = staff.get("company_id")
+    work = ["received", "washing", "drying", "packing"]
+    stages = [s.strip() for s in (staff.get("order_stages") or "").split(",") if s.strip()]
+    if stages:
+        visible = set()
+        for st in stages:
+            visible |= _STAGE_STATUSES.get(st, set())
+        work = [s for s in work if s in visible]
+    me = staff.get("login") or ""
+    # этап замера компании (настройка measure_stage, по умолчанию «В мастерской → стирка»)
+    try:
+        stage = await db.get_config("measure_stage")
+    except Exception:
+        stage = None
+    stage = stage if stage in ("received", "washing", "drying", "packing") else "washing"
+    if not work or not db.pool or not cid:
+        return {"ok": True, "stage": stage, "orders": []}
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT o.id AS order_id, o.order_num, o.status, o.client_first_name, o.updated_at,
+                   i.id AS item_id, i.service, i.service_ru, i.service_uz, COALESCE(i.unit_key_snap,'m2') AS unit_key,
+                   i.width_cm, i.length_cm, i.actual_width_cm, i.actual_length_cm, i.sqm,
+                   i.measure_status, i.reject_note, i.washer_login,
+                   (SELECT COUNT(*) FROM order_item_media im WHERE im.item_id = i.id)::int AS media_count
+              FROM orders o JOIN order_items i ON i.order_id = o.id
+             WHERE o.company_id = $3 AND o.status = ANY($1::text[])
+               AND (i.washer_login IS NULL OR i.washer_login = '' OR i.washer_login = $2)
+             ORDER BY o.updated_at ASC, o.id, i.id""", work, me, cid)
+    orders: dict = {}
+    for r in rows:
+        o = orders.setdefault(r["order_id"], {"order_id": r["order_id"], "order_num": r["order_num"], "status": r["status"],
+                                             "client_first_name": r["client_first_name"], "items": []})
+        o["items"].append({
+            "item_id": r["item_id"], "service": r["service"], "service_ru": r["service_ru"], "service_uz": r["service_uz"],
+            "unit_key": r["unit_key"], "width_cm": r["width_cm"], "length_cm": r["length_cm"],
+            "actual_width_cm": r["actual_width_cm"], "actual_length_cm": r["actual_length_cm"], "sqm": r["sqm"],
+            "measure_status": r["measure_status"], "reject_note": r["reject_note"],
+            "mine": (r["washer_login"] or "") == me and bool(me), "media_count": r["media_count"],
+        })
+    return {"ok": True, "stage": stage, "login": me,
+            "can_measure": bool(staff.get("can_measure")), "orders": list(orders.values())}
+
 
 @app.get("/api/staff/orders")
 async def staff_orders(status: str = None, branch: str = None, limit: int = 50, offset: int = 0,
@@ -6194,9 +6257,33 @@ async def check_phone(phone: str, _=Depends(get_current_staff)):
 @app.post("/api/staff/leads/{lead_id}/convert")
 async def convert_lead_to_order(lead_id: int, body: dict = Body({}),
                                  staff=Depends(require_perm("orders"))):
+    """Одна заявка — один заказ (перенос из ARTEZ 22c2819): двойное нажатие / два запроса сразу не создают
+    два заказа. Атомарный захват UPDATE … converting_at (только заявка своей компании; одна строка — один
+    победитель, и при нескольких копиях API); соединение не держим. Зависший захват истекает через 2 минуты."""
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="DB unavailable")
+    cid = staff.get("company_id")
+    got = await db.pool.fetchval(
+        "UPDATE leads SET converting_at=NOW() WHERE id=$1 AND company_id=$2 AND status NOT IN ('converted','lost') "
+        "AND (converting_at IS NULL OR converting_at < NOW() - INTERVAL '2 minutes') RETURNING id", lead_id, cid)
+    if not got:
+        st = await db.pool.fetchval("SELECT status FROM leads WHERE id=$1 AND company_id=$2", lead_id, cid)
+        if st is None:
+            raise HTTPException(status_code=404, detail="Лид не найден")
+        raise HTTPException(status_code=409, detail="Заявка уже закрыта" if st in ("converted", "lost") else "Заявка уже оформляется")
+    try:
+        return await _convert_lead_locked(lead_id, body, staff)
+    finally:
+        await db.pool.execute("UPDATE leads SET converting_at=NULL WHERE id=$1", lead_id)
+
+
+async def _convert_lead_locked(lead_id: int, body: dict, staff: dict):
     lead = await db.get_lead_by_id(lead_id)
     if not lead:
         raise HTTPException(status_code=404, detail="Лид не найден")
+    # уже оформленную/закрытую заявку повторно в заказ не превращаем (перечитано после захвата)
+    if lead.get("status") in ("converted", "lost"):
+        raise HTTPException(status_code=409, detail="Заявка уже закрыта")
     # Было lead.get("name")/lead.get("phone") — таких колонок у лида нет
     # (реальные имена client_name/client_phone), из-за чего имя и телефон
     # клиента терялись при каждой конвертации лида в заказ.
@@ -6234,6 +6321,19 @@ async def convert_lead_to_order(lead_id: int, body: dict = Body({}),
     await db.update_lead_status(lead_id, "converted")
     # Скидка «заявка через бот/сайт»: заказ создаётся с source="staff", канал — из лида
     await db.mark_order_online_from_lead(lead.get("source"), order_num)
+    # приложение (перенос из ARTEZ e45537a): позиции из услуг заявки — цены по прайсу компании,
+    # «шт» одной позицией, м² по одной (мойщик доизмерит)
+    if body.get("items_from_services") and lead.get("services_json"):
+        try:
+            lines = lead["services_json"]
+            if isinstance(lines, str):
+                lines = _json.loads(lines)
+            new_oid = await db.pool.fetchval("SELECT id FROM orders WHERE order_num=$1 AND company_id=$2",
+                                             order_num, staff.get("company_id"))
+            if new_oid and isinstance(lines, list):
+                await db.create_items_from_lead_lines(new_oid, lines)
+        except Exception as e:
+            logging.warning(f"convert lead={lead_id}: items from services failed: {type(e).__name__}: {e}")
     # Промо-акция: заказ считается "использованием" одноразового окна только если
     # лид пришёл с сайта/бота и привязан к зарегистрированному пользователю.
     if lead.get("source") in ("site", "bot") and lead.get("client_phone"):
@@ -6246,15 +6346,16 @@ async def convert_lead_to_order(lead_id: int, body: dict = Body({}),
     return {"ok": True, "order_num": order_num}
 
 @app.get("/api/admin/staff/packers")
-async def get_packers(_=Depends(get_current_staff)):
-    """Активные сотрудники с ролью упаковщика. Fallback — все активные не-агенты."""
+async def get_packers(me=Depends(get_current_staff)):
+    """Активные сотрудники своей компании с ролью упаковщика. Fallback — все активные не-агенты компании.
+    17.11.2026: раньше отдавались сотрудники ВСЕХ компаний."""
     async with db.pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, login, first_name, last_name, branch, role
             FROM staff
-            WHERE (active IS NULL OR active = TRUE)
+            WHERE (active IS NULL OR active = TRUE) AND company_id = $1
             ORDER BY last_name, first_name
-        """)
+        """, me.get("company_id"))
     packers = [dict(r) for r in rows if r['role'] in ('packer', 'operator_packing')]
     if not packers:
         packers = [dict(r) for r in rows if r['role'] not in ('agent',)]
@@ -6265,9 +6366,32 @@ async def get_packers(_=Depends(get_current_staff)):
 async def set_order_packer(order_id: int,
                             packer_login: str = Body(..., embed=True),
                             staff=Depends(get_current_staff)):
+    # Перенос из ARTEZ 50cd4df/b78a3fa (17.11.2026): раньше любой сотрудник мог назначить кого угодно упаковщиком
+    # любого заказа (и чужой компании — UPDATE был без company_id). Упаковщик — только взять свободный заказ себе
+    # или отказаться от своего (проверка и запись — одним UPDATE); назначать — admin/manager/логист.
+    role, me = staff.get("role"), staff.get("login") or ""
+    cid = staff.get("company_id")
+    packer_login = (packer_login or "").strip()
+    if not cid:
+        raise HTTPException(status_code=403)
+    if role == "packer":
+        if packer_login not in (me, "") or not me:
+            raise HTTPException(status_code=403, detail="Упаковщик может взять свободный заказ или отказаться от своего")
+        cond = "COALESCE(packer_login, '') IN ('', $3)" if packer_login else "packer_login = $3"
+        row = await db.pool.fetchrow(
+            f"UPDATE orders SET packer_login=$1 WHERE id=$2 AND company_id=$4 AND {cond} RETURNING id",
+            packer_login or None, order_id, me, cid)
+        if not row:
+            exists = await db.pool.fetchval("SELECT 1 FROM orders WHERE id=$1 AND company_id=$2", order_id, cid)
+            raise HTTPException(status_code=404 if not exists else 409,
+                                detail="Заказ не найден" if not exists else "Заказ уже взял другой упаковщик")
+        return {"ok": True}
+    elif role not in ("admin", "manager", "logistics") and staff.get("sub") != "admin":
+        raise HTTPException(status_code=403, detail="Нет прав назначать упаковщика")
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
-            "UPDATE orders SET packer_login=$1 WHERE id=$2 RETURNING id", packer_login, order_id)
+            "UPDATE orders SET packer_login=$1 WHERE id=$2 AND company_id=$3 RETURNING id",
+            packer_login or None, order_id, cid)
     if not row:
         raise HTTPException(status_code=404, detail="Заказ не найден")
     return {"ok": True}
@@ -6329,7 +6453,8 @@ async def admin_change_order_status(order_id: int, staff=Depends(get_current_sta
                                                            f"{staff_name} xodim tomonidan holat oʻzgartirildi"))
     if status == 'packing' and packer_login:
         async with db.pool.acquire() as _pc:
-            await _pc.execute("UPDATE orders SET packer_login=$1 WHERE id=$2", packer_login, order_id)
+            await _pc.execute("UPDATE orders SET packer_login=$1 WHERE id=$2 AND company_id=$3",
+                              packer_login, order_id, staff.get("company_id"))
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден")
 
@@ -6498,13 +6623,24 @@ async def postpone_order_delivery(order_id: int,
     return {"ok": True, "order": order}
 
 
+# Согласованная доставка — только эти роли (как _DSLOT_ROLES в staff.html и в приложении; перенос из ARTEZ
+# 516491a). Раньше хватало права «orders» — мойщик/водитель/упаковщик могли поставить её прямым запросом.
+DSLOT_ROLES = {"admin", "manager", "logistics", "callcenter"}
+
+
+async def _dslot_staff(staff=Depends(require_perm("orders"))):
+    if staff.get("role") not in DSLOT_ROLES and staff.get("sub") != "admin":
+        raise HTTPException(status_code=403, detail="Согласовать доставку может менеджер, логист или колл-центр")
+    return staff
+
+
 @app.post("/api/admin/orders/{order_id}/delivery-slot")
 async def set_order_delivery_slot_ep(order_id: int,
                                      date: str = Body(..., embed=True),
                                      time_from: str | None = Body(None, embed=True),
                                      time_to: str | None = Body(None, embed=True),
                                      note: str = Body("", embed=True),
-                                     staff=Depends(require_perm("orders"))):
+                                     staff=Depends(_dslot_staff)):
     """Согласованная с клиентом доставка: день + окно времени (+ примечание оператора).
     Каждое изменение — в историю заказа; сводка и контроль — _delivery_digest_worker."""
     from datetime import date as _date, time as _time, datetime as _dt, timezone as _tz, timedelta as _td
@@ -6530,7 +6666,7 @@ async def set_order_delivery_slot_ep(order_id: int,
 
 
 @app.delete("/api/admin/orders/{order_id}/delivery-slot")
-async def clear_order_delivery_slot_ep(order_id: int, staff=Depends(require_perm("orders"))):
+async def clear_order_delivery_slot_ep(order_id: int, staff=Depends(_dslot_staff)):
     order = await db.clear_order_delivery_slot(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден")
@@ -7085,6 +7221,18 @@ async def upload_order_photo(
     note: str = Form(""),
     staff=Depends(get_current_staff),
 ):
+    # заказ — только своей компании (раньше фото записывалось к любому order_id); водитель — только к заказам
+    # СВОЕГО маршрута за последние дни (перенос из ARTEZ b98f753, 17.11.2026)
+    if not await db.get_order_by_id(order_id):
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    if staff.get("role") == "driver":
+        async with db.pool.acquire() as conn:
+            mine = await conn.fetchval(
+                "SELECT 1 FROM route_orders ro JOIN routes r ON r.id = ro.route_id "
+                "WHERE ro.order_id=$1 AND r.driver_id=$2 AND r.company_id=$3 AND r.date >= CURRENT_DATE - 3 LIMIT 1",
+                order_id, staff["id"], staff.get("company_id"))
+        if not mine:
+            raise HTTPException(status_code=403, detail="Заказ не в вашем маршруте")
     media_ch = await _get_media_channel()
     if not BOT_TOKEN or not media_ch:
         raise HTTPException(status_code=503, detail="Медиа-хранилище не настроено")
@@ -7124,12 +7272,22 @@ async def upload_order_photo(
         file_id = msg[tg_type]["file_id"]
 
     name = " ".join(filter(None, [staff.get("last_name"), staff.get("first_name")])) or staff.get("login","")
-    photo = await db.save_order_photo(order_id, file_id, tg_type, photo_type, note, name)
+    photo = await db.save_order_photo(order_id, file_id, tg_type, photo_type, note, name,
+                                      uploaded_by_staff_id=staff.get("id"))
     return {"ok": True, "photo": photo}
 
 @app.delete("/api/admin/orders/{order_id}/photos/{photo_id}")
 async def delete_order_photo(order_id: int, photo_id: int, staff=Depends(get_current_staff)):
-    ok = await db.delete_order_photo(photo_id, staff.get("company_id") or 1)
+    # Фото — только этого заказа своей компании; удалить — админ/менеджер или автор фото
+    # (старые фото без автора — только админ/менеджер). Перенос из ARTEZ 2911b3f.
+    cid = staff.get("company_id")
+    photo = await db.get_photo_by_id(photo_id, cid) if cid else {}
+    if not photo or photo.get("order_id") != order_id:
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+    if staff.get("role") not in ("admin", "manager"):
+        if not photo.get("uploaded_by_staff_id") or photo["uploaded_by_staff_id"] != staff.get("id"):
+            raise HTTPException(status_code=403, detail="Удалить фото может автор или менеджер")
+    ok = await db.delete_order_photo(photo_id, cid)
     if not ok:
         raise HTTPException(status_code=404)
     return {"ok": True}
@@ -8940,6 +9098,11 @@ async def admin_measure_item(order_id: int, item_id: int, staff=Depends(get_curr
                     f"Замер «{svc}» ожидает вашего утверждения",
                     order_id=order_id, item_id=item_id, push_type="measure"
                 ))
+                # и в приложение сотрудника своей компании (перенос из ARTEZ 796bf7c)
+                if ap["id"] != staff.get("id"):
+                    asyncio.create_task(app_api.push_staff(staff.get("company_id"), ap["id"], f"📐 Новый замер — {order_num}",
+                                                           f"Замер «{svc}» ожидает вашего утверждения",
+                                                           {"kind": "measure", "order_id": order_id, "item_id": item_id}))
         except Exception as _pe:
             logging.warning(f"measure push error: {_pe}")
     elif action == "approve":
@@ -8976,6 +9139,8 @@ async def admin_measure_item(order_id: int, item_id: int, staff=Depends(get_curr
                     push_body,
                     order_id=order_id, item_id=item_id, push_type="measure_approved"
                 ))
+                asyncio.create_task(app_api.push_staff(staff.get("company_id"), recipient_id, f"✅ Замер утверждён — {order_num}",
+                                                       push_body, {"kind": "measure", "order_id": order_id, "item_id": item_id}))
                 await db.create_washer_notification(
                     recipient_id, order_id, order_num, push_body,
                     item_id=item_id, notification_type="measure_approved"
@@ -9011,6 +9176,8 @@ async def admin_measure_item(order_id: int, item_id: int, staff=Depends(get_curr
                     push_body,
                     order_id=order_id, item_id=item_id, push_type="measure_rejected"
                 ))
+                asyncio.create_task(app_api.push_staff(staff.get("company_id"), recipient_id, f"❌ Замер отклонён — {order_num}",
+                                                       push_body, {"kind": "measure", "order_id": order_id, "item_id": item_id}))
                 await db.create_washer_notification(
                     recipient_id, order_id, order_num, push_body,
                     item_id=item_id, notification_type="measure_rejected"
@@ -11263,6 +11430,31 @@ def _gen_chat_code() -> str:
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
 
+def _chat_clean_site_name(name: str) -> str:
+    """Имя из виджета сайта (не проверено). Пометку чата из приложения ставит сервер: «📱» В НАЧАЛЕ имени
+    (_chat_staff_name). Из имени с сайта убираем всё, чем её можно подделать: длину режем до и после NFKC
+    (эндпоинт без входа), служебные/невидимые символы (Cf), эмодзи и значки (So/Sk, вариационные селекторы),
+    затем «из приложения» — в цикле, пока строка меняется. Перенос из ARTEZ 3e4dedb/03bf15f/3ed2bc1."""
+    import unicodedata
+    n = unicodedata.normalize("NFKC", (name or "")[:200])[:200]
+    n = "".join(ch for ch in n
+                if unicodedata.category(ch) not in ("Cf", "Cc", "Co", "Cs", "So", "Sk")
+                and not (0xFE00 <= ord(ch) <= 0xFE0F))
+    while True:
+        m2 = re.sub(r"[·\-–—,.\s]*из\s*прил[оo]жени[яe]", "", n, flags=re.IGNORECASE)
+        if m2 == n:
+            break
+        n = m2
+    return re.sub(r"\s+", " ", n).strip()[:100]
+
+
+def _chat_staff_name(s: dict) -> str:
+    """Имя клиента для сотрудников: чат из приложения — «📱 … · из приложения» (16.11.2026).
+    В базе имя как есть — шаблоны {name} в приветствиях клиенту не меняются."""
+    name = (s.get('client_name') or s.get('client_phone') or 'Клиент')
+    return f"📱 {name} · из приложения" if s.get('source') == 'app' else name
+
+
 def _msg_json(msg: dict) -> dict:
     m = dict(msg)
     if hasattr(m.get('created_at'), 'isoformat'):
@@ -11273,7 +11465,7 @@ def _msg_json(msg: dict) -> dict:
 @app.post("/api/chat/start")
 async def chat_start(body: dict = Body(...)):
     client_phone = (body.get("client_phone") or "").strip()
-    client_name  = (body.get("client_name")  or "").strip()
+    client_name  = _chat_clean_site_name(body.get("client_name") or "")
     branch       = (body.get("branch")       or "").strip()
     lang         = (body.get("lang")         or "uz").strip().lower()[:5]
     cid = await _resolve_client_company_id(body.get("company_slug"))
@@ -11334,6 +11526,37 @@ async def _chat_bot_name(company_id: int | None) -> str:
     return name or "Cleano"
 
 
+CHAT_TEXT_MAX = 2000
+
+
+@app.post("/api/chat/{code}/send")
+async def chat_staff_send(code: str, text: str = Body(..., embed=True), staff=Depends(_chat_staff)):
+    """Ответ сотрудника без WebSocket (приложение; перенос из ARTEZ e45537a). Как сообщение в ws_chat_staff,
+    но только во ВЗЯТЫЙ этим сотрудником чат своей компании (админ — в любой чат компании)."""
+    text = (text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Пустое сообщение")
+    if len(text) > CHAT_TEXT_MAX:
+        raise HTTPException(status_code=400, detail=f"Сообщение длиннее {CHAT_TEXT_MAX} символов")
+    cid = int(staff.get("company_id") or 0)
+    session = await db.get_chat_session(code)
+    if not session or not cid or session.get("company_id") != cid:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    if session["status"] == "closed":
+        raise HTTPException(status_code=409, detail="Чат закрыт")
+    if session.get("claimed_by") != staff["id"] and staff.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Сначала возьмите чат")
+    sname = f"{staff.get('first_name','') or ''} {staff.get('last_name','') or ''}".strip() or "Менеджер"
+    msg = await db.add_chat_message(session["id"], "staff", sname, text)
+    if not msg:
+        raise HTTPException(status_code=500, detail="Не удалось сохранить сообщение")
+    await _chat.send_client(code, {"type": "message", "msg": _msg_json(msg)})
+    await _chat.broadcast_staff({"type": "message", "code": code, "msg": _msg_json(msg)}, exclude=staff["id"], company_id=cid)
+    if session.get("source") == "app":
+        asyncio.create_task(app_api.push_chat(cid, session, sname, text))
+    return {"ok": True, "msg": _msg_json(msg)}
+
+
 @app.get("/api/chat/sessions")
 async def chat_sessions(staff=Depends(_chat_staff)):
     sessions = await db.get_active_chat_sessions()
@@ -11343,6 +11566,7 @@ async def chat_sessions(staff=Depends(_chat_staff)):
         s2 = {k: (v.isoformat() if hasattr(v, 'isoformat') else v) for k, v in s.items()}
         s2['message_count'] = len(msgs)
         s2['last_text'] = msgs[-1]['text'] if msgs else ''
+        s2['client_name'] = _chat_staff_name(s)
         result.append(s2)
     return result
 
@@ -11354,6 +11578,7 @@ async def chat_get_messages(code: str, staff=Depends(_chat_staff)):
         raise HTTPException(404, "Сессия не найдена")
     msgs = await db.get_chat_messages(session['id'])
     s = {k: (v.isoformat() if hasattr(v, 'isoformat') else v) for k, v in session.items()}
+    s['client_name'] = _chat_staff_name(session)
     return {"session": s, "messages": [_msg_json(m) for m in msgs]}
 
 
@@ -11422,6 +11647,8 @@ async def chat_history(limit: int = 50, offset: int = 0, filter: str = "own",
     for r in rows:
         for k, v in r.items():
             if hasattr(v, 'isoformat'): r[k] = v.isoformat()
+        if 'client_name' in r:
+            r['client_name'] = _chat_staff_name(r)
     return {"rows": rows, "can_see_all": can_see_all}
 
 @app.get("/api/chat/templates")
@@ -11527,6 +11754,11 @@ async def ws_chat_client(websocket: WebSocket, code: str):
                 await _chat.send_staff(claimed, payload)
             else:
                 await _chat.broadcast_staff(payload, company_id=session.get('company_id'))
+            if session.get('company_id'):   # приложение сотрудника (перенос из ARTEZ e45537a)
+                asyncio.create_task(app_api.push_roles(
+                    session['company_id'], list(CHAT_ROLES), f"💬 {_chat_staff_name(session)}",
+                    text if len(text) <= 160 else text[:157] + "…",
+                    {"kind": "chat_staff", "code": code}, only_id=claimed or None))
             # Авто-ответ на первое сообщение клиента (через 3 сек)
             if is_first:
                 async def _send_auto_reply(c=code, sess=dict(session), cl=claimed):
@@ -11593,6 +11825,8 @@ async def ws_chat_staff(websocket: WebSocket, token: str):
             payload = {"type": "message", "code": code, "msg": _msg_json(msg)}
             await _chat.send_client(code, {"type": "message", "msg": _msg_json(msg)})
             await _chat.broadcast_staff(payload, exclude=staff_id, company_id=staff_company_id)
+            if session.get('source') == 'app':   # чат из приложения — push клиенту (токены этой компании)
+                asyncio.create_task(app_api.push_chat(staff_company_id, session, sname, text))
     except (WebSocketDisconnect, Exception):
         pass
     finally:
