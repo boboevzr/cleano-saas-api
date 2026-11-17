@@ -7301,14 +7301,17 @@ async def delete_order(order_id: int) -> bool:
     if not pool: return False
     cid = _cid()
     async with pool.acquire() as conn:
+        # Заказ — своей компании, ДО любых удалений (17.11.2026, аудит: раньше позиции/фото/остановки
+        # чужого заказа стирались до проверки компании)
+        row = await conn.fetchrow("SELECT order_num FROM orders WHERE id=$1 AND company_id=$2", order_id, cid)
+        if not row:
+            return False
+        order_num = dict(row).get("order_num")
         # Блокируем удаление если есть платежи — деньги должны быть сняты вручную
         payment_count = await conn.fetchval(
             "SELECT COUNT(*) FROM order_payments WHERE order_id=$1", order_id)
         if payment_count:
             raise ValueError(f"has_payments:{payment_count}")
-        # Получаем order_num до удаления (нужен для history)
-        row = await conn.fetchrow("SELECT order_num FROM orders WHERE id=$1 AND company_id=$2", order_id, cid)
-        order_num = dict(row).get("order_num") if row else None
         # Удаляем медиафайлы позиций
         await conn.execute("DELETE FROM order_item_media WHERE order_id=$1", order_id)
         # Удаляем позиции
@@ -8104,7 +8107,8 @@ async def get_cash_daily_total(date_str: str) -> dict:
             FROM order_payments
             WHERE created_at >= $1 AND created_at < $2
               AND NOT (confirmed = FALSE AND confirmed_at IS NOT NULL)
-        """, ts_from, ts_to)
+              AND order_id IN (SELECT id FROM orders WHERE company_id=$3)   -- 17.11.2026: только своя компания
+        """, ts_from, ts_to, _cid())
         return dict(row) if row else {}
 
 async def get_cash_payment_history(year: int, month: int, branch: str = '', day: int = 0) -> list:
@@ -8131,12 +8135,13 @@ async def get_cash_payment_history(year: int, month: int, branch: str = '', day:
                 COALESCE(SUM(op.amount), 0) AS total
             FROM order_payments op
             JOIN staff s ON s.id = op.created_by_staff_id
+            JOIN orders o ON o.id = op.order_id AND o.company_id = $4   -- 17.11.2026: только своя компания
             WHERE op.created_at >= $1 AND op.created_at < $2
               AND NOT (op.confirmed = FALSE AND op.confirmed_at IS NOT NULL)
               AND ($3 = '' OR s.branch = $3)
             GROUP BY pay_date, s.id, s.last_name, s.first_name, s.branch
             ORDER BY pay_date DESC, staff_name
-        """, ts_from, ts_to, branch)
+        """, ts_from, ts_to, branch, _cid())
         return [dict(r) for r in rows]
 
 # ── order_payments ────────────────────────────────────────────────────────────
@@ -9112,11 +9117,11 @@ async def get_unconfirmed_payments() -> list:
                    TRIM(COALESCE(s.last_name,'') || ' ' || COALESCE(s.first_name,'')) AS staff_full_name,
                    s.phone AS staff_phone
             FROM order_payments p
-            LEFT JOIN orders o ON o.id = p.order_id
+            JOIN orders o ON o.id = p.order_id AND o.company_id = $1   -- 17.11.2026: только своя компания
             LEFT JOIN staff s ON s.id = p.created_by_staff_id
             WHERE p.method IN ('card','transfer') AND p.confirmed=FALSE AND p.confirmed_at IS NULL
             ORDER BY p.created_at DESC
-        """)
+        """, _cid())
         return [dict(r) for r in rows]
 
 async def get_cash_tg_channel() -> str:

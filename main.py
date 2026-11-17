@@ -8460,7 +8460,10 @@ async def cash_debug(staff=Depends(get_current_staff)):
             "SELECT id, order_id, amount, method, purpose, created_by, created_by_staff_id, handed_to_staff_id, created_at FROM order_payments WHERE created_by_staff_id=$1 OR handed_to_staff_id=$1 ORDER BY created_at DESC LIMIT 20",
             sid)
         name_rows = await conn.fetch(
-            "SELECT id, order_id, amount, method, purpose, created_by, created_by_staff_id, handed_to_staff_id FROM order_payments WHERE method='cash' AND created_by_staff_id IS NULL ORDER BY created_at DESC LIMIT 10")
+            "SELECT id, order_id, amount, method, purpose, created_by, created_by_staff_id, handed_to_staff_id FROM order_payments "
+            "WHERE method='cash' AND created_by_staff_id IS NULL "
+            "AND order_id IN (SELECT id FROM orders WHERE company_id=$1) ORDER BY created_at DESC LIMIT 10",   # своя компания
+            db._cid())
         staff_row = await conn.fetchrow("SELECT id, first_name, last_name, login FROM staff WHERE id=$1", sid)
     return {
         "staff_id": sid,
@@ -8901,7 +8904,7 @@ async def get_pending_position_requests(staff=Depends(get_current_staff)):
         return {"ok": True, "order_ids": []}
     async with db.pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id FROM orders WHERE pos_request_pending=TRUE"
+            "SELECT id FROM orders WHERE pos_request_pending=TRUE AND company_id=$1", db._cid()   # своя компания
         )
     return {"ok": True, "order_ids": [r["id"] for r in rows]}
 
@@ -9525,7 +9528,9 @@ async def _driver_take_delivery_core(order_id: int, staff: dict, source: str = "
     if not _can_drive(staff): raise HTTPException(403, "Нет доступа")
     name = _driver_name(staff)
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT status FROM orders WHERE id=$1", order_id)
+        # заказ — компании водителя (17.11.2026, аудит: бот передаёт order_id из callback, мимо middleware)
+        row = await conn.fetchrow("SELECT status FROM orders WHERE id=$1 AND company_id=$2",
+                                  order_id, int(staff.get("company_id") or db._cid()))
         if not row: raise HTTPException(404)
         cur = row["status"]
         if cur not in ("ready", "delivery"):
@@ -9595,7 +9600,9 @@ async def driver_undo_delivery(order_id: int, staff=Depends(get_current_staff)):
     if not _can_drive(staff): raise HTTPException(403, "Нет доступа")
     name = _driver_name(staff)
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT status FROM orders WHERE id=$1", order_id)
+        # заказ — компании водителя (17.11.2026, аудит: бот передаёт order_id из callback, мимо middleware)
+        row = await conn.fetchrow("SELECT status FROM orders WHERE id=$1 AND company_id=$2",
+                                  order_id, int(staff.get("company_id") or db._cid()))
         if not row: raise HTTPException(404)
         if row["status"] == "delivery":
             await conn.execute("UPDATE orders SET status='ready', updated_at=NOW() WHERE id=$1", order_id)
@@ -9670,7 +9677,9 @@ async def _driver_deliver_core(order_id: int, staff: dict, method: str = "", amo
     if not _can_drive(staff): raise HTTPException(403, "Нет доступа")
     name = _driver_name(staff)
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT status FROM orders WHERE id=$1", order_id)
+        # заказ — компании водителя (17.11.2026, аудит: бот передаёт order_id из callback, мимо middleware)
+        row = await conn.fetchrow("SELECT status FROM orders WHERE id=$1 AND company_id=$2",
+                                  order_id, int(staff.get("company_id") or db._cid()))
         if not row: raise HTTPException(404)
         if row["status"] not in ("ready", "delivery"):
             raise HTTPException(400, f"Статус: {row['status']}")
