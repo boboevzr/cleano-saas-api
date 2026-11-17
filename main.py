@@ -6760,8 +6760,37 @@ def _price_audit(staff: dict, price: float, list_price, note: str | None) -> dic
     }
 
 
+async def _items_edit_guard(order_id: int, staff: dict, deleting: bool = False) -> dict:
+    """Добавить/удалить позицию (17.11.2026, ревью): те же правила, что у правки позиции
+    (admin_update_order_item) и у кнопок в staff.html (_itemEditLocked): только роли с доступом к заказам,
+    не при can_edit_items=false; статус — admin/can_edit_price до «Доставлен», менеджер до «Доставка»,
+    остальные до «Упаковка». Удаление — не мойщику (в его окне кнопки ✕ нет). Раньше проверок не было."""
+    role = staff.get("role", "")
+    is_admin = staff.get("sub") == "admin" or role == "admin"
+    if not is_admin and "orders" not in ROLE_PERMISSIONS.get(role, []):
+        raise HTTPException(status_code=403, detail="Нет доступа к позициям заказа")
+    if not is_admin and staff.get("can_edit_items") is False:
+        raise HTTPException(status_code=403, detail="Нет права менять позиции — включается в карточке сотрудника")
+    # удалить позицию — только менеджер и админ (владелец 17.11.2026: «с удалением осторожнее»)
+    if deleting and not is_admin and role != "manager":
+        raise HTTPException(status_code=403, detail="Удалить позицию может только менеджер")
+    order = await db.get_order_by_id(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    if is_admin or staff.get("can_edit_price", False):
+        locked = {"delivered", "cancelled"}
+    elif role == "manager":
+        locked = {"delivery", "delivered", "cancelled"}
+    else:
+        locked = {"packing", "ready", "delivery", "delivered", "cancelled"}
+    if order.get("status") in locked:
+        raise HTTPException(status_code=403, detail="Позиции в этом статусе заказа менять нельзя")
+    return order
+
+
 @app.post("/api/admin/orders/{order_id}/items")
 async def admin_create_order_item(order_id: int, req: OrderItemRequest, staff=Depends(get_current_staff)):
+    await _items_edit_guard(order_id, staff)
     sqm = req.sqm
     if not sqm and req.width_cm and req.length_cm:
         sqm = round(req.width_cm * req.length_cm / 10000, 3)
@@ -6909,7 +6938,11 @@ async def admin_update_order_item(order_id: int, item_id: int,
     return {"ok": True, "item": _item_for(staff, item)}
 
 @app.delete("/api/admin/orders/{order_id}/items/{item_id}")
-async def admin_delete_order_item(order_id: int, item_id: int, _=Depends(get_current_staff)):
+async def admin_delete_order_item(order_id: int, item_id: int, staff=Depends(get_current_staff)):
+    await _items_edit_guard(order_id, staff, deleting=True)   # заказ своей компании (get_order_by_id по _cid)
+    # позиция — именно этого заказа (раньше удалялась любая позиция по id, в т.ч. чужой компании)
+    if not db.pool or not await db.pool.fetchval("SELECT 1 FROM order_items WHERE id=$1 AND order_id=$2", item_id, order_id):
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
     ok = await db.delete_order_item(item_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Позиция не найдена")
@@ -8614,9 +8647,54 @@ async def cash_payment_history(year: int = None, month: int = None, day: int = 0
     rows = await db.get_cash_payment_history(year or today.year, month or today.month, branch, day)
     return {"ok": True, "rows": rows}
 
+async def _tg_file_response(file_id: str, request: Request):
+    """Файл из Telegram — отдаём сами (17.11.2026): раньше редирект на api.telegram.org (в ссылке
+    виден токен бота, .mov приходил как octet-stream и не играл). Тип по расширению + Range (Safari)."""
+    async with aiohttp.ClientSession() as s:
+        async with s.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}") as r:
+            data = await r.json()
+    if not data.get("ok"):
+        raise HTTPException(status_code=502, detail="Не удалось получить файл")
+
+    # 17.11.2026: раньше — редирект на api.telegram.org (в ссылке виден токен бота, .mov приходил
+    # как octet-stream и не проигрывался). Теперь отдаём сами: тип по расширению + Range (Safari без
+    # 206 видео не играет). .mov с iPhone — тот же MP4-контейнер, браузеру называем video/mp4.
+    from fastapi.responses import StreamingResponse
+    file_path = data["result"]["file_path"]
+    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+    ctype = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp",
+             "heic": "image/heic", "mp4": "video/mp4", "mov": "video/mp4", "m4v": "video/mp4",
+             "webm": "video/webm", "3gp": "video/3gpp"}.get(ext)
+    fwd = {}
+    if request.headers.get("range"):
+        fwd["Range"] = request.headers["range"]
+    session = aiohttp.ClientSession()
+    try:
+        resp = await session.get(file_url, headers=fwd)
+    except Exception:
+        await session.close()
+        raise HTTPException(status_code=502, detail="Не удалось получить файл")
+    out = {"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"}
+    for h in ("Content-Length", "Content-Range"):
+        if h in resp.headers:
+            out[h] = resp.headers[h]
+
+    async def _body():
+        try:
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                yield chunk
+        finally:
+            resp.release()
+            await session.close()
+
+    return StreamingResponse(_body(), status_code=resp.status if resp.status in (200, 206) else 502,
+                             media_type=ctype or resp.content_type or "application/octet-stream", headers=out)
+
 @app.get("/api/media/{photo_id}")
 async def serve_order_photo(
     photo_id: int,
+    request: Request,
     t: str = None,
     authorization: str = Header(None),
 ):
@@ -8641,19 +8719,12 @@ async def serve_order_photo(
         if not owner_phone or owner_phone != payload.get("phone"):
             raise HTTPException(status_code=403)
 
-    async with aiohttp.ClientSession() as s:
-        async with s.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={row['tg_file_id']}") as r:
-            data = await r.json()
-    if not data.get("ok"):
-        raise HTTPException(status_code=502, detail="Не удалось получить файл")
-
-    from fastapi.responses import RedirectResponse
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{data['result']['file_path']}"
-    return RedirectResponse(url=file_url)
+    return await _tg_file_response(row['tg_file_id'], request)
 
 @app.get("/api/item-media/{media_id}")
 async def serve_item_media(
     media_id: int,
+    request: Request,
     t: str = None,
     authorization: str = Header(None),
 ):
@@ -8677,15 +8748,7 @@ async def serve_item_media(
         if not owner_phone or owner_phone != payload.get("phone"):
             raise HTTPException(status_code=403)
 
-    async with aiohttp.ClientSession() as s:
-        async with s.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={row['tg_file_id']}") as r:
-            data = await r.json()
-    if not data.get("ok"):
-        raise HTTPException(status_code=502, detail="Не удалось получить файл")
-
-    from fastapi.responses import RedirectResponse
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{data['result']['file_path']}"
-    return RedirectResponse(url=file_url)
+    return await _tg_file_response(row['tg_file_id'], request)
 
 @app.patch("/api/admin/orders/{order_id}/discount")
 async def admin_set_order_discount(order_id: int, staff=Depends(get_current_staff),
@@ -9093,8 +9156,12 @@ async def delete_item_media(order_id: int, item_id: int, media_id: int, staff=De
     cid = staff.get("company_id") or 1
     # Fetch media type and item service before deleting
     media_row = await db.get_item_media_by_id(media_id, cid)
-    if not media_row:
-        raise HTTPException(status_code=404)
+    if not media_row or media_row.get("item_id") != item_id or media_row.get("order_id") != order_id:
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    _author = " ".join(filter(None, [staff.get("last_name"), staff.get("first_name")])) or staff.get("login", "")
+    if not (staff.get("role") in ("admin", "manager") or staff.get("can_approve_measure")
+            or staff.get("can_override_measure") or (media_row.get("created_by") or "") == _author):
+        raise HTTPException(status_code=403, detail="Удалить файл может автор или проверяющий замеры")
     await db.delete_item_media(media_id, cid)
     sname = f"{staff.get('first_name','')} {staff.get('last_name','')}".strip() or staff.get('login','?')
     item_service = ''; item_pos3 = None
