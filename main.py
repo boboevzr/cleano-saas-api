@@ -5331,6 +5331,38 @@ async def admin_create_lead(req: LeadCreateRequest, _=Depends(_get_admin)):
 # АГЕНТЫ — регистрация и сброс пароля
 # ══════════════════════════════════════════════════════════════════════════════
 
+@app.get("/api/agent/me")
+async def agent_me(staff=Depends(get_current_staff)):
+    """Агент в приложении (перенос из ARTEZ 9483a41): его заявки (сводка) и начисления — только свои, своей компании."""
+    if staff.get("role") != "agent":
+        raise HTTPException(status_code=403, detail="Только для агента")
+    sid, cid = staff["id"], db._cid()
+    async with db.pool.acquire() as conn:
+        st = await conn.fetchrow("""
+            SELECT COUNT(*)::int AS total,
+                   COUNT(*) FILTER (WHERE status='new')::int AS new,
+                   COUNT(*) FILTER (WHERE status='converted')::int AS converted,
+                   COUNT(*) FILTER (WHERE status='lost')::int AS lost
+              FROM leads WHERE (created_by=$1 OR volunteer_id=$1) AND company_id=$2""", sid, cid)
+        sums = await conn.fetchrow("""
+            SELECT COALESCE(SUM(amount) FILTER (WHERE status='paid'), 0) AS paid,
+                   COALESCE(SUM(amount) FILTER (WHERE status IS DISTINCT FROM 'paid'), 0) AS pending,
+                   COALESCE(SUM(amount) FILTER (WHERE created_at >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Tashkent')
+                                                   AT TIME ZONE 'Asia/Tashkent'), 0) AS month
+              FROM staff_commissions WHERE staff_id=$1 AND company_id=$2""", sid, cid)
+        rows = await conn.fetch("""
+            SELECT order_num, amount, status, created_at, paid_at
+              FROM staff_commissions WHERE staff_id=$1 AND company_id=$2 ORDER BY created_at DESC LIMIT 30""", sid, cid)
+    total = int(st["total"] or 0)
+    return {"ok": True,
+            "leads": {"total": total, "new": st["new"], "converted": st["converted"], "lost": st["lost"],
+                      "pct": round(st["converted"] * 100 / total) if total else 0},
+            "earn": {"paid": float(sums["paid"]), "pending": float(sums["pending"]), "month": float(sums["month"])},
+            "commissions": [{"order_num": r["order_num"], "amount": float(r["amount"]), "status": r["status"],
+                             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                             "paid_at": r["paid_at"].isoformat() if r["paid_at"] else None} for r in rows]}
+
+
 @app.get("/api/agent/status")
 async def agent_status(user=Depends(get_current_user)):
     """Возвращает статус агента для текущего пользователя сайта."""
@@ -6723,8 +6755,32 @@ def _price_audit(staff: dict, price: float, list_price, note: str | None) -> dic
     }
 
 
+async def _items_edit_guard(order_id: int, staff: dict, deleting: bool = False) -> dict:
+    """Добавить/удалить позицию (перенос из ARTEZ c411b44): заказ — только своей компании (db.get_order_by_id
+    скоупит по company_id), те же правила, что у правки позиции (admin_update_order_item): роль с доступом к заказам,
+    не при can_edit_items=false, статус — admin/can_edit_price до «Доставлен», остальные до «Упаковка»; удаление —
+    не мойщику. Раньше проверок не было, а удаление не сверяло даже компанию."""
+    role = staff.get("role", "")
+    is_admin = staff.get("sub") == "admin" or role == "admin"
+    if not is_admin and "orders" not in ROLE_PERMISSIONS.get(role, []):
+        raise HTTPException(status_code=403, detail="Нет доступа к позициям заказа")
+    if not is_admin and staff.get("can_edit_items") is False:
+        raise HTTPException(status_code=403, detail="Нет права менять позиции — включается в карточке сотрудника")
+    if deleting and role == "washer":
+        raise HTTPException(status_code=403, detail="Удалить позицию может менеджер")
+    order = await db.get_order_by_id(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Заказ не найден")
+    locked = {"delivered", "cancelled"} if (is_admin or staff.get("can_edit_price", False)) \
+        else {"packing", "ready", "delivery", "delivered", "cancelled"}
+    if order.get("status") in locked:
+        raise HTTPException(status_code=403, detail="Позиции в этом статусе заказа менять нельзя")
+    return order
+
+
 @app.post("/api/admin/orders/{order_id}/items")
 async def admin_create_order_item(order_id: int, req: OrderItemRequest, staff=Depends(get_current_staff)):
+    await _items_edit_guard(order_id, staff)
     sqm = req.sqm
     if not sqm and req.width_cm and req.length_cm:
         sqm = round(req.width_cm * req.length_cm / 10000, 3)
@@ -6752,11 +6808,11 @@ async def admin_bulk_create_items(order_id: int, count: int = Body(0, embed=True
                                    staff=Depends(get_current_staff)):
     # items={service_key: qty} — позиции сразу с услугой и ценой по прайсу (менеджер обязан
     # выбрать услугу, решение 2026-10-10); count — старый режим «пустых» (окно мойщика).
+    order = await _items_edit_guard(order_id, staff)
     if items:
         total = sum(max(0, int(q)) for q in items.values())
         if total < 1 or total > 50:
             raise HTTPException(status_code=400, detail="Количество от 1 до 50")
-        order = await db.get_order_by_id(order_id) or {}
         created = await db.create_empty_items_by_service(order_id, items, order.get("service_type"))
     else:
         if count < 1 or count > 50:
@@ -6867,7 +6923,11 @@ async def admin_update_order_item(order_id: int, item_id: int,
     return {"ok": True, "item": _item_for(staff, item)}
 
 @app.delete("/api/admin/orders/{order_id}/items/{item_id}")
-async def admin_delete_order_item(order_id: int, item_id: int, _=Depends(get_current_staff)):
+async def admin_delete_order_item(order_id: int, item_id: int, staff=Depends(get_current_staff)):
+    await _items_edit_guard(order_id, staff, deleting=True)   # заказ своей компании
+    # позиция — именно этого заказа (раньше удалялась любая позиция по id, даже другой компании)
+    if not db.pool or not await db.pool.fetchval("SELECT 1 FROM order_items WHERE id=$1 AND order_id=$2", item_id, order_id):
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
     ok = await db.delete_order_item(item_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Позиция не найдена")
@@ -7973,16 +8033,20 @@ async def confirm_payment(order_id: int, payment_id: int, staff=Depends(get_curr
     # Auto-deliver: если заказ в статусе "delivery" и долг погашен после подтверждения
     try:
         async with db.pool.acquire() as _c:
+            # перенос из ARTEZ 8a7547c: итог — как в карточке (минимумы + скидки, округление вниз до 1000)
             o = await _c.fetchrow("""
-                SELECT o.status,
-                       COALESCE((SELECT SUM(COALESCE(sqm*price_per_sqm,0)) FROM order_items WHERE order_id=o.id),0) AS items_total,
+                SELECT o.status, o.total_price,
                        COALESCE(o.discount_sum,0)+COALESCE(o.delivery_discount,0)+COALESCE(o.manual_discount,0)+COALESCE(o.client_discount,0) AS disc,
                        COALESCE((SELECT SUM(amount) FROM order_payments
                                  WHERE order_id=o.id AND confirmed=TRUE),0) AS paid_conf
                 FROM orders o WHERE o.id=$1
             """, order_id)
         if o and o["status"] == "delivery":
-            debt_left = float(o["items_total"]) - float(o["disc"]) - float(o["paid_conf"])
+            _bill = await db.get_order_items_billing(order_id)
+            _base = float(_bill.get("order_total") or 0) if _bill.get("items") else float(o["total_price"] or 0)
+            _net = max(0.0, _base - float(o["disc"]))
+            _net -= _net % 1000
+            debt_left = _net - float(o["paid_conf"])
             if debt_left <= 0:
                 async with db.pool.acquire() as _c:
                     await _c.execute("UPDATE orders SET status='delivered',delivered_at=NOW() WHERE id=$1", order_id)
@@ -8130,6 +8194,17 @@ async def upload_payment_receipt(
     file: UploadFile = File(...),
     staff=Depends(get_current_staff),
 ):
+    # Перенос из ARTEZ 8a7547c: чек — только к платежу ЭТОГО заказа своей компании; прикрепляет автор платежа
+    # или кассир/менеджер/админ.
+    async with db.pool.acquire() as conn:
+        _p = await conn.fetchrow("SELECT op.order_id, op.created_by_staff_id FROM order_payments op "
+                                 "JOIN orders o ON o.id = op.order_id WHERE op.id=$1 AND o.company_id=$2",
+                                 payment_id, db._cid())
+    if not _p or _p["order_id"] != order_id:
+        raise HTTPException(status_code=404, detail="Платёж не найден")
+    if not (staff.get("sub") == "admin" or staff.get("role") in ("admin", "manager") or staff.get("can_manage_cash")
+            or (_p["created_by_staff_id"] and _p["created_by_staff_id"] == staff.get("id"))):
+        raise HTTPException(status_code=403, detail="Чек прикрепляет тот, кто принял оплату, или кассир")
     content = await file.read()
     ct = file.content_type or "image/jpeg"
     tg_method = "sendDocument" if not ct.startswith("image/") else "sendPhoto"
@@ -9724,14 +9799,72 @@ async def driver_pay(
     order_id: int,
     method: str = Body(..., embed=True),
     amount: float = Body(..., embed=True),
+    client_key: str = Body("", embed=True),
     staff=Depends(get_current_staff)
 ):
     if not _can_drive(staff): raise HTTPException(403, "Нет доступа")
     if method not in ("cash","card","transfer"): raise HTTPException(400, "Неверный метод")
-    name = _driver_name(staff)
-    row = await db.add_order_payment(order_id, amount, method, "delivery",
-                                     "Оплата при доставке (web)", name,
-                                     created_by_staff_id=staff["id"])
+    # Перенос из ARTEZ 8a7547c/4792172/cab9136 (касса): заказ — своей компании и из маршрута ЭТОГО водителя;
+    # сумма > 0 и не больше остатка; повтор (сбой связи, двойное нажатие) возвращает уже созданную оплату.
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Сумма — число")
+    if not (amount > 0) or amount != amount or amount > 1e10:
+        raise HTTPException(400, "Сумма должна быть больше 0")
+    cid = db._cid()
+    key = re.sub(r"[^A-Za-z0-9_\-]", "", str(client_key or ""))[:64] or None
+    async with db.pool.acquire() as conn:
+        order = await conn.fetchrow("SELECT * FROM orders WHERE id=$1 AND company_id=$2", order_id, cid)
+        if not order:
+            raise HTTPException(404, "Заказ не найден")
+        if staff.get("role") != "admin":
+            mine = await conn.fetchval(
+                "SELECT 1 FROM route_orders ro JOIN routes r ON r.id = ro.route_id "
+                "WHERE ro.order_id=$1 AND r.driver_id=$2 AND r.company_id=$3 AND r.date >= CURRENT_DATE - 3 LIMIT 1",
+                order_id, staff["id"], cid)
+            if not mine:
+                raise HTTPException(403, "Заказ не в вашем маршруте")
+    # Одна оплата за раз по заказу: атомарный захват orders.driver_pay_claim_at с меткой владельца (без удержания
+    # соединения пула); повтор ждёт до ~10 с и видит первую; зависший захват истекает через 2 мин.
+    import uuid as _uuid
+    claim = _uuid.uuid4().hex
+    got = False
+    for _ in range(50):
+        if await db.pool.fetchval(
+                "UPDATE orders SET driver_pay_claim_at=NOW(), driver_pay_claim_token=$2 WHERE id=$1 AND company_id=$3 AND "
+                "(driver_pay_claim_at IS NULL OR driver_pay_claim_at < NOW() - INTERVAL '2 minutes') RETURNING id",
+                order_id, claim, cid):
+            got = True
+            break
+        await asyncio.sleep(0.2)
+    if not got:
+        raise HTTPException(409, "Оплата по этому заказу уже записывается — повторите через минуту")
+    try:
+        dup = None
+        if key:
+            dup = await db.pool.fetchrow("SELECT * FROM order_payments WHERE order_id=$1 AND client_key=$2", order_id, key)
+        if not dup:
+            dup = await db.pool.fetchrow(
+                "SELECT * FROM order_payments WHERE order_id=$1 AND created_by_staff_id=$2 AND method=$3 "
+                "AND amount=$4 AND confirmed IS NOT TRUE AND confirmed_at IS NULL "
+                "AND created_at > NOW() - INTERVAL '10 minutes' ORDER BY id DESC LIMIT 1",
+                order_id, staff["id"], method, amount)
+        if dup:
+            return {"ok": True, "payment": dict(dup), "duplicate": True}
+        m = await pay.money(dict(order))
+        if amount > m["due"] + 1000:   # +1000 — округление сумм в интерфейсе
+            raise HTTPException(400, f"Сумма больше остатка к оплате ({m['due']:,} сум)".replace(",", " "))
+        name = _driver_name(staff)
+        row = await db.add_order_payment(order_id, amount, method, "delivery",
+                                         "Оплата при доставке (web)", name,
+                                         created_by_staff_id=staff["id"])
+        if key and row:
+            await db.pool.execute("UPDATE order_payments SET client_key=$2 WHERE id=$1", row["id"], key)
+            row = dict(row); row["client_key"] = key
+    finally:
+        await db.pool.execute("UPDATE orders SET driver_pay_claim_at=NULL, driver_pay_claim_token=NULL "
+                              "WHERE id=$1 AND driver_pay_claim_token=$2", order_id, claim)
     if method == "cash":
         asyncio.create_task(_update_api_channel_stop(order_id))
     # card/transfer: push к менеджерам отправляется из upload_payment_receipt — после сохранения чека
